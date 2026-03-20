@@ -1,0 +1,30 @@
+{
+  "relayUrl": "ws://127.0.0.1:8765",
+  "stackCommands": {
+    "start": "deploy/windows-portable-template/start.ps1",
+    "stop": "deploy/windows-portable-template/stop.ps1",
+    "restart": "deploy/windows-portable-template/restart.ps1"
+  },
+  "services": [
+    {
+      "id": "industrial-assistant",
+      "label": "Industrial Assistant",
+      "healthUrl": "http://127.0.0.1:7788/api/health"
+    },
+    {
+      "id": "wakefusion-vision",
+      "label": "WakeFusion Vision",
+      "healthUrl": "http://127.0.0.1:8080/health"
+    },
+    {
+      "id": "wakefusion-audio",
+      "label": "WakeFusion Audio",
+      "healthUrl": "http://127.0.0.1:8080/health"
+    },
+    {
+      "id": "wakefusion-core",
+      "label": "WakeFusion Core",
+      "healthUrl": "http://127.0.0.1:8080/health"
+    }
+  ]
+}
