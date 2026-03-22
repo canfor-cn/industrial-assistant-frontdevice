@@ -1,14 +1,9 @@
 """
-视觉 WebSocket 服务器（UDP 监听版）
-作为 UDP 消费者，从 VisionService 的 UDP 输出中读取数据并提供 WebSocket 推送服务
+废弃：旧版视觉 WebSocket 网关。
 
-架构说明：
-- 本服务不导入或启动 VisionService
-- 仅作为 UDP 消费者，监听 VisionService 发送的 UDP 数据
-- 将接收到的数据通过 WebSocket 推送给客户端
-
-使用方法:
-    python -m wakefusion.network_services.vision_ws_server
+该模块属于历史可视化/三通道辅助链路，不再参与当前统一设备主链。
+当前设备接入请统一使用：
+    ws://<host>/api/voice/ws?deviceId=<deviceId>&token=<token>
 """
 
 import asyncio
@@ -241,4 +236,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise RuntimeError(
+        "wakefusion.network_services.vision_ws_server 已废弃，请改用统一设备协议 /api/voice/ws。"
+    )

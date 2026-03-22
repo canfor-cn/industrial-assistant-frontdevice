@@ -1,6 +1,8 @@
-"""
-TTS音频播放测试脚本
-接收TTS模块的音频数据并通过系统喇叭播放，用于测试TTS合成效果
+"""Deprecated legacy TTS player test.
+
+This script listened to the retired local TTS audio push port. The active
+device path is `core_server -> /api/voice/ws`, with audio returned from the
+central service over the unified device link.
 """
 import zmq
 import json
@@ -102,4 +104,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise RuntimeError(
+        "wakefusion/tests/test_tts_player.py 已废弃：设备端不再监听本地 TTS 推流，"
+        "请改测统一 /api/voice/ws 返回的 audio_* 消息。"
+    )

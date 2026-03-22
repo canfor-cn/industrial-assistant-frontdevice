@@ -1,7 +1,8 @@
-"""
-ASR模块测试脚本
-模拟Core Server发送音频数据到ASR模块，验证WebSocket输出和END_OF_SPEECH标记处理
-支持选择本地WAV文件进行测试
+"""Deprecated legacy ASR local test.
+
+This script targeted the retired device-side ASR module and old WebSocket/ZMQ
+flow. The active device path is `core_server -> /api/voice/ws`, with ASR now
+handled centrally by the server.
 """
 import json
 import time
@@ -140,4 +141,7 @@ def test_asr_module():
 
 
 if __name__ == "__main__":
-    test_asr_module()
+    raise RuntimeError(
+        "wakefusion/tests/test_asr_module.py 已废弃：设备端不再运行本地 ASR，"
+        "请改测统一 /api/voice/ws 链路。"
+    )

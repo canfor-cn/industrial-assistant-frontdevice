@@ -1,3 +1,10 @@
+"""Deprecated legacy mock relay for the old WakeFusion three-channel flow.
+
+This file is kept only as historical reference. The active device protocol is
+the unified `/api/voice/ws` link, with `core_server` talking directly to the
+central service and relaying UI events locally.
+"""
+
 import asyncio
 import json
 import logging
@@ -104,7 +111,7 @@ async def main():
             await asyncio.Future()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("🛑 服务已停止")
+    raise RuntimeError(
+        "tests/mock_llm_server.py 已废弃，请改用统一设备协议 /api/voice/ws，"
+        "不要再启动旧版 mock relay。"
+    )

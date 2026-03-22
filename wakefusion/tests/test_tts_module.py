@@ -1,6 +1,8 @@
-"""
-TTS模块测试脚本
-模拟LLM发送文本到TTS模块，验证ZMQ音频输出、流式输出和中断处理
+"""Deprecated legacy TTS local test.
+
+This script targeted the retired device-side TTS module and old WebSocket/ZMQ
+flow. The active device path is `core_server -> /api/voice/ws`, with TTS now
+handled centrally by the server.
 """
 import json
 import time
@@ -164,4 +166,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise RuntimeError(
+        "wakefusion/tests/test_tts_module.py 已废弃：设备端不再运行本地 TTS，"
+        "请改测统一 /api/voice/ws 链路。"
+    )

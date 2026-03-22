@@ -1,7 +1,9 @@
 """
-音频 WebSocket 服务器 (Audio Gateway)
-功能：接收底层 UDP 10002 数据转 WebSocket -> 接收 HTTP API 请求转 UDP 10003 指令
-启动：python -m wakefusion.network_services.audio_ws_server
+废弃：旧版音频 WebSocket 网关。
+
+该模块属于历史三通道架构，不再参与当前主链。
+当前设备接入请统一使用：
+    ws://<host>/api/voice/ws?deviceId=<deviceId>&token=<token>
 """
 import asyncio
 import json
@@ -70,6 +72,6 @@ async def stop_audio_stream():
         return {"status": "error", "message": str(e)}
 
 if __name__ == "__main__":
-    import uvicorn
-    # 🌟 注意：这里使用 8001 端口，绝不和视觉冲突
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    raise RuntimeError(
+        "wakefusion.network_services.audio_ws_server 已废弃，请改用统一设备协议 /api/voice/ws。"
+    )

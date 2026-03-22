@@ -3,7 +3,7 @@
 
 <head>
     <meta charset="UTF-8">
-    <title>WakeFusion Mock LLM - 自动回复测试</title>
+    <title>WakeFusion Mock LLM - 自动回复测试（已废弃）</title>
     <style>
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -45,6 +45,13 @@
             border-radius: 5px;
             margin-bottom: 15px;
             border-left: 4px solid #2196F3;
+        }
+        .deprecated-box {
+            background: #3b1111;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 15px;
+            border-left: 4px solid #f44336;
         }
 
         .two-column {
@@ -329,7 +336,14 @@
 
 <body>
     <div class="container">
-        <h2>🤖 Mock LLM - 自动回复测试工具</h2>
+        <div class="deprecated-box">
+            <div><strong>该页面已废弃，仅保留作旧版 relay/mock 调试参考。</strong></div>
+            <div style="margin-top: 10px; font-size: 0.95em; color: #ffb3b3;">
+                当前推荐链路为 <code>core_server -&gt; /api/voice/ws -&gt; 同连接返回 token/audio/media_ref/final</code>，
+                不再推荐使用本页配合 <code>mock_llm_server.py</code> 走旧版 <code>tts_request</code> / <code>stop_synthesis</code> 协议。
+            </div>
+        </div>
+        <h2>🤖 Mock LLM - 自动回复测试工具（已废弃）</h2>
         <p style="color: #aaa; margin-top: -10px;">自动接收 ASR 识别结果并生成随机回复，验证免唤醒链路</p>
 
         <div class="info-box">

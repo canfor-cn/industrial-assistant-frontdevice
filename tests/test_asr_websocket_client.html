@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <title>WakeFusion ASR WebSocket 测试</title>
+    <title>WakeFusion ASR WebSocket 测试（已废弃）</title>
     <style>
         body { 
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
@@ -33,6 +33,13 @@
             border-radius: 5px;
             margin-bottom: 15px;
             border-left: 4px solid #2196F3;
+        }
+        .deprecated-box {
+            background: #3b1111;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 15px;
+            border-left: 4px solid #f44336;
         }
         .result-box {
             background: #000;
@@ -76,7 +83,15 @@
 </head>
 <body>
     <div class="container">
-        <h2>🎤 ASR 语音识别结果监控</h2>
+        <h2>🎤 ASR 语音识别结果监控（已废弃）</h2>
+
+        <div class="deprecated-box">
+            <div><strong>该页面仅保留为旧版三通道调试参考。</strong></div>
+            <div style="margin-top: 10px; font-size: 0.95em; color: #ffb3b3;">
+                当前设备主链路已统一为 <code>/api/voice/ws</code>，不再推荐连接 <code>ws://127.0.0.1:8766</code>。
+                请改用 <code>core_server -&gt; /api/voice/ws -&gt; UI relay</code> 的统一协议流程。
+            </div>
+        </div>
         
         <div id="status" class="status disconnected">🔴 未连接 (ws://127.0.0.1:8766)</div>
         

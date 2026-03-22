@@ -97,12 +97,12 @@ python wakefusion/tests/mock_asr_saver.py
 python -m wakefusion.services.core_server
 ```
 
-**健康检查** (旧版):
+**健康检查**（旧版可视化/辅助链路，仅历史参考）:
 ```bash
 curl http://localhost:8080/health
 ```
 
-**WebSocket连接** (旧版):
+**WebSocket连接**（旧版本地 relay，仅历史参考）:
 ```bash
 wscat -c ws://localhost:8765
 ```
