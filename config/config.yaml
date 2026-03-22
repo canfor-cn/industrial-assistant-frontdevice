@@ -149,6 +149,8 @@ audio_playback:
   format: "pcm_int16"  # 音频格式（pcm_int16, pcm_float32等，便于未来扩展视频等）
   channels: 1  # 声道数
   prebuffer_ms: 100  # 预缓冲时长（毫秒），用于网络抖动抑制，建议100ms
+  output_device_match: "XVF3800"  # 强制音频播放设备匹配名称
+  strict_output_device: true  # 找不到 XVF3800 时不回退到默认输出，避免 HDMI 抢占
 
 # LLM Agent 配置（统一WebSocket协议）
 llm_agent:

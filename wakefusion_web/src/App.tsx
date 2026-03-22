@@ -1,4 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   Mic,
   MicOff,
@@ -85,6 +87,10 @@ interface MediaHistoryEntry {
   status: "playing" | "ended" | "stopped";
 }
 
+type SinkCapableMediaElement = HTMLMediaElement & {
+  setSinkId?: (sinkId: string) => Promise<void>;
+};
+
 declare global {
   interface Window {
     createUnityInstance: any;
@@ -120,10 +126,12 @@ export default function App() {
   const [ragStatus, setRagStatus] = useState("");
   const [stageMediaRef, setStageMediaRef] = useState<MediaRef | null>(null);
   const [stageMode, setStageMode] = useState<"avatar" | "loading" | "media" | "exiting">("avatar");
+  const [isStageFullscreen, setIsStageFullscreen] = useState(false);
   const [playbackHistory, setPlaybackHistory] = useState<MediaHistoryEntry[]>([]);
   const [playbackState, setPlaybackState] = useState<"idle" | "playing" | "ended" | "stopped">("idle");
-  const [stagePlaybackVolume, setStagePlaybackVolume] = useState(1);
+  const [stageMediaVolume, setStageMediaVolume] = useState(1);
   const [pendingUploads, setPendingUploads] = useState<PendingUploadItem[]>([]);
+  const [preferredSinkId, setPreferredSinkId] = useState<string | null>(null);
   const [directWsBaseUrl] = useState(() => localStorage.getItem("wakefusion.directWsBaseUrl") ?? directWsUrlDefault);
   const [directToken] = useState(() => localStorage.getItem("wakefusion.directToken") ?? "test-voice-token");
   const [directDeviceId] = useState(() => localStorage.getItem("wakefusion.directDeviceId") ?? `browser-${Math.random().toString(36).slice(2, 10)}`);
@@ -147,6 +155,15 @@ export default function App() {
     return connectionStatus;
   }, [connectionStatus, isRecording]);
 
+  const recentUniqueMedia = useMemo(() => {
+    const seen = new Set<string>();
+    return playbackHistory.filter((item) => {
+      if (seen.has(item.ref.assetId)) return false;
+      seen.add(item.ref.assetId);
+      return true;
+    }).slice(0, 6);
+  }, [playbackHistory]);
+
   const ragApiBaseUrl = useMemo(() => {
     try {
       const url = new URL(directWsBaseUrl);
@@ -164,13 +181,63 @@ export default function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages]);
 
+  const currentTurnMessages = useMemo(() => {
+    const lastUserIndex = [...messages].map((message) => message.role).lastIndexOf("user");
+    if (lastUserIndex === -1) {
+      return messages.slice(-1);
+    }
+    return messages.slice(lastUserIndex);
+  }, [messages]);
+
   useEffect(() => {
     const host = stageSurfaceRef.current;
     if (!host) return;
     const media = host.querySelector("video, audio") as HTMLMediaElement | null;
     if (!media) return;
-    media.volume = stagePlaybackVolume;
-  }, [stagePlaybackVolume, stageMediaRef]);
+    media.volume = stageMediaVolume;
+  }, [stageMediaVolume, stageMediaRef, stageMode]);
+
+  useEffect(() => {
+    let disposed = false;
+
+    async function resolvePreferredSink() {
+      if (typeof navigator === "undefined" || !navigator.mediaDevices?.enumerateDevices) {
+        return;
+      }
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        if (disposed) return;
+        const sink = devices.find((device) => (
+          device.kind === "audiooutput" &&
+          device.label.toLowerCase().includes("xvf3800")
+        ));
+        setPreferredSinkId(sink?.deviceId ?? null);
+      } catch (error) {
+        console.warn("Resolve preferred audio sink failed", error);
+        if (!disposed) {
+          setPreferredSinkId(null);
+        }
+      }
+    }
+
+    void resolvePreferredSink();
+    return () => {
+      disposed = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!stageMediaRef || !isPlayableMedia(stageMediaRef.assetType) || !preferredSinkId) {
+      return;
+    }
+    const host = stageSurfaceRef.current;
+    if (!host) return;
+    const media = host.querySelector("video, audio") as SinkCapableMediaElement | null;
+    if (!media || typeof media.setSinkId !== "function") return;
+    media.setSinkId(preferredSinkId).catch((error) => {
+      console.warn("Bind XVF3800 audio sink failed", error);
+    });
+  }, [preferredSinkId, stageMediaRef, stageMode]);
 
   useEffect(() => {
     const script = document.createElement("script");
@@ -237,7 +304,6 @@ export default function App() {
         try {
           const data = JSON.parse(event.data);
           if (data.type === "subtitle_user" && data.text) {
-            duckStageAudio();
             setMessages([{ id: `${Date.now()}-relay-user`, role: "user", text: String(data.text) }]);
             return;
           }
@@ -263,6 +329,14 @@ export default function App() {
               activateStageMedia(ref, data.traceId ? String(data.traceId) : undefined);
             }
             setMessages((prev) => attachMediaToLatestAssistant(prev, ref));
+            return;
+          }
+          if (data.type === "media_duck") {
+            if (data.action === "duck") {
+              setStageMediaVolume(typeof data.level === "number" ? data.level : 0.1);
+            } else if (data.action === "restore") {
+              setStageMediaVolume(typeof data.level === "number" ? data.level : 1);
+            }
             return;
           }
           if (data.type === "media_control") {
@@ -297,7 +371,12 @@ export default function App() {
   }, [relayUrl]);
 
   useEffect(() => {
+    const onFullscreenChange = () => {
+      setIsStageFullscreen(Boolean(document.fullscreenElement));
+    };
+    document.addEventListener("fullscreenchange", onFullscreenChange);
     return () => {
+      document.removeEventListener("fullscreenchange", onFullscreenChange);
       if (mediaReturnTimerRef.current) {
         window.clearTimeout(mediaReturnTimerRef.current);
       }
@@ -308,6 +387,29 @@ export default function App() {
       directSocketRef.current?.close();
     };
   }, []);
+
+  async function enterStageFullscreen() {
+    const host = stageSurfaceRef.current;
+    if (!host || document.fullscreenElement) return false;
+    try {
+      await host.requestFullscreen();
+      return true;
+    } catch (error) {
+      console.error("Enter fullscreen failed", error);
+      return false;
+    }
+  }
+
+  async function exitStageFullscreen() {
+    if (!document.fullscreenElement) return true;
+    try {
+      await document.exitFullscreen();
+      return true;
+    } catch (error) {
+      console.error("Exit fullscreen failed", error);
+      return false;
+    }
+  }
 
   function buildAssistantWsUrl() {
     const url = new URL(directWsBaseUrl);
@@ -341,14 +443,6 @@ export default function App() {
     });
   }
 
-  function duckStageAudio() {
-    setStagePlaybackVolume(0.1);
-  }
-
-  function restoreStageAudio() {
-    setStagePlaybackVolume(1);
-  }
-
   function clearMediaReturnTimer() {
     if (mediaReturnTimerRef.current) {
       window.clearTimeout(mediaReturnTimerRef.current);
@@ -366,7 +460,7 @@ export default function App() {
   function activateStageMedia(ref: MediaRef, sourceTraceId?: string) {
     clearMediaReturnTimer();
     clearStageTransitionTimer();
-    restoreStageAudio();
+    setStageMediaVolume(1);
     setPlaybackState("playing");
     setStageMediaRef(ref);
     setStageMode("loading");
@@ -401,6 +495,7 @@ export default function App() {
   function returnToAvatar(reason: "ended" | "stopped" = "stopped") {
     clearMediaReturnTimer();
     clearStageTransitionTimer();
+    void exitStageFullscreen();
     setPlaybackState(reason === "ended" ? "ended" : "stopped");
     markLatestPlayback(reason);
     setStageMode("exiting");
@@ -416,7 +511,7 @@ export default function App() {
     setPlaybackState("ended");
     markLatestPlayback("ended");
     mediaReturnTimerRef.current = window.setTimeout(() => {
-      setStageMediaRef(null);
+      returnToAvatar("ended");
       setPlaybackState("idle");
       mediaReturnTimerRef.current = null;
     }, 1000);
@@ -442,7 +537,38 @@ export default function App() {
       returnToAvatar("stopped");
       return "好的，已经切回数字人讲解。";
     }
+    if (action === "enter_fullscreen") {
+      void enterStageFullscreen();
+      return stageMediaRef ? "好的，已切换到全屏播放。" : "当前没有正在播放的媒体。";
+    }
+    if (action === "exit_fullscreen") {
+      void exitStageFullscreen();
+      return "好的，已退出全屏播放。";
+    }
     return "";
+  }
+
+  function buildMediaContext() {
+    return {
+      media: {
+        stageMode,
+        isFullscreen: isStageFullscreen,
+        currentMedia: stageMediaRef
+          ? {
+              assetId: stageMediaRef.assetId,
+              assetType: stageMediaRef.assetType,
+              label: stageMediaRef.label,
+              url: stageMediaRef.url,
+            }
+          : null,
+        recentMedia: playbackHistory.slice(0, 3).map((item) => ({
+          assetId: item.ref.assetId,
+          assetType: item.ref.assetType,
+          label: item.ref.label,
+          status: item.status,
+        })),
+      },
+    };
   }
 
   async function ensureAssistantSocket() {
@@ -500,14 +626,11 @@ export default function App() {
         if (!traceId) return;
 
         if (data.type === "asr" && data.stage === "final" && data.text) {
-          duckStageAudio();
           appendUserMessage(traceId, String(data.text));
-          setConnectionStatus("已转写，正在生成回答");
           return;
         }
         if (data.type === "token" && data.text) {
           appendAssistantChunk(traceId, String(data.text));
-          setConnectionStatus("回答生成中");
           return;
         }
         if (data.type === "media_ref" && data.url) {
@@ -527,12 +650,10 @@ export default function App() {
           return;
         }
         if (data.type === "stop_tts") {
-          duckStageAudio();
           setConnectionStatus("播放已打断");
           return;
         }
         if (data.type === "final") {
-          setConnectionStatus("本轮完成");
           return;
         }
         if (data.type === "warning") {
@@ -554,7 +675,6 @@ export default function App() {
     const text = input.trim();
     if (!text) return;
     const traceId = `browser-text-${Date.now()}`;
-    duckStageAudio();
     resetConversation(traceId);
     appendUserMessage(traceId, text);
     setInput("");
@@ -566,6 +686,7 @@ export default function App() {
         traceId,
         deviceId: directDeviceId.trim(),
         text,
+        context: buildMediaContext(),
       }));
     } catch (error) {
       setConnectionStatus(error instanceof Error ? error.message : "文本发送失败");
@@ -598,7 +719,6 @@ export default function App() {
       resetConversation(traceId);
       recorderRef.current = recorder;
       setIsRecording(true);
-      duckStageAudio();
       setConnectionStatus("录音中");
 
       recorder.ondataavailable = (event) => {
@@ -630,6 +750,7 @@ export default function App() {
             mimeType: blob.type || "audio/webm",
             codec: recorder.mimeType || undefined,
             language: "zh",
+            context: buildMediaContext(),
           }));
           socket.send(JSON.stringify({
             type: "audio_segment_chunk",
@@ -661,6 +782,14 @@ export default function App() {
     if (event.key === "Backspace" || event.key === "Delete") {
       const nativeEvent = event.nativeEvent as KeyboardEvent;
       nativeEvent.stopImmediatePropagation?.();
+    }
+  }
+
+  function handleComposerKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
+    isolateComposerKeyboard(event);
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      void sendText();
     }
   }
 
@@ -866,13 +995,6 @@ export default function App() {
   return (
     <div className="app-shell">
       <section className="stage-column">
-        <div className="stage-header">
-          <div>
-            <div className="stage-eyebrow">Unity WebGL Stage</div>
-            <h1>WakeFusion Digital Guide</h1>
-          </div>
-          <div className="stage-status">{isUnityLoaded ? "数字人已就绪" : `加载中 ${loadingProgress}%`}</div>
-        </div>
         <div className="unity-stage" ref={stageSurfaceRef}>
           {!isUnityLoaded && (
             <div className="unity-loading">
@@ -886,24 +1008,9 @@ export default function App() {
           <div className={`stage-media-shell ${stageMediaRef ? "is-mounted" : ""} ${stageMode === "media" ? "is-visible" : ""} ${stageMode === "loading" ? "is-loading" : ""} ${stageMode === "exiting" ? "is-exiting" : ""}`}>
             {stageMediaRef ? (
               <>
-                <div className="stage-media-header">
-                  <div>
-                    <div className="stage-eyebrow">Retrieved Media</div>
-                    <strong>{stageMediaRef.label}</strong>
-                  </div>
-                  <div className="stage-media-actions">
-                    <span className="stage-playback-state">{stageMode === "loading" ? "媒体加载中" : formatPlaybackState(playbackState)}</span>
-                    <button type="button" className="stage-reset-button" onClick={() => replayLastMedia()}>
-                      重播上一条
-                    </button>
-                    <button type="button" className="stage-reset-button" onClick={() => returnToAvatar("stopped")}>
-                      返回数字人
-                    </button>
-                  </div>
-                </div>
-                {playbackHistory.length ? (
+                {recentUniqueMedia.length ? (
                   <div className="stage-history-bar">
-                    {playbackHistory.slice(0, 3).map((item) => (
+                    {recentUniqueMedia.map((item) => (
                       <button
                         key={item.id}
                         type="button"
@@ -939,25 +1046,32 @@ export default function App() {
             <h2>展厅讲解对话</h2>
           </div>
           <div className="chat-header-actions">
-            <button type="button" className="rag-button" onClick={() => setRagOpen(true)}>
+            <button type="button" className="rag-icon-button" onClick={() => setRagOpen(true)} aria-label="打开 RAG 管理">
               <Database className="h-4 w-4" />
-              RAG 管理
             </button>
             <div className="chat-status">{connectionLabel}</div>
           </div>
         </header>
 
         <main className="chat-messages chat-scrollbar">
-          {messages.length === 0 ? (
+          {currentTurnMessages.length === 0 ? (
             <div className="chat-empty">
               <h3>开始对话</h3>
               <p>输入问题或直接点击麦克风录音，右侧会自动滚动展示回答与资料链接。</p>
             </div>
           ) : (
-            messages.map((message) => (
+            currentTurnMessages.map((message) => (
               <article key={message.id} className={`chat-bubble ${message.role === "user" ? "is-user" : "is-assistant"}`}>
                 <div className="chat-role">{message.role === "user" ? "你" : "讲解员"}</div>
-                <div className="chat-text">{message.text}</div>
+                <div className="chat-text markdown-body">
+                  {message.role === "assistant" ? (
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                      {message.text || "..."}
+                    </ReactMarkdown>
+                  ) : (
+                    message.text
+                  )}
+                </div>
                 {message.mediaRefs?.length ? (
                   <div className="chat-media-grid">
                     {message.mediaRefs.map((ref) => (
@@ -1000,13 +1114,13 @@ export default function App() {
               }}
               onKeyDownCapture={isolateComposerKeyboard}
               onKeyUpCapture={isolateComposerKeyboard}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
-                  event.preventDefault();
-                  void sendText();
-                }
-              }}
+              onKeyDown={handleComposerKeyDown}
               placeholder="请输入问题，或点击右侧麦克风直接语音输入"
+              rows={2}
+              lang="zh-CN"
+              autoCapitalize="off"
+              autoCorrect="off"
+              spellCheck={false}
             />
             <div className="chat-actions">
               <button type="button" className={`icon-button ${isRecording ? "is-recording" : ""}`} onClick={() => void (isRecording ? stopRecording() : startRecording())}>
@@ -1014,7 +1128,6 @@ export default function App() {
               </button>
               <button type="button" className="send-button" onClick={() => void sendText()}>
                 <SendHorizontal className="h-4 w-4" />
-                发送
               </button>
             </div>
           </div>

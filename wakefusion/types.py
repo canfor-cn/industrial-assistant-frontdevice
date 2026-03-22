@@ -318,6 +318,8 @@ class AudioPlaybackConfig(BaseModel):
     format: str = "pcm_int16"  # 音频格式（pcm_int16, pcm_float32等，便于未来扩展）
     channels: int = 1  # 声道数
     prebuffer_ms: int = 100  # 预缓冲时长（毫秒），用于网络抖动抑制
+    output_device_match: str = "XVF3800"  # 播放输出设备匹配名称
+    strict_output_device: bool = True  # 找不到目标输出设备时是否禁止回退到系统默认
 
 
 class LLMAgentConfig(BaseModel):

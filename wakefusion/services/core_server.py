@@ -96,6 +96,7 @@ class CoreServer:
         
         # 防回声的Drain机制
         self._wait_for_audio_drain = False  # 等待音频排空标志
+        self._media_ducked = False  # 当前媒体是否处于压低音量状态
         
         # 硬件冷却期（硬打断后）
         self._cooldown_until: float = 0.0
@@ -334,6 +335,14 @@ class CoreServer:
             )
         except Exception as e:
             logger.debug(f"转发消息给UI失败: {e}")
+
+    def _set_media_duck(self, action: str, level: float):
+        """通知前端媒体播放器降音量或恢复音量"""
+        self._forward_to_ui({
+            "type": "media_duck",
+            "action": action,
+            "level": level,
+        })
     
     async def _broadcast_to_ui_clients(self, message_json: str):
         """向所有UI客户端广播消息"""
@@ -673,18 +682,27 @@ class CoreServer:
             logger.error(f"❌ 本地音频播放不可用（PortAudio 缺失或系统音频库异常）: {e}")
             return
         
-        # 尝试查找XVF3800输出设备（可选）
+        # 尝试查找目标输出设备
         output_device = None
+        output_device_match = (self.audio_playback_config.output_device_match or "XVF3800").lower()
         try:
             devices = sd.query_devices()
             for i, device in enumerate(devices):
-                if 'xvf3800' in device['name'].lower() or 'xv3800' in device['name'].lower():
+                device_name = str(device.get('name', ''))
+                if output_device_match in device_name.lower():
                     if device['max_output_channels'] > 0:
                         output_device = i
-                        logger.info(f"🎵 找到XVF3800输出设备: {device['name']} (ID: {i})")
+                        logger.info(f"🎵 找到目标输出设备: {device_name} (ID: {i})")
                         break
         except Exception as e:
-            logger.debug(f"查找音频设备时出错（将使用默认设备）: {e}")
+            logger.debug(f"查找音频设备时出错: {e}")
+
+        if output_device is None and self.audio_playback_config.strict_output_device:
+            logger.error(
+                f"❌ 未找到目标输出设备: {self.audio_playback_config.output_device_match}，"
+                "严格输出模式已启用，禁止回退到系统默认输出设备"
+            )
+            return
         
         # 使用OutputStream进行流式播放
         sample_rate = self.audio_playback_config.sample_rate
@@ -852,6 +870,9 @@ class CoreServer:
         """退出交互模式（替代原来的_transition_to_idle）"""
         with self._state_lock:
             logger.info(f"状态转换: 退出交互模式")
+            if self._media_ducked:
+                self._set_media_duck("restore", 1.0)
+                self._media_ducked = False
             
             # 🌟 修复1：VAD超时检查已移至 _process_audio_data，不再需要独立线程
             
@@ -1015,6 +1036,9 @@ class CoreServer:
         if self._current_trace_id:
             self._send_audio_segment_end(self._current_trace_id, "vad_timeout")
         self._current_trace_id = None
+        if self._media_ducked:
+            self._set_media_duck("restore", 1.0)
+            self._media_ducked = False
     
     def _handle_vad_timeout(self):
         """处理VAD超时"""
@@ -1520,6 +1544,9 @@ class CoreServer:
             if vad:
                 self._vad_silence_start = current_time
                 self._last_speech_time = current_time
+                if not self._media_ducked:
+                    self._set_media_duck("duck", 0.1)
+                    self._media_ducked = True
             elif not self._vad_silence_start:
                 self._vad_silence_start = current_time
 
@@ -1527,6 +1554,15 @@ class CoreServer:
                 self._lip_silence_start = current_time
             elif not self._lip_silence_start:
                 self._lip_silence_start = current_time
+
+            if (
+                not vad
+                and self._media_ducked
+                and self._vad_silence_start
+                and (current_time - self._vad_silence_start) >= 0.8
+            ):
+                self._set_media_duck("restore", 1.0)
+                self._media_ducked = False
 
             # 🌟 核心修复：TTS播放期间暂停所有超时倒计时
             if self.is_playing_tts:
