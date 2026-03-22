@@ -5,7 +5,7 @@ import {
   Mic,
   MicOff,
   SendHorizontal,
-  Link2,
+  Keyboard,
   Image as ImageIcon,
   PlayCircle,
   Volume2,
@@ -16,6 +16,9 @@ import {
   Upload,
   Network,
   X,
+  ChevronDown,
+  Maximize,
+  Minimize,
 } from "lucide-react";
 
 interface MediaRef {
@@ -131,12 +134,16 @@ export default function App() {
   const [playbackState, setPlaybackState] = useState<"idle" | "playing" | "ended" | "stopped">("idle");
   const [stageMediaVolume, setStageMediaVolume] = useState(1);
   const [pendingUploads, setPendingUploads] = useState<PendingUploadItem[]>([]);
+  const [showTextInput, setShowTextInput] = useState(false);
+  const [displayedAssistantText, setDisplayedAssistantText] = useState("");
+  const [subtitlePhase, setSubtitlePhase] = useState<"hidden" | "visible" | "fading">("hidden");
   const [preferredSinkId, setPreferredSinkId] = useState<string | null>(null);
   const [directWsBaseUrl] = useState(() => localStorage.getItem("wakefusion.directWsBaseUrl") ?? directWsUrlDefault);
   const [directToken] = useState(() => localStorage.getItem("wakefusion.directToken") ?? "test-voice-token");
   const [directDeviceId] = useState(() => localStorage.getItem("wakefusion.directDeviceId") ?? `browser-${Math.random().toString(36).slice(2, 10)}`);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const appShellRef = useRef<HTMLDivElement>(null);
   const stageSurfaceRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -149,6 +156,10 @@ export default function App() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const mediaReturnTimerRef = useRef<number | null>(null);
   const stageTransitionTimerRef = useRef<number | null>(null);
+  const subtitleEndRef = useRef<HTMLDivElement>(null);
+  const assistantFullTextRef = useRef("");
+  const displayTimerRef = useRef<number | null>(null);
+  const subtitleFadeTimerRef = useRef<number | null>(null);
 
   const connectionLabel = useMemo(() => {
     if (isRecording) return "录音中";
@@ -179,6 +190,7 @@ export default function App() {
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    subtitleEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages]);
 
   const currentTurnMessages = useMemo(() => {
@@ -188,6 +200,105 @@ export default function App() {
     }
     return messages.slice(lastUserIndex);
   }, [messages]);
+
+  // Derive the latest user question and full assistant text from current turn
+  const latestUserText = useMemo(() => {
+    const userMsg = currentTurnMessages.find((m) => m.role === "user");
+    return userMsg?.text ?? "";
+  }, [currentTurnMessages]);
+
+  const latestAssistantFull = useMemo(() => {
+    const assistantMsg = [...currentTurnMessages].reverse().find((m) => m.role === "assistant");
+    return assistantMsg?.text ?? "";
+  }, [currentTurnMessages]);
+
+  const latestAssistantMediaRefs = useMemo(() => {
+    const assistantMsg = [...currentTurnMessages].reverse().find((m) => m.role === "assistant");
+    return assistantMsg?.mediaRefs ?? [];
+  }, [currentTurnMessages]);
+
+  // Token buffer: uniform-speed character reveal
+  useEffect(() => {
+    assistantFullTextRef.current = latestAssistantFull;
+
+    if (!latestAssistantFull) {
+      setDisplayedAssistantText("");
+      if (displayTimerRef.current) {
+        window.clearInterval(displayTimerRef.current);
+        displayTimerRef.current = null;
+      }
+      return;
+    }
+
+    // Start the reveal timer if not already running
+    if (!displayTimerRef.current) {
+      displayTimerRef.current = window.setInterval(() => {
+        setDisplayedAssistantText((prev) => {
+          const full = assistantFullTextRef.current;
+          if (prev.length >= full.length) {
+            return prev;
+          }
+          // Adaptive speed: if buffer > 30 chars behind, go faster
+          const lag = full.length - prev.length;
+          const step = lag > 60 ? 3 : lag > 30 ? 2 : 1;
+          return full.slice(0, prev.length + step);
+        });
+      }, 80); // ~12 chars/sec base speed
+    }
+
+    return undefined;
+  }, [latestAssistantFull]);
+
+  // Show subtitle when there's content, reset fade
+  useEffect(() => {
+    if (latestUserText || latestAssistantFull) {
+      setSubtitlePhase("visible");
+      // Clear any pending fade timer
+      if (subtitleFadeTimerRef.current) {
+        window.clearTimeout(subtitleFadeTimerRef.current);
+        subtitleFadeTimerRef.current = null;
+      }
+    }
+  }, [latestUserText, latestAssistantFull]);
+
+  // Detect when all text is fully displayed → start 5s fade timer
+  useEffect(() => {
+    if (!latestAssistantFull || displayedAssistantText.length < latestAssistantFull.length) {
+      return;
+    }
+    // Fully caught up — stop the interval
+    if (displayTimerRef.current) {
+      window.clearInterval(displayTimerRef.current);
+      displayTimerRef.current = null;
+    }
+    // Start 5s countdown to fade
+    if (subtitleFadeTimerRef.current) {
+      window.clearTimeout(subtitleFadeTimerRef.current);
+    }
+    subtitleFadeTimerRef.current = window.setTimeout(() => {
+      setSubtitlePhase("fading");
+      // After the CSS transition (1s), hide completely
+      subtitleFadeTimerRef.current = window.setTimeout(() => {
+        setSubtitlePhase("hidden");
+        subtitleFadeTimerRef.current = null;
+      }, 1200);
+    }, 5000);
+
+    return () => {
+      if (subtitleFadeTimerRef.current) {
+        window.clearTimeout(subtitleFadeTimerRef.current);
+        subtitleFadeTimerRef.current = null;
+      }
+    };
+  }, [displayedAssistantText, latestAssistantFull]);
+
+  // Cleanup timers on unmount
+  useEffect(() => {
+    return () => {
+      if (displayTimerRef.current) window.clearInterval(displayTimerRef.current);
+      if (subtitleFadeTimerRef.current) window.clearTimeout(subtitleFadeTimerRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     const host = stageSurfaceRef.current;
@@ -389,7 +500,7 @@ export default function App() {
   }, []);
 
   async function enterStageFullscreen() {
-    const host = stageSurfaceRef.current;
+    const host = appShellRef.current;
     if (!host || document.fullscreenElement) return false;
     try {
       await host.requestFullscreen();
@@ -422,6 +533,18 @@ export default function App() {
     currentTraceRef.current = traceId;
     setMessages([]);
     setConnectionStatus("等待后端响应");
+    // Reset subtitle buffer state
+    assistantFullTextRef.current = "";
+    setDisplayedAssistantText("");
+    setSubtitlePhase("hidden");
+    if (displayTimerRef.current) {
+      window.clearInterval(displayTimerRef.current);
+      displayTimerRef.current = null;
+    }
+    if (subtitleFadeTimerRef.current) {
+      window.clearTimeout(subtitleFadeTimerRef.current);
+      subtitleFadeTimerRef.current = null;
+    }
   }
 
   function appendUserMessage(traceId: string, text: string) {
@@ -993,92 +1116,97 @@ export default function App() {
   }, [ragOpen, ragTenantId]);
 
   return (
-    <div className="app-shell">
-      <section className="stage-column">
-        <div className="unity-stage" ref={stageSurfaceRef}>
-          {!isUnityLoaded && (
-            <div className="unity-loading">
-              <div className="unity-loading-ring" />
-              <div>{loadingProgress}%</div>
-            </div>
-          )}
-          <div className={`stage-avatar-shell ${stageMode === "media" || stageMode === "loading" ? "is-dimmed" : ""}`}>
-            <canvas ref={canvasRef} className="unity-canvas" />
+    <div className="app-shell" ref={appShellRef}>
+      {/* Layer 0-1: Full-screen stage */}
+      <div className="stage-fullscreen" ref={stageSurfaceRef}>
+        {!isUnityLoaded && (
+          <div className="unity-loading">
+            <div className="unity-loading-ring" />
+            <div>{loadingProgress}%</div>
           </div>
-          <div className={`stage-media-shell ${stageMediaRef ? "is-mounted" : ""} ${stageMode === "media" ? "is-visible" : ""} ${stageMode === "loading" ? "is-loading" : ""} ${stageMode === "exiting" ? "is-exiting" : ""}`}>
-            {stageMediaRef ? (
-              <>
-                {recentUniqueMedia.length ? (
-                  <div className="stage-history-bar">
-                    {recentUniqueMedia.map((item) => (
-                      <button
-                        key={item.id}
-                        type="button"
-                        className={`stage-history-pill is-${item.status}`}
-                        onClick={() => activateStageMedia(item.ref, item.sourceTraceId)}
-                      >
-                        {item.ref.label}
-                      </button>
-                    ))}
-                  </div>
-                ) : null}
-                {renderStageMedia(stageMediaRef, {
-                  onReady: handleStageMediaReady,
-                  onEnded: handleStageMediaEnded,
-                  showCover: stageMode === "loading",
-                })}
-                {stageMode === "loading" ? (
-                  <div className="stage-media-loading">
-                    <div className="unity-loading-ring" />
-                    <span>媒体准备中</span>
-                  </div>
-                ) : null}
-              </>
-            ) : null}
-          </div>
+        )}
+        <div className={`stage-avatar-shell ${stageMode === "media" || stageMode === "loading" ? "is-dimmed" : ""}`}>
+          <canvas ref={canvasRef} className="unity-canvas" />
         </div>
-      </section>
+        <div className={`stage-media-shell ${stageMediaRef ? "is-mounted" : ""} ${stageMode === "media" ? "is-visible" : ""} ${stageMode === "loading" ? "is-loading" : ""} ${stageMode === "exiting" ? "is-exiting" : ""}`}>
+          {stageMediaRef ? renderStageMedia(stageMediaRef, {
+            onReady: handleStageMediaReady,
+            onEnded: handleStageMediaEnded,
+            showCover: stageMode === "loading",
+          }) : null}
+        </div>
+      </div>
 
-      <section className="chat-column">
-        <header className="chat-header">
-          <div>
-            <div className="chat-eyebrow">Conversation</div>
-            <h2>展厅讲解对话</h2>
-          </div>
-          <div className="chat-header-actions">
-            <button type="button" className="rag-icon-button" onClick={() => setRagOpen(true)} aria-label="打开 RAG 管理">
-              <Database className="h-4 w-4" />
-            </button>
-            <div className="chat-status">{connectionLabel}</div>
-          </div>
+      {/* Layer 2-3: Floating UI overlay */}
+      <div className="ui-overlay">
+        {/* Top-left: branding */}
+        <div className="overlay-branding">
+          <span className="brand-name-cn">成都曜曜慧道展陈有限公司</span>
+          <span className="brand-name-en">Chengdu YaoYao Huidao Exhibition Co., Ltd.</span>
+        </div>
+
+        {/* Top-right: status + fullscreen + management */}
+        <header className="overlay-header">
+          <div className={`overlay-status ${isRecording ? "is-recording" : ""}`}>{connectionLabel}</div>
+          <button
+            type="button"
+            className="overlay-btn"
+            onClick={() => void (isStageFullscreen ? exitStageFullscreen() : enterStageFullscreen())}
+            aria-label={isStageFullscreen ? "退出全屏" : "全屏"}
+          >
+            {isStageFullscreen ? <Minimize className="h-4 w-4" /> : <Maximize className="h-4 w-4" />}
+          </button>
+          <button type="button" className="overlay-btn" onClick={() => setRagOpen(true)} aria-label="打开知识库管理">
+            <Database className="h-4 w-4" />
+          </button>
         </header>
 
-        <main className="chat-messages chat-scrollbar">
-          {currentTurnMessages.length === 0 ? (
-            <div className="chat-empty">
-              <h3>开始对话</h3>
-              <p>输入问题或直接点击麦克风录音，右侧会自动滚动展示回答与资料链接。</p>
-            </div>
-          ) : (
-            currentTurnMessages.map((message) => (
-              <article key={message.id} className={`chat-bubble ${message.role === "user" ? "is-user" : "is-assistant"}`}>
-                <div className="chat-role">{message.role === "user" ? "你" : "讲解员"}</div>
-                <div className="chat-text markdown-body">
-                  {message.role === "assistant" ? (
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                      {message.text || "..."}
-                    </ReactMarkdown>
-                  ) : (
-                    message.text
-                  )}
+        {/* Left-bottom: media history (max 3, text cards) */}
+        {recentUniqueMedia.length > 0 ? (
+          <div className="media-history">
+            {recentUniqueMedia.slice(0, 3).map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                className={`history-card is-${item.status}`}
+                onClick={() => activateStageMedia(item.ref, item.sourceTraceId)}
+              >
+                <span className="history-card-text">{item.ref.label}</span>
+              </button>
+            ))}
+          </div>
+        ) : null}
+
+        {/* Idle hint */}
+        {currentTurnMessages.length === 0 && stageMode === "avatar" ? (
+          <div className="stage-idle-hint">点击下方麦克风开始对话</div>
+        ) : null}
+
+        {/* Subtitle bar — two-line structure: question + answer */}
+        {subtitlePhase !== "hidden" && (latestUserText || displayedAssistantText) ? (
+          <div className={`subtitle-bar ${subtitlePhase === "fading" ? "is-fading" : ""}`}>
+            {/* Line 1: User question */}
+            {latestUserText ? (
+              <div className="subtitle-question">
+                <span className="subtitle-question-label">你：</span>
+                <span className="subtitle-question-text">{latestUserText}</span>
+              </div>
+            ) : null}
+            {/* Line 2: Assistant answer (scrollable, uniform-speed reveal) */}
+            {displayedAssistantText ? (
+              <div className="subtitle-answer chat-scrollbar">
+                <div className="markdown-body">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                    {displayedAssistantText}
+                  </ReactMarkdown>
                 </div>
-                {message.mediaRefs?.length ? (
-                  <div className="chat-media-grid">
-                    {message.mediaRefs.map((ref) => (
+                {latestAssistantMediaRefs.length > 0 ? (
+                  <div className="subtitle-media">
+                    {latestAssistantMediaRefs.map((ref) => (
                       <button
                         key={`${ref.assetId}-${ref.url}`}
                         type="button"
-                        className="chat-media-card"
+                        className="subtitle-media-chip"
                         onClick={() => {
                           if (isPlayableMedia(ref.assetType)) {
                             activateStageMedia(ref, ref.traceId);
@@ -1087,61 +1215,76 @@ export default function App() {
                           window.open(ref.url, "_blank", "noopener,noreferrer");
                         }}
                       >
-                        <span className="chat-media-icon">{renderMediaIcon(ref.assetType)}</span>
-                        <span className="chat-media-meta">
-                          <strong>{ref.label}</strong>
-                          <small>{formatAssetType(ref.assetType)}</small>
-                        </span>
-                        <Link2 className="h-4 w-4 text-slate-400" />
+                        {renderMediaIcon(ref.assetType)}
+                        <span>{ref.label}</span>
                       </button>
                     ))}
                   </div>
                 ) : null}
-              </article>
-            ))
-          )}
-          <div ref={messagesEndRef} />
-        </main>
-
-        <footer className="chat-composer">
-          <div className="chat-input-shell">
-            <textarea
-              ref={textareaRef}
-              value={input}
-              onChange={(event) => setInput(event.target.value)}
-              onFocus={() => {
-                canvasRef.current?.blur();
-              }}
-              onKeyDownCapture={isolateComposerKeyboard}
-              onKeyUpCapture={isolateComposerKeyboard}
-              onKeyDown={handleComposerKeyDown}
-              placeholder="请输入问题，或点击右侧麦克风直接语音输入"
-              rows={2}
-              lang="zh-CN"
-              autoCapitalize="off"
-              autoCorrect="off"
-              spellCheck={false}
-            />
-            <div className="chat-actions">
-              <button type="button" className={`icon-button ${isRecording ? "is-recording" : ""}`} onClick={() => void (isRecording ? stopRecording() : startRecording())}>
-                {isRecording ? <MicOff className="h-5 w-5" /> : <Mic className="h-5 w-5" />}
-              </button>
-              <button type="button" className="send-button" onClick={() => void sendText()}>
-                <SendHorizontal className="h-4 w-4" />
-              </button>
-            </div>
+                <div ref={subtitleEndRef} />
+                <div ref={messagesEndRef} />
+              </div>
+            ) : null}
           </div>
-          <div className="chat-hint">Assistant WS: {directWsBaseUrl}</div>
-        </footer>
-      </section>
+        ) : null}
 
+        {/* Action bar */}
+        <div className="action-bar">
+          {showTextInput ? (
+            <div className="action-text-input">
+              <textarea
+                ref={textareaRef}
+                value={input}
+                onChange={(event) => setInput(event.target.value)}
+                onFocus={() => { canvasRef.current?.blur(); }}
+                onKeyDownCapture={isolateComposerKeyboard}
+                onKeyUpCapture={isolateComposerKeyboard}
+                onKeyDown={handleComposerKeyDown}
+                placeholder="输入问题，Enter 发送"
+                rows={1}
+                lang="zh-CN"
+                autoCapitalize="off"
+                autoCorrect="off"
+                spellCheck={false}
+              />
+              <div className="action-text-btns">
+                <button type="button" className={`action-icon-btn ${isRecording ? "is-recording" : ""}`} onClick={() => void (isRecording ? stopRecording() : startRecording())}>
+                  {isRecording ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
+                </button>
+                <button type="button" className="action-send-btn" onClick={() => void sendText()}>
+                  <SendHorizontal className="h-4 w-4" />
+                </button>
+                <button type="button" className="action-close-btn" onClick={() => setShowTextInput(false)}>
+                  <ChevronDown className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+          ) : (
+            <>
+              <button
+                type="button"
+                className={`mic-button ${isRecording ? "is-recording" : ""}`}
+                onClick={() => void (isRecording ? stopRecording() : startRecording())}
+              >
+                {isRecording ? <MicOff className="h-5 w-5" /> : <Mic className="h-5 w-5" />}
+                <span>{isRecording ? "点击结束录音" : "点击开始对话"}</span>
+              </button>
+              <button type="button" className="keyboard-toggle" onClick={() => setShowTextInput(true)} title="文字输入">
+                <Keyboard className="h-5 w-5" />
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* RAG drawer */}
       {ragOpen ? (
         <aside className="rag-drawer">
           <div className="rag-drawer-backdrop" onClick={() => setRagOpen(false)} />
           <div className="rag-panel">
             <header className="rag-panel-header">
               <div>
-                <div className="chat-eyebrow">RAG Control</div>
+                <div className="rag-eyebrow">RAG Control</div>
                 <h3>知识库管理</h3>
               </div>
               <button type="button" className="icon-button" onClick={() => setRagOpen(false)}>
@@ -1387,6 +1530,7 @@ function renderStageMedia(
           preload="auto"
           poster={ref.frameUrl}
           onCanPlay={callbacks?.onReady}
+          onPlaying={callbacks?.onReady}
           onEnded={callbacks?.onEnded}
         />
         {ref.frameUrl ? <img src={ref.frameUrl} alt="" className={`stage-media-cover ${callbacks?.showCover ? "is-visible" : ""}`} /> : null}
@@ -1410,19 +1554,13 @@ function renderStageMedia(
           autoPlay
           preload="auto"
           onCanPlay={callbacks?.onReady}
+          onPlaying={callbacks?.onReady}
           onEnded={callbacks?.onEnded}
         />
       </div>
     );
   }
   return null;
-}
-
-function formatPlaybackState(state: "idle" | "playing" | "ended" | "stopped") {
-  if (state === "playing") return "播放中";
-  if (state === "ended") return "播放完成";
-  if (state === "stopped") return "已停止";
-  return "数字人待机";
 }
 
 function stripPlaybackFragment(url: string) {
