@@ -37,6 +37,8 @@ interface ChatMessage {
   role: "user" | "assistant";
   text: string;
   mediaRefs?: MediaRef[];
+  source?: "text" | "voice";
+  audioUrl?: string;
 }
 
 interface RagExhibit {
@@ -154,6 +156,7 @@ export default function App() {
   const recorderChunksRef = useRef<Blob[]>([]);
   const currentTraceRef = useRef<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const subtitleScrollRef = useRef<HTMLDivElement>(null);
   const mediaReturnTimerRef = useRef<number | null>(null);
   const stageTransitionTimerRef = useRef<number | null>(null);
   const subtitleEndRef = useRef<HTMLDivElement>(null);
@@ -188,34 +191,31 @@ export default function App() {
     }
   }, [directWsBaseUrl]);
 
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-    subtitleEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages]);
-
-  const currentTurnMessages = useMemo(() => {
+  const currentTurnMessages = (() => {
     const lastUserIndex = [...messages].map((message) => message.role).lastIndexOf("user");
     if (lastUserIndex === -1) {
       return messages.slice(-1);
     }
     return messages.slice(lastUserIndex);
-  }, [messages]);
+  })();
 
-  // Derive the latest user question and full assistant text from current turn
-  const latestUserText = useMemo(() => {
-    const userMsg = currentTurnMessages.find((m) => m.role === "user");
-    return userMsg?.text ?? "";
-  }, [currentTurnMessages]);
+  const latestUserMessage = currentTurnMessages.find((message) => message.role === "user");
+  const latestAssistantMessage = [...currentTurnMessages].reverse().find((message) => message.role === "assistant");
+  const latestUserText = latestUserMessage?.text ?? "";
+  const latestUserSource = latestUserMessage?.source ?? "text";
+  const latestUserAudioUrl = latestUserMessage?.audioUrl;
+  const latestAssistantFull = latestAssistantMessage?.text ?? "";
+  const latestAssistantMediaRefs = latestAssistantMessage?.mediaRefs ?? [];
 
-  const latestAssistantFull = useMemo(() => {
-    const assistantMsg = [...currentTurnMessages].reverse().find((m) => m.role === "assistant");
-    return assistantMsg?.text ?? "";
-  }, [currentTurnMessages]);
-
-  const latestAssistantMediaRefs = useMemo(() => {
-    const assistantMsg = [...currentTurnMessages].reverse().find((m) => m.role === "assistant");
-    return assistantMsg?.mediaRefs ?? [];
-  }, [currentTurnMessages]);
+  useEffect(() => {
+    const host = subtitleScrollRef.current;
+    if (host) {
+      host.scrollTop = host.scrollHeight;
+      return;
+    }
+    messagesEndRef.current?.scrollIntoView({ block: "end" });
+    subtitleEndRef.current?.scrollIntoView({ block: "end" });
+  }, [messages, displayedAssistantText, latestAssistantMediaRefs, subtitlePhase]);
 
   // Token buffer: uniform-speed character reveal
   useEffect(() => {
@@ -415,7 +415,20 @@ export default function App() {
         try {
           const data = JSON.parse(event.data);
           if (data.type === "subtitle_user" && data.text) {
-            setMessages([{ id: `${Date.now()}-relay-user`, role: "user", text: String(data.text) }]);
+            const traceId = data.traceId ? String(data.traceId) : `relay-${Date.now()}`;
+            let audioUrl: string | undefined;
+            if (data.audioData && data.audioMime) {
+              try {
+                const bin = atob(data.audioData);
+                const bytes = new Uint8Array(bin.length);
+                for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                audioUrl = URL.createObjectURL(new Blob([bytes], { type: data.audioMime }));
+              } catch (e) {
+                console.error("Failed to decode relay audio", e);
+              }
+            }
+            // 先到先显示，后到覆盖（partial → final）
+            appendUserMessage(traceId, String(data.text), "voice", audioUrl);
             return;
           }
           if (data.type === "subtitle_ai_stream" && data.text) {
@@ -547,11 +560,22 @@ export default function App() {
     }
   }
 
-  function appendUserMessage(traceId: string, text: string) {
+  function appendUserMessage(traceId: string, text: string, source: "text" | "voice" = "text", audioUrl?: string) {
     setMessages((prev) => {
       const filtered = prev.filter((item) => item.id !== `${traceId}-user`);
-      return [...filtered, { id: `${traceId}-user`, role: "user", text }];
+      const previous = prev.find((item) => item.id === `${traceId}-user`);
+      return [...filtered, {
+        id: `${traceId}-user`,
+        role: "user",
+        text,
+        source,
+        audioUrl: audioUrl ?? previous?.audioUrl,
+      }];
     });
+  }
+
+  function ensureVoiceUserMessage(traceId: string, text = "语音识别中…", audioUrl?: string) {
+    appendUserMessage(traceId, text, "voice", audioUrl);
   }
 
   function appendAssistantChunk(traceId: string, text: string) {
@@ -688,6 +712,7 @@ export default function App() {
           assetId: item.ref.assetId,
           assetType: item.ref.assetType,
           label: item.ref.label,
+          url: item.ref.url,
           status: item.status,
         })),
       },
@@ -748,8 +773,27 @@ export default function App() {
         const traceId = String(data.traceId ?? currentTraceRef.current ?? "");
         if (!traceId) return;
 
-        if (data.type === "asr" && data.stage === "final" && data.text) {
-          appendUserMessage(traceId, String(data.text));
+        if (data.type === "asr" && data.text) {
+          let audioUrl: string | undefined;
+          if (data.audioData && data.audioMime) {
+            try {
+              const bin = atob(data.audioData);
+              const bytes = new Uint8Array(bin.length);
+              for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+              audioUrl = URL.createObjectURL(new Blob([bytes], { type: data.audioMime }));
+            } catch (e) {
+              console.error("Failed to decode direct audio", e);
+            }
+          }
+          appendUserMessage(traceId, String(data.text), "voice", audioUrl);
+          return;
+        }
+        if (data.type === "audio_error") {
+          const message = typeof data.message === "string" && data.message
+            ? `语音识别失败：${data.message}`
+            : "语音识别失败";
+          setMessages((prev) => [...prev, { id: `${traceId}-audio-error-${Date.now()}`, role: "assistant", text: message }]);
+          setConnectionStatus("语音识别失败");
           return;
         }
         if (data.type === "token" && data.text) {
@@ -799,7 +843,7 @@ export default function App() {
     if (!text) return;
     const traceId = `browser-text-${Date.now()}`;
     resetConversation(traceId);
-    appendUserMessage(traceId, text);
+    appendUserMessage(traceId, text, "text");
     setInput("");
     try {
       const socket = await ensureAssistantSocket();
@@ -840,6 +884,7 @@ export default function App() {
       recorderChunksRef.current = [];
       const traceId = `browser-audio-${Date.now()}`;
       resetConversation(traceId);
+      ensureVoiceUserMessage(traceId);
       recorderRef.current = recorder;
       setIsRecording(true);
       setConnectionStatus("录音中");
@@ -857,6 +902,7 @@ export default function App() {
 
       recorder.onstop = async () => {
         const blob = new Blob(recorderChunksRef.current, { type: recorder.mimeType || "audio/webm" });
+        ensureVoiceUserMessage(traceId, "语音识别中…");
         const buffer = await blob.arrayBuffer();
         const bytes = new Uint8Array(buffer);
         let binary = "";
@@ -1189,12 +1235,31 @@ export default function App() {
             {latestUserText ? (
               <div className="subtitle-question">
                 <span className="subtitle-question-label">你：</span>
-                <span className="subtitle-question-text">{latestUserText}</span>
+                <span className="subtitle-question-text">
+                  {latestUserSource === "voice" ? (
+                    latestUserAudioUrl ? (
+                      <button
+                        type="button"
+                        className="subtitle-question-audio-btn"
+                        onClick={() => {
+                          const audio = new Audio(latestUserAudioUrl);
+                          void audio.play().catch((error) => console.error("Play recorded audio failed", error));
+                        }}
+                        aria-label="播放识别前的原始语音"
+                      >
+                        <Volume2 className="subtitle-question-audio-icon" />
+                      </button>
+                    ) : (
+                      <Volume2 className="subtitle-question-audio-icon" />
+                    )
+                  ) : null}
+                  <span>{latestUserText}</span>
+                </span>
               </div>
             ) : null}
             {/* Line 2: Assistant answer (scrollable, uniform-speed reveal) */}
             {displayedAssistantText ? (
-              <div className="subtitle-answer chat-scrollbar">
+              <div ref={subtitleScrollRef} className="subtitle-answer chat-scrollbar">
                 <div className="markdown-body">
                   <ReactMarkdown remarkPlugins={[remarkGfm]}>
                     {displayedAssistantText}

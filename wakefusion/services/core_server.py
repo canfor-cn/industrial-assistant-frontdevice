@@ -167,6 +167,9 @@ class CoreServer:
         self._ui_ws_clients = set()  # 存储连接的UI客户端
         self._ui_ws_thread: Optional[threading.Thread] = None
         self._ui_ws_loop: Optional[asyncio.AbstractEventLoop] = None
+
+        # UI音频缓冲：按traceId缓存上行PCM块，ASR结果到达时附带音频发给前端
+        self._ui_audio_buffer: dict = {}  # {trace_id: [bytes, ...]}
         
         # 初始化控制socket
         self._init_control_socket()
@@ -477,12 +480,23 @@ class CoreServer:
             text = data.get("text", "")
             if text:
                 logger.info(f"📝 转发用户字幕: {text}")
-                self._forward_to_ui({
+                trace_id = data.get("traceId")
+                stage = data.get("stage", "final")
+                ui_msg = {
                     "type": "subtitle_user",
-                    "traceId": data.get("traceId"),
-                    "stage": data.get("stage", "final"),
+                    "traceId": trace_id,
+                    "stage": stage,
                     "text": text
-                })
+                }
+                # ASR final 时附带录音音频（WAV base64）供前端播放
+                if stage == "final" and trace_id and trace_id in self._ui_audio_buffer:
+                    chunks = self._ui_audio_buffer.pop(trace_id, [])
+                    if chunks:
+                        pcm_data = b"".join(chunks)
+                        wav_data = self._pcm_to_wav(pcm_data, 16000, 1, 16)
+                        ui_msg["audioData"] = base64.b64encode(wav_data).decode("ascii")
+                        ui_msg["audioMime"] = "audio/wav"
+                self._forward_to_ui(ui_msg)
         elif msg_type == "token":
             text = data.get("text", "")
             if text:
@@ -995,6 +1009,8 @@ class CoreServer:
     
     def _send_audio_segment_begin(self, trace_id: str, sample_rate: int = 16000):
         self._current_audio_seq = 0
+        # 初始化UI音频缓冲
+        self._ui_audio_buffer[trace_id] = []
         self._send_websocket_message({
             "type": "audio_segment_begin",
             "traceId": trace_id,
@@ -1007,6 +1023,9 @@ class CoreServer:
         })
 
     def _send_audio_segment_chunk(self, trace_id: str, audio_data: bytes):
+        # 同时缓存到UI音频缓冲
+        if trace_id in self._ui_audio_buffer:
+            self._ui_audio_buffer[trace_id].append(audio_data)
         self._send_websocket_message({
             "type": "audio_segment_chunk",
             "traceId": trace_id,
@@ -1026,6 +1045,22 @@ class CoreServer:
             "timestamp": time.time()
         })
     
+    @staticmethod
+    def _pcm_to_wav(pcm_data: bytes, sample_rate: int = 16000, channels: int = 1, bits_per_sample: int = 16) -> bytes:
+        """将原始PCM数据转换为WAV格式（添加44字节WAV头）"""
+        import struct
+        data_size = len(pcm_data)
+        byte_rate = sample_rate * channels * bits_per_sample // 8
+        block_align = channels * bits_per_sample // 8
+        header = struct.pack(
+            '<4sI4s4sIHHIIHH4sI',
+            b'RIFF', 36 + data_size, b'WAVE',
+            b'fmt ', 16, 1,  # PCM format
+            channels, sample_rate, byte_rate, block_align, bits_per_sample,
+            b'data', data_size
+        )
+        return header + pcm_data
+
     # 🌟 修复1：_vad_timeout_checker 方法已删除
     # VAD超时检查逻辑已移至 _process_audio_data 中，实现纯事件驱动，避免多线程锁竞争
     

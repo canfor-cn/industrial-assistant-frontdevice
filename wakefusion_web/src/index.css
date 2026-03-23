@@ -461,36 +461,72 @@ button {
 
 /* Line 1: User question */
 .subtitle-question {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   padding-bottom: 10px;
   border-bottom: 1px solid rgba(0, 0, 0, 0.05);
   margin-bottom: 10px;
-  color: var(--text-secondary);
+  color: rgba(15, 23, 42, 0.9);
   font-size: 15px;
   line-height: 1.5;
-  text-shadow: 0 1px 3px rgba(255, 255, 255, 0.8);
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.28);
+  min-width: 0;
+}
+
+.subtitle-question-label {
+  color: rgba(30, 41, 59, 0.72);
+  font-size: 13px;
+  flex: 0 0 auto;
+}
+
+.subtitle-question-text {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: rgba(15, 23, 42, 0.92);
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.subtitle-question-label {
-  color: var(--text-muted);
-  font-size: 13px;
-  margin-right: 4px;
+.subtitle-question-audio-icon {
+  width: 20px;
+  height: 20px;
+  color: var(--accent, #1A7F64);
+  flex: 0 0 auto;
+  filter: drop-shadow(0 1px 2px rgba(0,0,0,0.15));
 }
 
-.subtitle-question-text {
-  color: var(--text-secondary);
+.subtitle-question-audio-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1.5px solid rgba(26, 127, 100, 0.3);
+  border-radius: 50%;
+  background: rgba(26, 127, 100, 0.08);
+  cursor: pointer;
+  flex: 0 0 auto;
+  transition: background 0.2s, border-color 0.2s;
+}
+
+.subtitle-question-audio-btn:hover {
+  background: rgba(26, 127, 100, 0.16);
+  border-color: rgba(26, 127, 100, 0.5);
 }
 
 /* Line 2: Assistant answer (scrollable) */
 .subtitle-answer {
   max-height: 32vh;
   overflow-y: auto;
-  color: var(--text-primary);
+  color: rgba(15, 23, 42, 0.94);
   font-size: 20px;
   line-height: 1.8;
-  text-shadow: 0 1px 2px rgba(255, 255, 255, 0.6);
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.24);
   scrollbar-width: thin;
   scrollbar-color: rgba(0, 0, 0, 0.08) transparent;
 }
@@ -510,10 +546,11 @@ button {
   border-radius: var(--radius-full);
   border: 1px solid var(--border);
   background: var(--glass);
-  color: var(--text-primary);
+  color: rgba(15, 23, 42, 0.9);
   font-size: 13px;
   box-shadow: var(--shadow-sm);
   transition: all var(--duration-fast) var(--ease);
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.18);
 }
 
 .subtitle-media-chip:hover {
