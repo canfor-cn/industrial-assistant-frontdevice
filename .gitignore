@@ -10,7 +10,8 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
+lib/*
+!lib/orbbec/
 lib64/
 parts/
 sdist/
@@ -87,6 +88,11 @@ real_manifest.json
 # ===================== 二进制库文件 =====================
 *.dll
 *.pyd
+
+# 但保留内嵌的 Orbbec SDK（便携部署开箱即用）
+!lib/orbbec/
+!lib/orbbec/*.dll
+!lib/orbbec/*.pyd
 
 # ===================== 备份 / 临时文件 =====================
 pip_backup.txt
