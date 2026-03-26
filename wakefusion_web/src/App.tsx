@@ -1,6 +1,7 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { isTauriEnv, tauriSendText, tauriSendAudio, tauriGetCachedAudio, subscribeTauriEvents, type VoiceMessage } from "./useTauriBackend";
 import {
   Mic,
   MicOff,
@@ -38,7 +39,10 @@ interface ChatMessage {
   text: string;
   mediaRefs?: MediaRef[];
   source?: "text" | "voice";
+  audioId?: string;
   audioUrl?: string;
+  audioBase64?: string;
+  audioMime?: string;
 }
 
 interface RagExhibit {
@@ -163,6 +167,15 @@ export default function App() {
   const assistantFullTextRef = useRef("");
   const displayTimerRef = useRef<number | null>(null);
   const subtitleFadeTimerRef = useRef<number | null>(null);
+  const ttsSegmentBuffersRef = useRef(new Map<string, Uint8Array[]>());
+  const ttsSegmentMetaRef = useRef(new Map<string, { mimeType?: string }>());
+  const ttsPlaybackQueueRef = useRef<Array<{ url: string; mimeType: string }>>([]);
+  const ttsCurrentAudioRef = useRef<HTMLAudioElement | null>(null);
+  const ttsCurrentUrlRef = useRef<string | null>(null);
+  // Web Audio API queue for Tauri mode (bypasses blob URL limitations)
+  const ttsWebAudioQueueRef = useRef<ArrayBuffer[]>([]);
+  const ttsWebAudioPlayingRef = useRef(false);
+  const ttsAudioContextRef = useRef<AudioContext | null>(null);
 
   const connectionLabel = useMemo(() => {
     if (isRecording) return "录音中";
@@ -203,7 +216,11 @@ export default function App() {
   const latestAssistantMessage = [...currentTurnMessages].reverse().find((message) => message.role === "assistant");
   const latestUserText = latestUserMessage?.text ?? "";
   const latestUserSource = latestUserMessage?.source ?? "text";
+  const latestUserAudioId = latestUserMessage?.audioId;
   const latestUserAudioUrl = latestUserMessage?.audioUrl;
+  const latestUserAudioBase64 = latestUserMessage?.audioBase64;
+  const latestUserAudioMime = latestUserMessage?.audioMime;
+  const hasPlayableAudio = !!(latestUserAudioId || latestUserAudioUrl || latestUserAudioBase64);
   const latestAssistantFull = latestAssistantMessage?.text ?? "";
   const latestAssistantMediaRefs = latestAssistantMessage?.mediaRefs ?? [];
 
@@ -216,6 +233,26 @@ export default function App() {
     messagesEndRef.current?.scrollIntoView({ block: "end" });
     subtitleEndRef.current?.scrollIntoView({ block: "end" });
   }, [messages, displayedAssistantText, latestAssistantMediaRefs, subtitlePhase]);
+
+  useEffect(() => {
+    return () => {
+      if (ttsCurrentAudioRef.current) {
+        ttsCurrentAudioRef.current.pause();
+        ttsCurrentAudioRef.current.src = "";
+        ttsCurrentAudioRef.current = null;
+      }
+      if (ttsCurrentUrlRef.current) {
+        URL.revokeObjectURL(ttsCurrentUrlRef.current);
+        ttsCurrentUrlRef.current = null;
+      }
+      for (const item of ttsPlaybackQueueRef.current) {
+        URL.revokeObjectURL(item.url);
+      }
+      ttsPlaybackQueueRef.current = [];
+      ttsSegmentBuffersRef.current.clear();
+      ttsSegmentMetaRef.current.clear();
+    };
+  }, []);
 
   // Token buffer: uniform-speed character reveal
   useEffect(() => {
@@ -349,6 +386,79 @@ export default function App() {
       console.warn("Bind XVF3800 audio sink failed", error);
     });
   }, [preferredSinkId, stageMediaRef, stageMode]);
+
+  // Tauri IPC event subscription (replaces WS when running inside Tauri host)
+  useEffect(() => {
+    if (!isTauriEnv()) return;
+    setConnectionStatus("Tauri host 已连接");
+    let cancelled = false;
+    let cleanup: (() => void) | undefined;
+    subscribeTauriEvents({
+      onToken: (traceId, text) => {
+        if (!cancelled) appendAssistantChunk(traceId, text);
+      },
+      onAsrResult: (traceId, text, stage, audioId) => {
+        if (cancelled) return;
+        if (stage !== "final" && stage !== "done") return;
+        // audioId alignment: discard if it doesn't match the current user message's audioId
+        setMessages((prev) => {
+          const userMsg = prev.find((m) => m.id === `${traceId}-user`);
+          if (userMsg?.audioId && audioId && userMsg.audioId !== audioId) return prev;
+          const filtered = prev.filter((m) => m.id !== `${traceId}-user`);
+          return [...filtered, { ...userMsg!, text, audioId: audioId ?? userMsg?.audioId }];
+        });
+      },
+      onFinal: (_traceId) => {},
+      onClear: () => {
+        if (!cancelled) {
+          setMessages([]);
+          setDisplayedAssistantText("");
+        }
+      },
+      onMediaRef: (data) => {
+        if (cancelled) return;
+        const ref = normalizeMediaRef(data);
+        if (isPlayableMedia(ref.assetType)) {
+          activateStageMedia(ref, data.traceId || "");
+        }
+        appendMediaRefToLatest(ref);
+      },
+      onConnectionStatus: (_connected, message) => {
+        if (!cancelled) setConnectionStatus(message);
+      },
+      onVoiceMessage: (msg) => {
+        if (cancelled) return;
+        // audioId from gateway — audio data is cached in Rust, not sent to WebView
+        appendUserMessage(msg.traceId, msg.text, "voice", undefined, undefined, msg.audioMime, msg.audioId);
+      },
+      onTtsAudioChunk: (data, mimeType) => {
+        if (cancelled) return;
+        try {
+          const bin = atob(data);
+          const bytes = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+          console.log(`[TTS] chunk received: ${bytes.length} bytes, queue=${ttsPlaybackQueueRef.current.length}`);
+          enqueueTtsPlayback([bytes], mimeType || "audio/wav");
+        } catch (e) {
+          console.error("TTS audio decode error", e);
+        }
+      },
+      onTtsAudioEnd: () => {
+        // TTS stream finished — no special handling needed
+      },
+    }).then((unsub) => {
+      if (cancelled) {
+        // Effect was cleaned up before subscription completed — immediately unsub
+        unsub();
+      } else {
+        cleanup = unsub;
+      }
+    });
+    return () => {
+      cancelled = true;
+      cleanup?.();
+    };
+  }, []);
 
   useEffect(() => {
     const script = document.createElement("script");
@@ -508,7 +618,9 @@ export default function App() {
         window.clearTimeout(stageTransitionTimerRef.current);
       }
       recorderRef.current?.stream.getTracks().forEach((track) => track.stop());
-      directSocketRef.current?.close();
+      if (!isTauriEnv()) {
+        directSocketRef.current?.close();
+      }
     };
   }, []);
 
@@ -560,16 +672,19 @@ export default function App() {
     }
   }
 
-  function appendUserMessage(traceId: string, text: string, source: "text" | "voice" = "text", audioUrl?: string) {
+  function appendUserMessage(traceId: string, text: string, source: "text" | "voice" = "text", audioUrl?: string, audioBase64?: string, audioMime?: string, audioId?: string) {
     setMessages((prev) => {
       const filtered = prev.filter((item) => item.id !== `${traceId}-user`);
       const previous = prev.find((item) => item.id === `${traceId}-user`);
       return [...filtered, {
         id: `${traceId}-user`,
-        role: "user",
+        role: "user" as const,
         text,
         source,
+        audioId: audioId ?? previous?.audioId,
         audioUrl: audioUrl ?? previous?.audioUrl,
+        audioBase64: audioBase64 ?? previous?.audioBase64,
+        audioMime: audioMime ?? previous?.audioMime,
       }];
     });
   }
@@ -720,6 +835,10 @@ export default function App() {
   }
 
   async function ensureAssistantSocket() {
+    // In Tauri mode, WS is managed by the Rust host — no direct connection from frontend
+    if (isTauriEnv()) {
+      throw new Error("WS not available in Tauri mode — use invoke() instead");
+    }
     const targetUrl = buildAssistantWsUrl();
     const current = directSocketRef.current;
     if (current && current.readyState === WebSocket.OPEN && directSocketKeyRef.current === targetUrl) {
@@ -774,18 +893,21 @@ export default function App() {
         if (!traceId) return;
 
         if (data.type === "asr" && data.text) {
-          let audioUrl: string | undefined;
-          if (data.audioData && data.audioMime) {
-            try {
-              const bin = atob(data.audioData);
-              const bytes = new Uint8Array(bin.length);
-              for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-              audioUrl = URL.createObjectURL(new Blob([bytes], { type: data.audioMime }));
-            } catch (e) {
-              console.error("Failed to decode direct audio", e);
+          const asrAudioId = data.audioId ? String(data.audioId) : undefined;
+          // audioId alignment: discard if it doesn't match current user message
+          setMessages((prev) => {
+            const userMsg = prev.find((m) => m.id === `${traceId}-user`);
+            if (userMsg?.audioId && asrAudioId && userMsg.audioId !== asrAudioId) {
+              console.warn("ASR audioId mismatch, discarding", { expected: userMsg.audioId, got: asrAudioId });
+              return prev;
             }
-          }
-          appendUserMessage(traceId, String(data.text), "voice", audioUrl);
+            const filtered = prev.filter((m) => m.id !== `${traceId}-user`);
+            return [...filtered, {
+              ...(userMsg ?? { id: `${traceId}-user`, role: "user" as const, source: "voice" as const }),
+              text: String(data.text),
+              audioId: asrAudioId ?? userMsg?.audioId,
+            }];
+          });
           return;
         }
         if (data.type === "audio_error") {
@@ -794,6 +916,24 @@ export default function App() {
             : "语音识别失败";
           setMessages((prev) => [...prev, { id: `${traceId}-audio-error-${Date.now()}`, role: "assistant", text: message }]);
           setConnectionStatus("语音识别失败");
+          return;
+        }
+        if (data.type === "audio_begin") {
+          ttsSegmentBuffersRef.current.set(traceId, []);
+          ttsSegmentMetaRef.current.set(traceId, {
+            mimeType: typeof data.mimeType === "string" && data.mimeType ? data.mimeType : "audio/wav",
+          });
+          return;
+        }
+        if (data.type === "audio_chunk" && typeof data.data === "string") {
+          const chunk = decodeBase64ToBytes(data.data);
+          const meta = ttsSegmentMetaRef.current.get(traceId);
+          enqueueTtsPlayback([chunk], meta?.mimeType ?? "audio/wav");
+          return;
+        }
+        if (data.type === "audio_end") {
+          ttsSegmentBuffersRef.current.delete(traceId);
+          ttsSegmentMetaRef.current.delete(traceId);
           return;
         }
         if (data.type === "token" && data.text) {
@@ -817,6 +957,7 @@ export default function App() {
           return;
         }
         if (data.type === "stop_tts") {
+          stopTtsPlayback();
           setConnectionStatus("播放已打断");
           return;
         }
@@ -846,15 +987,19 @@ export default function App() {
     appendUserMessage(traceId, text, "text");
     setInput("");
     try {
-      const socket = await ensureAssistantSocket();
-      socket.send(JSON.stringify({
-        type: "asr",
-        stage: "final",
-        traceId,
-        deviceId: directDeviceId.trim(),
-        text,
-        context: buildMediaContext(),
-      }));
+      if (isTauriEnv()) {
+        await tauriSendText(text, traceId, directDeviceId.trim());
+      } else {
+        const socket = await ensureAssistantSocket();
+        socket.send(JSON.stringify({
+          type: "asr",
+          stage: "final",
+          traceId,
+          deviceId: directDeviceId.trim(),
+          text,
+          context: buildMediaContext(),
+        }));
+      }
     } catch (error) {
       setConnectionStatus(error instanceof Error ? error.message : "文本发送失败");
     }
@@ -877,14 +1022,18 @@ export default function App() {
     }
 
     try {
-      await ensureAssistantSocket();
+      if (!isTauriEnv()) {
+        await ensureAssistantSocket();
+      }
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const mimeType = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"].find((candidate) => MediaRecorder.isTypeSupported(candidate));
       const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
       recorderChunksRef.current = [];
       const traceId = `browser-audio-${Date.now()}`;
       resetConversation(traceId);
-      ensureVoiceUserMessage(traceId);
+      if (!isTauriEnv()) {
+        ensureVoiceUserMessage(traceId); // Browser mode: show immediately
+      }
       recorderRef.current = recorder;
       setIsRecording(true);
       setConnectionStatus("录音中");
@@ -902,7 +1051,6 @@ export default function App() {
 
       recorder.onstop = async () => {
         const blob = new Blob(recorderChunksRef.current, { type: recorder.mimeType || "audio/webm" });
-        ensureVoiceUserMessage(traceId, "语音识别中…");
         const buffer = await blob.arrayBuffer();
         const bytes = new Uint8Array(buffer);
         let binary = "";
@@ -911,6 +1059,12 @@ export default function App() {
         }
         const data = btoa(binary);
         try {
+          if (isTauriEnv()) {
+            // Tauri: send to Rust host — it will emit voice_message back to display
+            await tauriSendAudio(traceId, data, blob.type || "audio/webm", "zh");
+          } else {
+          // Browser: display locally + send via WS
+          ensureVoiceUserMessage(traceId, "语音识别中…", URL.createObjectURL(blob));
           const socket = await ensureAssistantSocket();
           socket.send(JSON.stringify({
             type: "audio_segment_begin",
@@ -934,6 +1088,7 @@ export default function App() {
             deviceId: directDeviceId.trim(),
             reason: "browser_recording_complete",
           }));
+          } // end else (non-Tauri)
         } catch (error) {
           setConnectionStatus(error instanceof Error ? error.message : "录音上传失败");
         }
@@ -943,6 +1098,135 @@ export default function App() {
     } catch (error) {
       setIsRecording(false);
       setConnectionStatus(error instanceof Error ? error.message : "无法开始录音");
+    }
+  }
+
+  function decodeBase64ToBytes(data: string) {
+    const binary = atob(data);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+  }
+
+  function concatChunks(chunks: Uint8Array[]) {
+    const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return merged;
+  }
+
+  function playNextTtsSegment() {
+    if (ttsCurrentAudioRef.current || ttsPlaybackQueueRef.current.length === 0) return;
+    const next = ttsPlaybackQueueRef.current.shift();
+    if (!next) return;
+    const audio = new Audio(next.url);
+    ttsCurrentAudioRef.current = audio;
+    ttsCurrentUrlRef.current = next.url;
+    audio.onended = () => {
+      audio.src = "";
+      ttsCurrentAudioRef.current = null;
+      if (ttsCurrentUrlRef.current) {
+        URL.revokeObjectURL(ttsCurrentUrlRef.current);
+        ttsCurrentUrlRef.current = null;
+      }
+      playNextTtsSegment();
+    };
+    audio.onerror = () => {
+      audio.pause();
+      audio.src = "";
+      ttsCurrentAudioRef.current = null;
+      if (ttsCurrentUrlRef.current) {
+        URL.revokeObjectURL(ttsCurrentUrlRef.current);
+        ttsCurrentUrlRef.current = null;
+      }
+      playNextTtsSegment();
+    };
+    audio.play().catch((error) => {
+      console.error("TTS playback failed", error);
+      audio.pause();
+      audio.src = "";
+      ttsCurrentAudioRef.current = null;
+      if (ttsCurrentUrlRef.current) {
+        URL.revokeObjectURL(ttsCurrentUrlRef.current);
+        ttsCurrentUrlRef.current = null;
+      }
+      playNextTtsSegment();
+    });
+  }
+
+  function enqueueTtsPlayback(chunks: Uint8Array[], mimeType: string) {
+    const merged = concatChunks(chunks);
+    if (isTauriEnv()) {
+      // Tauri mode: use Web Audio API (blob URLs don't work in WebView2)
+      ttsWebAudioQueueRef.current.push(merged.buffer.slice(merged.byteOffset, merged.byteOffset + merged.byteLength));
+      playNextWebAudioSegment();
+    } else {
+      // Browser mode: use <audio> + blob URL
+      const url = URL.createObjectURL(new Blob([merged], { type: mimeType || "audio/wav" }));
+      ttsPlaybackQueueRef.current.push({ url, mimeType });
+      playNextTtsSegment();
+    }
+  }
+
+  function playNextWebAudioSegment() {
+    if (ttsWebAudioPlayingRef.current || ttsWebAudioQueueRef.current.length === 0) return;
+    const buf = ttsWebAudioQueueRef.current.shift();
+    if (!buf) return;
+    ttsWebAudioPlayingRef.current = true;
+
+    if (!ttsAudioContextRef.current) {
+      ttsAudioContextRef.current = new AudioContext();
+    }
+    const ctx = ttsAudioContextRef.current;
+
+    ctx.decodeAudioData(buf.slice(0)) // slice to avoid detached buffer
+      .then((audioBuffer) => {
+        const source = ctx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(ctx.destination);
+        source.onended = () => {
+          ttsWebAudioPlayingRef.current = false;
+          playNextWebAudioSegment();
+        };
+        source.start();
+      })
+      .catch((err) => {
+        console.error("Web Audio decode failed:", err);
+        ttsWebAudioPlayingRef.current = false;
+        playNextWebAudioSegment();
+      });
+  }
+
+  function stopTtsPlayback() {
+    // Stop <audio> mode
+    if (ttsCurrentAudioRef.current) {
+      ttsCurrentAudioRef.current.pause();
+      ttsCurrentAudioRef.current.currentTime = 0;
+      ttsCurrentAudioRef.current.src = "";
+      ttsCurrentAudioRef.current = null;
+    }
+    if (ttsCurrentUrlRef.current) {
+      URL.revokeObjectURL(ttsCurrentUrlRef.current);
+      ttsCurrentUrlRef.current = null;
+    }
+    for (const item of ttsPlaybackQueueRef.current) {
+      URL.revokeObjectURL(item.url);
+    }
+    ttsPlaybackQueueRef.current = [];
+    ttsSegmentBuffersRef.current.clear();
+    ttsSegmentMetaRef.current.clear();
+    // Stop Web Audio mode
+    ttsWebAudioQueueRef.current = [];
+    ttsWebAudioPlayingRef.current = false;
+    if (ttsAudioContextRef.current) {
+      ttsAudioContextRef.current.close().catch(() => {});
+      ttsAudioContextRef.current = null;
     }
   }
 
@@ -1187,7 +1471,7 @@ export default function App() {
       <div className="ui-overlay">
         {/* Top-left: branding */}
         <div className="overlay-branding">
-          <span className="brand-name-cn">成都曜曜慧道展陈有限公司</span>
+          <span className="brand-name-cn">成都曜曜慧道科技有限公司</span>
           <span className="brand-name-en">Chengdu YaoYao Huidao Exhibition Co., Ltd.</span>
         </div>
 
@@ -1237,13 +1521,41 @@ export default function App() {
                 <span className="subtitle-question-label">你：</span>
                 <span className="subtitle-question-text">
                   {latestUserSource === "voice" ? (
-                    latestUserAudioUrl ? (
+                    hasPlayableAudio ? (
                       <button
                         type="button"
                         className="subtitle-question-audio-btn"
                         onClick={() => {
-                          const audio = new Audio(latestUserAudioUrl);
-                          void audio.play().catch((error) => console.error("Play recorded audio failed", error));
+                          // Play via Web Audio API (works in both Tauri and browser)
+                          const playFromArrayBuffer = (buf: ArrayBuffer) => {
+                            const ctx = new AudioContext();
+                            ctx.decodeAudioData(buf).then(decoded => {
+                              const src = ctx.createBufferSource();
+                              src.buffer = decoded;
+                              src.connect(ctx.destination);
+                              src.onended = () => ctx.close();
+                              src.start();
+                            }).catch(e => console.error("Audio decode failed", e));
+                          };
+                          if (latestUserAudioId && isTauriEnv()) {
+                            // Fetch from Rust gateway cache by audioId
+                            tauriGetCachedAudio(latestUserAudioId).then(result => {
+                              if (!result) return;
+                              const bin = atob(result.audioData);
+                              const bytes = new Uint8Array(bin.length);
+                              for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                              playFromArrayBuffer(bytes.buffer);
+                            }).catch(e => console.error("Play cached audio failed", e));
+                          } else if (latestUserAudioBase64) {
+                            const bin = atob(latestUserAudioBase64);
+                            const bytes = new Uint8Array(bin.length);
+                            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                            playFromArrayBuffer(bytes.buffer);
+                          } else if (latestUserAudioUrl) {
+                            // Blob URL (from browser recording)
+                            fetch(latestUserAudioUrl).then(r => r.arrayBuffer()).then(playFromArrayBuffer)
+                              .catch(e => console.error("Play audio failed", e));
+                          }
                         }}
                         aria-label="播放识别前的原始语音"
                       >
