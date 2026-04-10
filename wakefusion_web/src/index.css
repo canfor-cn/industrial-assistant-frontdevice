@@ -112,6 +112,8 @@ button {
   overflow: hidden;
 }
 
+/* Particle background canvas — positioned via inline style in component */
+
 .stage-avatar-shell {
   position: absolute;
   inset: 0;
@@ -125,6 +127,11 @@ button {
   opacity: 0.06;
   transform: scale(0.98);
   filter: blur(4px);
+}
+
+/* Stop Unity rendering when avatar is hidden (saves CPU/GPU) */
+.stage-avatar-shell.is-dimmed .unity-canvas {
+  display: none;
 }
 
 .unity-canvas {
@@ -268,6 +275,110 @@ button {
   width: min(100%, 560px);
 }
 
+/* ─── Image Carousel ─── */
+.stage-carousel {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.stage-carousel-image {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.stage-carousel-zoom-hint {
+  position: absolute;
+  bottom: 60px;
+  right: 20px;
+  background: rgba(0, 0, 0, 0.45);
+  color: #fff;
+  border-radius: 50%;
+  padding: 10px;
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+.stage-carousel-dots {
+  position: absolute;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 8px;
+}
+
+.stage-carousel-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.7);
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+
+.stage-carousel-dot.is-active {
+  background: #fff;
+}
+
+/* ─── Lightbox ─── */
+.stage-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  background: rgba(0, 0, 0, 0.92);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  touch-action: none;
+}
+
+.stage-lightbox-close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  z-index: 31;
+  background: rgba(255, 255, 255, 0.15);
+  border: none;
+  border-radius: 50%;
+  padding: 10px;
+  color: #fff;
+  cursor: pointer;
+}
+
+.stage-lightbox-image {
+  max-width: 95vw;
+  max-height: 95vh;
+  object-fit: contain;
+  touch-action: none;
+  transition: transform 0.1s ease;
+}
+
+/* ─── Document Viewer ─── */
+.stage-doc-viewer {
+  width: 100%;
+  height: 100%;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  background: #fff;
+}
+
+.stage-doc-frame {
+  width: 100%;
+  height: 100%;
+  min-height: 100vh;
+  border: none;
+}
+
 /* ─── UI Overlay (Layer 2-3) ─── */
 .ui-overlay {
   position: absolute;
@@ -281,6 +392,20 @@ button {
 
 .ui-overlay > * {
   pointer-events: auto;
+}
+
+/* ─── UI toggle hotzone (top-right corner, double-click to show/hide UI) ─── */
+.ui-toggle-hotzone {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 80px;
+  height: 80px;
+  z-index: 50;
+  pointer-events: auto;
+  cursor: default;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 /* ─── Branding (top-left) ─── */
@@ -322,7 +447,7 @@ button {
   gap: 8px;
   padding: 20px 24px;
   pointer-events: none;
-  z-index: 12;
+  z-index: 51;
 }
 
 .overlay-header > * {
@@ -364,6 +489,16 @@ button {
   color: var(--text-secondary);
   box-shadow: var(--shadow-sm);
   transition: all var(--duration-fast) var(--ease);
+}
+
+.overlay-btn.is-device-online {
+  border-color: rgba(34, 197, 94, 0.4);
+  color: #22c55e;
+}
+
+.overlay-btn.is-device-offline {
+  border-color: rgba(239, 68, 68, 0.3);
+  color: #ef4444;
 }
 
 .overlay-btn:hover {
@@ -428,7 +563,81 @@ button {
   border-color: rgba(217, 119, 6, 0.3);
 }
 
-/* ─── Subtitle Bar ─── */
+/* ─── Live Subtitle Panel (two-line: user voice + assistant text) ─── */
+.live-subtitle-panel {
+  position: absolute;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(80vw, 920px);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  z-index: 30;
+  pointer-events: none;
+}
+
+.live-subtitle-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 20px;
+  border-radius: var(--radius-lg, 12px);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  animation: live-subtitle-in 0.3s ease both;
+  transition: opacity 1.2s ease;
+}
+
+.live-subtitle-line.is-fading {
+  opacity: 0;
+}
+
+@keyframes live-subtitle-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.live-subtitle-user {
+  background: rgba(255, 255, 255, 0.85);
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  color: #333;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08), 0 1px 4px rgba(0, 0, 0, 0.04);
+}
+
+.live-subtitle-assistant {
+  background: rgba(255, 255, 255, 0.88);
+  border: 1px solid rgba(26, 127, 100, 0.15);
+  color: #1a5c46;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08), 0 1px 4px rgba(0, 0, 0, 0.04);
+}
+
+.live-subtitle-voice-icon {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  color: #666;
+  animation: voice-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes voice-pulse {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 1; }
+}
+
+.live-subtitle-text {
+  font-size: 15px;
+  line-height: 1.4;
+  letter-spacing: 0.02em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ─── Old Subtitle Bar (deprecated, kept for compat) ─── */
 .subtitle-bar {
   width: min(72vw, 960px);
   margin: 0 auto 12px;
@@ -1255,4 +1464,118 @@ button {
   .action-bar {
     padding: 0 16px 24px;
   }
+}
+
+/* ─── Device Status Panel ─── */
+.device-panel {
+  max-width: 400px;
+}
+
+.device-panel-body {
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+  max-height: calc(100vh - 80px);
+}
+
+.device-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.02);
+  border: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.device-section-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #888;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 4px;
+}
+
+.device-status-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.6);
+}
+
+.device-footer {
+  background: transparent;
+  border-top: 1px solid rgba(0, 0, 0, 0.06);
+  padding-top: 10px;
+  margin-top: 4px;
+}
+
+.device-status-label {
+  font-size: 13px;
+  color: #666;
+  display: flex;
+  align-items: center;
+}
+
+.device-status-value {
+  font-size: 13px;
+  font-family: var(--font-mono, monospace);
+  color: #333;
+}
+
+.device-value-highlight {
+  font-size: 16px;
+  font-weight: 600;
+  color: #111;
+}
+
+.device-status-badge {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-weight: 500;
+}
+
+.device-status-badge.is-online {
+  background: rgba(34, 197, 94, 0.12);
+  color: #16a34a;
+  border: 1px solid rgba(34, 197, 94, 0.25);
+}
+
+.device-status-badge.is-offline {
+  background: rgba(239, 68, 68, 0.1);
+  color: #dc2626;
+  border: 1px solid rgba(239, 68, 68, 0.2);
+}
+
+.device-status-badge.is-muted {
+  background: rgba(0, 0, 0, 0.04);
+  color: #999;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+}
+
+.device-status-badge.is-listening {
+  background: rgba(59, 130, 246, 0.12);
+  color: #2563eb;
+  border: 1px solid rgba(59, 130, 246, 0.25);
+}
+
+.device-status-badge.is-speaking {
+  background: rgba(168, 85, 247, 0.12);
+  color: #7c3aed;
+  border: 1px solid rgba(168, 85, 247, 0.25);
+}
+
+.device-status-badge.is-thinking {
+  background: rgba(245, 158, 11, 0.12);
+  color: #d97706;
+  border: 1px solid rgba(245, 158, 11, 0.25);
 }

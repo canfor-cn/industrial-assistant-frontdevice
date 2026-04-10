@@ -29,14 +29,21 @@ class LipSyncDetector:
         self._talking_confirm_threshold = 2  # 🌟 2帧防抖
         
         # 初始化 MediaPipe Face Mesh
-        self.mp_face_mesh = mp.solutions.face_mesh
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
-        )
-        logger.info(f"✅ 唇动检测模块已初始化 (history={history_len}, variance_threshold={variance_threshold}, mar_closed_threshold={mar_closed_threshold})")
+        self._disabled = False
+        try:
+            self.mp_face_mesh = mp.solutions.face_mesh
+            self.face_mesh = self.mp_face_mesh.FaceMesh(
+                max_num_faces=1,
+                refine_landmarks=True,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5
+            )
+            logger.info(f"✅ 唇动检测模块已初始化 (history={history_len}, variance_threshold={variance_threshold}, mar_closed_threshold={mar_closed_threshold})")
+        except (AttributeError, ImportError):
+            self._disabled = True
+            self.mp_face_mesh = None
+            self.face_mesh = None
+            logger.warning("⚠️ 唇动检测不可用 (mediapipe.solutions 缺失)，已降级为空操作")
 
     def start_sync(self):
         """启动口型同步检测（已废弃，保留接口兼容性）"""
@@ -49,7 +56,10 @@ class LipSyncDetector:
     def process_frame(self, frame_rgb: np.ndarray) -> bool:
         """
         处理单帧图像，判断是否在说话
-        
+        """
+        if self._disabled:
+            return False
+        """
         优化策略：
         1. 绝对门限：如果 MAR 太小（嘴巴几乎闭合），直接判定为不说话
         2. 方差判断：只有明显的连续开合动作（方差足够大）才判定为说话

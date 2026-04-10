@@ -93,6 +93,11 @@ pub struct DownstreamMessage {
     pub channels: Option<u32>,
     pub data: Option<String>,
     pub seq: Option<u32>,
+    // Session fields
+    #[serde(rename = "sessionId")]
+    pub session_id: Option<String>,
+    #[serde(rename = "sessionAction")]
+    pub session_action: Option<String>,
     // Text fields
     pub text: Option<String>,
     pub stage: Option<String>,

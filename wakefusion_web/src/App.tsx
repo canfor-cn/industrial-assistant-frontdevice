@@ -1,7 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { isTauriEnv, tauriSendText, tauriSendAudio, tauriGetCachedAudio, subscribeTauriEvents, type VoiceMessage } from "./useTauriBackend";
+import { isTauriEnv, tauriSendText, tauriSendAudio, tauriGetCachedAudio, tauriGetBackendHost, subscribeTauriEvents, type VoiceMessage, type DeviceStatePayload } from "./useTauriBackend";
+import { ParticleBackground } from "./ParticleBackground";
 import {
   Mic,
   MicOff,
@@ -16,11 +17,24 @@ import {
   Trash2,
   Upload,
   Network,
+  Radio,
   X,
   ChevronDown,
   Maximize,
   Minimize,
+  Camera,
+  Eye,
+  EyeOff,
+  User,
+  Ruler,
+  Activity,
 } from "lucide-react";
+import { useMediaStateMachine } from "./media/useMediaStateMachine";
+import { createMediaQueue } from "./media/mediaQueue";
+import { MediaPresenter } from "./media/MediaPresenter";
+import { isPlayableMedia as isPlayableMediaCheck } from "./media/types";
+import type { MediaRef as MediaRefType } from "./media/types";
+import { useSyncedSubtitle } from "./useSyncedSubtitle";
 
 interface MediaRef {
   assetId: string;
@@ -123,6 +137,12 @@ export default function App() {
   const [connectionStatus, setConnectionStatus] = useState("未连接");
   const [isRecording, setIsRecording] = useState(false);
   const [ragOpen, setRagOpen] = useState(false);
+  const [devicePanelOpen, setDevicePanelOpen] = useState(false);
+  const [deviceConnected, setDeviceConnected] = useState(false);
+  const [deviceAddr, setDeviceAddr] = useState("");
+  const [deviceLastSeen, setDeviceLastSeen] = useState<number | null>(null);
+  const [deviceState, setDeviceState] = useState<DeviceStatePayload | null>(null);
+  const [uiVisible, setUiVisible] = useState(false);
   const [ragTenantId, setRagTenantId] = useState("default");
   const [ragExhibits, setRagExhibits] = useState<RagExhibit[]>([]);
   const [selectedExhibitId, setSelectedExhibitId] = useState("");
@@ -133,18 +153,72 @@ export default function App() {
   const [graphSnapshot, setGraphSnapshot] = useState<RagGraphSnapshot | null>(null);
   const [newExhibitName, setNewExhibitName] = useState("");
   const [ragStatus, setRagStatus] = useState("");
-  const [stageMediaRef, setStageMediaRef] = useState<MediaRef | null>(null);
-  const [stageMode, setStageMode] = useState<"avatar" | "loading" | "media" | "exiting">("avatar");
   const [isStageFullscreen, setIsStageFullscreen] = useState(false);
   const [playbackHistory, setPlaybackHistory] = useState<MediaHistoryEntry[]>([]);
   const [playbackState, setPlaybackState] = useState<"idle" | "playing" | "ended" | "stopped">("idle");
   const [stageMediaVolume, setStageMediaVolume] = useState(1);
+
+  // Media state machine + queue (replaces stageMediaRef / stageMode / timer refs)
+  const mediaMachine = useMediaStateMachine({
+    onActivate: (refs, sourceTraceId) => {
+      setStageMediaVolume(1);
+      setPlaybackState("playing");
+      setPlaybackHistory((prev) => {
+        const next = prev.map((item) =>
+          item.status === "playing" ? { ...item, status: "stopped" as const, endedAt: Date.now() } : item,
+        );
+        return [
+          {
+            id: `${refs[0].assetId}-${Date.now()}`,
+            ref: refs[0],
+            sourceTraceId,
+            startedAt: Date.now(),
+            status: "playing" as const,
+          },
+          ...next,
+        ].slice(0, 20);
+      });
+    },
+    onExit: (reason) => {
+      void exitStageFullscreen();
+      setPlaybackState(reason === "ended" ? "ended" : "stopped");
+      setPlaybackHistory((prev) => {
+        const next = [...prev];
+        const index = next.findIndex((item) => item.status === "playing");
+        if (index >= 0) {
+          next[index] = { ...next[index], status: reason === "ended" ? "ended" : "stopped", endedAt: Date.now() };
+        }
+        return next;
+      });
+    },
+  });
+
+  // Derived compat shims for code that still references the old names
+  const stageMediaRef = mediaMachine.currentRefs[0] ?? null;
+  const stageMode = mediaMachine.state === "playing" ? "media" : mediaMachine.state === "idle" ? "avatar" : mediaMachine.state;
+
+  const mediaQueueRef = useRef(createMediaQueue((refs, traceId) => {
+    mediaMachine.activate(refs, traceId);
+  }));
+  // Keep the queue callback in sync with the latest mediaMachine.activate
+  useEffect(() => {
+    mediaQueueRef.current = createMediaQueue((refs, traceId) => {
+      mediaMachine.activate(refs, traceId);
+    });
+  }, [mediaMachine.activate]);
   const [pendingUploads, setPendingUploads] = useState<PendingUploadItem[]>([]);
   const [showTextInput, setShowTextInput] = useState(false);
-  const [displayedAssistantText, setDisplayedAssistantText] = useState("");
-  const [subtitlePhase, setSubtitlePhase] = useState<"hidden" | "visible" | "fading">("hidden");
+
+  // Live subtitle panel: sentence-level audio-text sync
+  const syncSub = useSyncedSubtitle();
   const [preferredSinkId, setPreferredSinkId] = useState<string | null>(null);
-  const [directWsBaseUrl] = useState(() => localStorage.getItem("wakefusion.directWsBaseUrl") ?? directWsUrlDefault);
+  const [directWsBaseUrl] = useState(() => {
+    if (isTauriEnv()) {
+      return directWsUrlDefault;
+    }
+    const stored = localStorage.getItem("wakefusion.directWsBaseUrl")?.trim();
+    return stored || directWsUrlDefault;
+  });
   const [directToken] = useState(() => localStorage.getItem("wakefusion.directToken") ?? "test-voice-token");
   const [directDeviceId] = useState(() => localStorage.getItem("wakefusion.directDeviceId") ?? `browser-${Math.random().toString(36).slice(2, 10)}`);
 
@@ -161,21 +235,8 @@ export default function App() {
   const currentTraceRef = useRef<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const subtitleScrollRef = useRef<HTMLDivElement>(null);
-  const mediaReturnTimerRef = useRef<number | null>(null);
-  const stageTransitionTimerRef = useRef<number | null>(null);
+  // (mediaReturnTimerRef and stageTransitionTimerRef removed — handled by mediaMachine)
   const subtitleEndRef = useRef<HTMLDivElement>(null);
-  const assistantFullTextRef = useRef("");
-  const displayTimerRef = useRef<number | null>(null);
-  const subtitleFadeTimerRef = useRef<number | null>(null);
-  const ttsSegmentBuffersRef = useRef(new Map<string, Uint8Array[]>());
-  const ttsSegmentMetaRef = useRef(new Map<string, { mimeType?: string }>());
-  const ttsPlaybackQueueRef = useRef<Array<{ url: string; mimeType: string }>>([]);
-  const ttsCurrentAudioRef = useRef<HTMLAudioElement | null>(null);
-  const ttsCurrentUrlRef = useRef<string | null>(null);
-  // Web Audio API queue for Tauri mode (bypasses blob URL limitations)
-  const ttsWebAudioQueueRef = useRef<ArrayBuffer[]>([]);
-  const ttsWebAudioPlayingRef = useRef(false);
-  const ttsAudioContextRef = useRef<AudioContext | null>(null);
 
   const connectionLabel = useMemo(() => {
     if (isRecording) return "录音中";
@@ -191,7 +252,17 @@ export default function App() {
     }).slice(0, 6);
   }, [playbackHistory]);
 
+  const [tauriBackendHost, setTauriBackendHost] = useState("127.0.0.1:7788");
+  useEffect(() => {
+    if (isTauriEnv()) {
+      tauriGetBackendHost().then(setTauriBackendHost);
+    }
+  }, []);
+
   const ragApiBaseUrl = useMemo(() => {
+    if (isTauriEnv()) {
+      return `http://${tauriBackendHost}`;
+    }
     try {
       const url = new URL(directWsBaseUrl);
       url.protocol = url.protocol === "wss:" ? "https:" : "http:";
@@ -224,118 +295,7 @@ export default function App() {
   const latestAssistantFull = latestAssistantMessage?.text ?? "";
   const latestAssistantMediaRefs = latestAssistantMessage?.mediaRefs ?? [];
 
-  useEffect(() => {
-    const host = subtitleScrollRef.current;
-    if (host) {
-      host.scrollTop = host.scrollHeight;
-      return;
-    }
-    messagesEndRef.current?.scrollIntoView({ block: "end" });
-    subtitleEndRef.current?.scrollIntoView({ block: "end" });
-  }, [messages, displayedAssistantText, latestAssistantMediaRefs, subtitlePhase]);
-
-  useEffect(() => {
-    return () => {
-      if (ttsCurrentAudioRef.current) {
-        ttsCurrentAudioRef.current.pause();
-        ttsCurrentAudioRef.current.src = "";
-        ttsCurrentAudioRef.current = null;
-      }
-      if (ttsCurrentUrlRef.current) {
-        URL.revokeObjectURL(ttsCurrentUrlRef.current);
-        ttsCurrentUrlRef.current = null;
-      }
-      for (const item of ttsPlaybackQueueRef.current) {
-        URL.revokeObjectURL(item.url);
-      }
-      ttsPlaybackQueueRef.current = [];
-      ttsSegmentBuffersRef.current.clear();
-      ttsSegmentMetaRef.current.clear();
-    };
-  }, []);
-
-  // Token buffer: uniform-speed character reveal
-  useEffect(() => {
-    assistantFullTextRef.current = latestAssistantFull;
-
-    if (!latestAssistantFull) {
-      setDisplayedAssistantText("");
-      if (displayTimerRef.current) {
-        window.clearInterval(displayTimerRef.current);
-        displayTimerRef.current = null;
-      }
-      return;
-    }
-
-    // Start the reveal timer if not already running
-    if (!displayTimerRef.current) {
-      displayTimerRef.current = window.setInterval(() => {
-        setDisplayedAssistantText((prev) => {
-          const full = assistantFullTextRef.current;
-          if (prev.length >= full.length) {
-            return prev;
-          }
-          // Adaptive speed: if buffer > 30 chars behind, go faster
-          const lag = full.length - prev.length;
-          const step = lag > 60 ? 3 : lag > 30 ? 2 : 1;
-          return full.slice(0, prev.length + step);
-        });
-      }, 80); // ~12 chars/sec base speed
-    }
-
-    return undefined;
-  }, [latestAssistantFull]);
-
-  // Show subtitle when there's content, reset fade
-  useEffect(() => {
-    if (latestUserText || latestAssistantFull) {
-      setSubtitlePhase("visible");
-      // Clear any pending fade timer
-      if (subtitleFadeTimerRef.current) {
-        window.clearTimeout(subtitleFadeTimerRef.current);
-        subtitleFadeTimerRef.current = null;
-      }
-    }
-  }, [latestUserText, latestAssistantFull]);
-
-  // Detect when all text is fully displayed → start 5s fade timer
-  useEffect(() => {
-    if (!latestAssistantFull || displayedAssistantText.length < latestAssistantFull.length) {
-      return;
-    }
-    // Fully caught up — stop the interval
-    if (displayTimerRef.current) {
-      window.clearInterval(displayTimerRef.current);
-      displayTimerRef.current = null;
-    }
-    // Start 5s countdown to fade
-    if (subtitleFadeTimerRef.current) {
-      window.clearTimeout(subtitleFadeTimerRef.current);
-    }
-    subtitleFadeTimerRef.current = window.setTimeout(() => {
-      setSubtitlePhase("fading");
-      // After the CSS transition (1s), hide completely
-      subtitleFadeTimerRef.current = window.setTimeout(() => {
-        setSubtitlePhase("hidden");
-        subtitleFadeTimerRef.current = null;
-      }, 1200);
-    }, 5000);
-
-    return () => {
-      if (subtitleFadeTimerRef.current) {
-        window.clearTimeout(subtitleFadeTimerRef.current);
-        subtitleFadeTimerRef.current = null;
-      }
-    };
-  }, [displayedAssistantText, latestAssistantFull]);
-
-  // Cleanup timers on unmount
-  useEffect(() => {
-    return () => {
-      if (displayTimerRef.current) window.clearInterval(displayTimerRef.current);
-      if (subtitleFadeTimerRef.current) window.clearTimeout(subtitleFadeTimerRef.current);
-    };
-  }, []);
+  // (Old scroll effect and timer-based reveal removed — replaced by LiveSubtitlePanel)
 
   useEffect(() => {
     const host = stageSurfaceRef.current;
@@ -375,7 +335,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!stageMediaRef || !isPlayableMedia(stageMediaRef.assetType) || !preferredSinkId) {
+    if (!stageMediaRef || !isPlayableMediaCheck(stageMediaRef.assetType) || !preferredSinkId) {
       return;
     }
     const host = stageSurfaceRef.current;
@@ -394,57 +354,61 @@ export default function App() {
     let cancelled = false;
     let cleanup: (() => void) | undefined;
     subscribeTauriEvents({
-      onToken: (traceId, text) => {
-        if (!cancelled) appendAssistantChunk(traceId, text);
+      onToken: (_traceId, text) => {
+        if (!cancelled) syncSub.pushToken(text);
       },
-      onAsrResult: (traceId, text, stage, audioId) => {
-        if (cancelled) return;
-        if (stage !== "final" && stage !== "done") return;
-        // audioId alignment: discard if it doesn't match the current user message's audioId
-        setMessages((prev) => {
-          const userMsg = prev.find((m) => m.id === `${traceId}-user`);
-          if (userMsg?.audioId && audioId && userMsg.audioId !== audioId) return prev;
-          const filtered = prev.filter((m) => m.id !== `${traceId}-user`);
-          return [...filtered, { ...userMsg!, text, audioId: audioId ?? userMsg?.audioId }];
-        });
+      onAsrResult: () => {
+        // ASR text now handled by onUserVoiceText — no longer update messages[]
       },
-      onFinal: (_traceId) => {},
+      onFinal: (_traceId) => {
+        if (!cancelled) syncSub.signalTextEnd();
+      },
       onClear: () => {
-        if (!cancelled) {
-          setMessages([]);
-          setDisplayedAssistantText("");
-        }
+        if (!cancelled) syncSub.reset();
       },
       onMediaRef: (data) => {
         if (cancelled) return;
         const ref = normalizeMediaRef(data);
-        if (isPlayableMedia(ref.assetType)) {
-          activateStageMedia(ref, data.traceId || "");
+        if (isPlayableMediaCheck(ref.assetType)) {
+          mediaQueueRef.current.push(ref as MediaRefType, data.traceId || "");
         }
-        appendMediaRefToLatest(ref);
       },
       onConnectionStatus: (_connected, message) => {
         if (!cancelled) setConnectionStatus(message);
       },
-      onVoiceMessage: (msg) => {
-        if (cancelled) return;
-        // audioId from gateway — audio data is cached in Rust, not sent to WebView
-        appendUserMessage(msg.traceId, msg.text, "voice", undefined, undefined, msg.audioMime, msg.audioId);
+      onVoiceMessage: () => {
+        // Voice display now handled by onUserVoiceStart/onUserVoiceText
       },
-      onTtsAudioChunk: (data, mimeType) => {
-        if (cancelled) return;
-        try {
-          const bin = atob(data);
-          const bytes = new Uint8Array(bin.length);
-          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-          console.log(`[TTS] chunk received: ${bytes.length} bytes, queue=${ttsPlaybackQueueRef.current.length}`);
-          enqueueTtsPlayback([bytes], mimeType || "audio/wav");
-        } catch (e) {
-          console.error("TTS audio decode error", e);
-        }
+      onUserVoiceStart: (audioId) => {
+        if (!cancelled) syncSub.showVoiceStart(audioId);
       },
-      onTtsAudioEnd: () => {
-        // TTS stream finished — no special handling needed
+      onUserVoiceText: (audioId, _traceId, text) => {
+        if (!cancelled) syncSub.showVoiceText(audioId, text);
+      },
+      onSentencePack: (sentenceIndex, text, audio, mimeType, _sampleRate) => {
+        if (!cancelled) syncSub.pushSentencePack(sentenceIndex, text, audio, mimeType);
+      },
+      onSentencePackDone: () => {
+        if (!cancelled) syncSub.signalPacksDone();
+      },
+      onMediaControl: (action, _message) => {
+        if (!cancelled) applyMediaControl(action);
+      },
+      onDeviceStatus: (connected, addr) => {
+        if (cancelled) return;
+        setDeviceConnected(connected);
+        setDeviceAddr(addr);
+        if (connected) setDeviceLastSeen(Date.now());
+      },
+      onDeviceState: (state) => {
+        if (cancelled) return;
+        setDeviceState(state);
+        setDeviceLastSeen(Date.now());
+      },
+      onSessionUpdate: (_sessionId, _sessionAction, traceId) => {
+        if (cancelled) return;
+        syncSub.reset();
+        currentTraceRef.current = traceId;
       },
     }).then((unsub) => {
       if (cancelled) {
@@ -461,6 +425,8 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    // Delay Unity loading so UI renders first (avoids blocking the main thread)
+    const delayTimer = setTimeout(() => {
     const script = document.createElement("script");
     script.src = "/Build/Build.loader.js";
     script.async = true;
@@ -496,10 +462,10 @@ export default function App() {
     };
 
     document.body.appendChild(script);
+    }, 500); // 500ms delay — let UI paint first
+
     return () => {
-      if (document.body.contains(script)) {
-        document.body.removeChild(script);
-      }
+      clearTimeout(delayTimer);
     };
   }, []);
 
@@ -559,8 +525,8 @@ export default function App() {
           }
           if (data.type === "media_ref" && data.url) {
             const ref = normalizeMediaRef(data);
-            if (isPlayableMedia(ref.assetType)) {
-              activateStageMedia(ref, data.traceId ? String(data.traceId) : undefined);
+            if (isPlayableMediaCheck(ref.assetType)) {
+              mediaQueueRef.current.push(ref as MediaRefType, data.traceId ? String(data.traceId) : "");
             }
             setMessages((prev) => attachMediaToLatestAssistant(prev, ref));
             return;
@@ -611,12 +577,6 @@ export default function App() {
     document.addEventListener("fullscreenchange", onFullscreenChange);
     return () => {
       document.removeEventListener("fullscreenchange", onFullscreenChange);
-      if (mediaReturnTimerRef.current) {
-        window.clearTimeout(mediaReturnTimerRef.current);
-      }
-      if (stageTransitionTimerRef.current) {
-        window.clearTimeout(stageTransitionTimerRef.current);
-      }
       recorderRef.current?.stream.getTracks().forEach((track) => track.stop());
       if (!isTauriEnv()) {
         directSocketRef.current?.close();
@@ -658,18 +618,7 @@ export default function App() {
     currentTraceRef.current = traceId;
     setMessages([]);
     setConnectionStatus("等待后端响应");
-    // Reset subtitle buffer state
-    assistantFullTextRef.current = "";
-    setDisplayedAssistantText("");
-    setSubtitlePhase("hidden");
-    if (displayTimerRef.current) {
-      window.clearInterval(displayTimerRef.current);
-      displayTimerRef.current = null;
-    }
-    if (subtitleFadeTimerRef.current) {
-      window.clearTimeout(subtitleFadeTimerRef.current);
-      subtitleFadeTimerRef.current = null;
-    }
+    syncSub.reset();
   }
 
   function appendUserMessage(traceId: string, text: string, source: "text" | "voice" = "text", audioUrl?: string, audioBase64?: string, audioMime?: string, audioId?: string) {
@@ -705,89 +654,18 @@ export default function App() {
     });
   }
 
-  function clearMediaReturnTimer() {
-    if (mediaReturnTimerRef.current) {
-      window.clearTimeout(mediaReturnTimerRef.current);
-      mediaReturnTimerRef.current = null;
-    }
-  }
-
-  function clearStageTransitionTimer() {
-    if (stageTransitionTimerRef.current) {
-      window.clearTimeout(stageTransitionTimerRef.current);
-      stageTransitionTimerRef.current = null;
-    }
-  }
-
   function activateStageMedia(ref: MediaRef, sourceTraceId?: string) {
-    clearMediaReturnTimer();
-    clearStageTransitionTimer();
-    setStageMediaVolume(1);
-    setPlaybackState("playing");
-    setStageMediaRef(ref);
-    setStageMode("loading");
-    setPlaybackHistory((prev) => {
-      const next = prev.map((item) => (
-        item.status === "playing" ? { ...item, status: "stopped", endedAt: Date.now() } : item
-      ));
-      return [
-        {
-          id: `${ref.assetId}-${Date.now()}`,
-          ref,
-          sourceTraceId,
-          startedAt: Date.now(),
-          status: "playing",
-        },
-        ...next,
-      ].slice(0, 20);
-    });
+    mediaQueueRef.current.push(ref as MediaRefType, sourceTraceId ?? "");
   }
 
-  function markLatestPlayback(status: "ended" | "stopped") {
-    setPlaybackHistory((prev) => {
-      const next = [...prev];
-      const index = next.findIndex((item) => item.status === "playing");
-      if (index >= 0) {
-        next[index] = { ...next[index], status, endedAt: Date.now() };
-      }
-      return next;
-    });
-  }
-
-  function returnToAvatar(reason: "ended" | "stopped" = "stopped") {
-    clearMediaReturnTimer();
-    clearStageTransitionTimer();
-    void exitStageFullscreen();
-    setPlaybackState(reason === "ended" ? "ended" : "stopped");
-    markLatestPlayback(reason);
-    setStageMode("exiting");
-    stageTransitionTimerRef.current = window.setTimeout(() => {
-      setStageMediaRef(null);
-      setStageMode("avatar");
-      stageTransitionTimerRef.current = null;
-    }, 420);
-  }
-
-  function handleStageMediaEnded() {
-    clearMediaReturnTimer();
-    setPlaybackState("ended");
-    markLatestPlayback("ended");
-    mediaReturnTimerRef.current = window.setTimeout(() => {
-      returnToAvatar("ended");
-      setPlaybackState("idle");
-      mediaReturnTimerRef.current = null;
-    }, 1000);
-  }
-
-  function handleStageMediaReady() {
-    clearStageTransitionTimer();
-    setStageMode("media");
+  function returnToAvatar(_reason: "ended" | "stopped" = "stopped") {
+    mediaMachine.dismiss(_reason);
   }
 
   function replayLastMedia() {
     const latest = playbackHistory[0];
     if (!latest) return false;
-    activateStageMedia(latest.ref, latest.sourceTraceId);
+    mediaMachine.activate([latest.ref as MediaRefType], latest.sourceTraceId);
     return true;
   }
 
@@ -811,16 +689,17 @@ export default function App() {
   }
 
   function buildMediaContext() {
+    const currentRef = mediaMachine.currentRefs[0] ?? null;
     return {
       media: {
-        stageMode,
+        stageMode: mediaMachine.state,
         isFullscreen: isStageFullscreen,
-        currentMedia: stageMediaRef
+        currentMedia: currentRef
           ? {
-              assetId: stageMediaRef.assetId,
-              assetType: stageMediaRef.assetType,
-              label: stageMediaRef.label,
-              url: stageMediaRef.url,
+              assetId: currentRef.assetId,
+              assetType: currentRef.assetType,
+              label: currentRef.label,
+              url: currentRef.url,
             }
           : null,
         recentMedia: playbackHistory.slice(0, 3).map((item) => ({
@@ -911,57 +790,68 @@ export default function App() {
           return;
         }
         if (data.type === "audio_error") {
-          const message = typeof data.message === "string" && data.message
-            ? `语音识别失败：${data.message}`
-            : "语音识别失败";
-          setMessages((prev) => [...prev, { id: `${traceId}-audio-error-${Date.now()}`, role: "assistant", text: message }]);
           setConnectionStatus("语音识别失败");
           return;
         }
         if (data.type === "audio_begin") {
-          ttsSegmentBuffersRef.current.set(traceId, []);
-          ttsSegmentMetaRef.current.set(traceId, {
-            mimeType: typeof data.mimeType === "string" && data.mimeType ? data.mimeType : "audio/wav",
-          });
+          // audio_begin: no action needed, audio chunks go to sync hook
           return;
         }
         if (data.type === "audio_chunk" && typeof data.data === "string") {
           const chunk = decodeBase64ToBytes(data.data);
-          const meta = ttsSegmentMetaRef.current.get(traceId);
-          enqueueTtsPlayback([chunk], meta?.mimeType ?? "audio/wav");
+          const sentenceIndex = typeof data.sentenceIndex === "number" ? data.sentenceIndex : 0;
+          syncSub.pushAudioChunk(sentenceIndex, chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength));
           return;
         }
         if (data.type === "audio_end") {
-          ttsSegmentBuffersRef.current.delete(traceId);
-          ttsSegmentMetaRef.current.delete(traceId);
+          syncSub.signalAudioEnd();
+          return;
+        }
+        if (data.type === "sentence_boundary" && data.text) {
+          const sentenceIndex = typeof data.sentenceIndex === "number" ? data.sentenceIndex : 0;
+          syncSub.pushSentenceBoundary(sentenceIndex, String(data.text));
           return;
         }
         if (data.type === "token" && data.text) {
-          appendAssistantChunk(traceId, String(data.text));
+          syncSub.pushToken(String(data.text));
+          return;
+        }
+        if (data.type === "sentence_pack" && data.text && data.audio) {
+          syncSub.pushSentencePack(
+            typeof data.sentenceIndex === "number" ? data.sentenceIndex : 0,
+            String(data.text),
+            String(data.audio),
+            String(data.mimeType ?? "audio/wav"),
+          );
+          return;
+        }
+        if (data.type === "sentence_pack_done") {
+          syncSub.signalPacksDone();
+          return;
+        }
+        if (data.type === "asr" && data.text) {
+          syncSub.showVoiceText(undefined, String(data.text));
           return;
         }
         if (data.type === "media_ref" && data.url) {
           const ref = normalizeMediaRef(data);
-          if (isPlayableMedia(ref.assetType)) {
-            activateStageMedia(ref, traceId);
+          if (isPlayableMediaCheck(ref.assetType)) {
+            mediaQueueRef.current.push(ref as MediaRefType, traceId);
           }
-          setMessages((prev) => attachMediaToLatestAssistant(prev, ref));
           return;
         }
         if (data.type === "media_control") {
-          const responseText = applyMediaControl(typeof data.action === "string" ? data.action : undefined) || String(data.message ?? "");
-          if (responseText) {
-            setMessages((prev) => [...prev, { id: `${traceId}-assistant-media-control`, role: "assistant", text: responseText }]);
-          }
+          applyMediaControl(typeof data.action === "string" ? data.action : undefined);
           setConnectionStatus("媒体控制已执行");
           return;
         }
         if (data.type === "stop_tts") {
-          stopTtsPlayback();
+          syncSub.reset();
           setConnectionStatus("播放已打断");
           return;
         }
         if (data.type === "final") {
+          syncSub.signalTextEnd();
           return;
         }
         if (data.type === "warning") {
@@ -982,19 +872,21 @@ export default function App() {
   async function sendText() {
     const text = input.trim();
     if (!text) return;
-    const traceId = `browser-text-${Date.now()}`;
-    resetConversation(traceId);
-    appendUserMessage(traceId, text, "text");
+    // Generate a local placeholder traceId for immediate UI feedback.
+    // The real traceId + sessionId come from the backend in the meta event.
+    const localTraceId = `browser-text-${Date.now()}`;
+    // Show text input as user voice line (without voice icon since it's typed)
+    syncSub.showVoiceStart(`text-${localTraceId}`);
+    syncSub.showVoiceText(`text-${localTraceId}`, text);
     setInput("");
     try {
       if (isTauriEnv()) {
-        await tauriSendText(text, traceId, directDeviceId.trim());
+        await tauriSendText(text, localTraceId, directDeviceId.trim());
       } else {
         const socket = await ensureAssistantSocket();
         socket.send(JSON.stringify({
           type: "asr",
           stage: "final",
-          traceId,
           deviceId: directDeviceId.trim(),
           text,
           context: buildMediaContext(),
@@ -1030,7 +922,6 @@ export default function App() {
       const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
       recorderChunksRef.current = [];
       const traceId = `browser-audio-${Date.now()}`;
-      resetConversation(traceId);
       if (!isTauriEnv()) {
         ensureVoiceUserMessage(traceId); // Browser mode: show immediately
       }
@@ -1110,125 +1001,7 @@ export default function App() {
     return bytes;
   }
 
-  function concatChunks(chunks: Uint8Array[]) {
-    const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-    const merged = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-      merged.set(chunk, offset);
-      offset += chunk.length;
-    }
-    return merged;
-  }
-
-  function playNextTtsSegment() {
-    if (ttsCurrentAudioRef.current || ttsPlaybackQueueRef.current.length === 0) return;
-    const next = ttsPlaybackQueueRef.current.shift();
-    if (!next) return;
-    const audio = new Audio(next.url);
-    ttsCurrentAudioRef.current = audio;
-    ttsCurrentUrlRef.current = next.url;
-    audio.onended = () => {
-      audio.src = "";
-      ttsCurrentAudioRef.current = null;
-      if (ttsCurrentUrlRef.current) {
-        URL.revokeObjectURL(ttsCurrentUrlRef.current);
-        ttsCurrentUrlRef.current = null;
-      }
-      playNextTtsSegment();
-    };
-    audio.onerror = () => {
-      audio.pause();
-      audio.src = "";
-      ttsCurrentAudioRef.current = null;
-      if (ttsCurrentUrlRef.current) {
-        URL.revokeObjectURL(ttsCurrentUrlRef.current);
-        ttsCurrentUrlRef.current = null;
-      }
-      playNextTtsSegment();
-    };
-    audio.play().catch((error) => {
-      console.error("TTS playback failed", error);
-      audio.pause();
-      audio.src = "";
-      ttsCurrentAudioRef.current = null;
-      if (ttsCurrentUrlRef.current) {
-        URL.revokeObjectURL(ttsCurrentUrlRef.current);
-        ttsCurrentUrlRef.current = null;
-      }
-      playNextTtsSegment();
-    });
-  }
-
-  function enqueueTtsPlayback(chunks: Uint8Array[], mimeType: string) {
-    const merged = concatChunks(chunks);
-    if (isTauriEnv()) {
-      // Tauri mode: use Web Audio API (blob URLs don't work in WebView2)
-      ttsWebAudioQueueRef.current.push(merged.buffer.slice(merged.byteOffset, merged.byteOffset + merged.byteLength));
-      playNextWebAudioSegment();
-    } else {
-      // Browser mode: use <audio> + blob URL
-      const url = URL.createObjectURL(new Blob([merged], { type: mimeType || "audio/wav" }));
-      ttsPlaybackQueueRef.current.push({ url, mimeType });
-      playNextTtsSegment();
-    }
-  }
-
-  function playNextWebAudioSegment() {
-    if (ttsWebAudioPlayingRef.current || ttsWebAudioQueueRef.current.length === 0) return;
-    const buf = ttsWebAudioQueueRef.current.shift();
-    if (!buf) return;
-    ttsWebAudioPlayingRef.current = true;
-
-    if (!ttsAudioContextRef.current) {
-      ttsAudioContextRef.current = new AudioContext();
-    }
-    const ctx = ttsAudioContextRef.current;
-
-    ctx.decodeAudioData(buf.slice(0)) // slice to avoid detached buffer
-      .then((audioBuffer) => {
-        const source = ctx.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(ctx.destination);
-        source.onended = () => {
-          ttsWebAudioPlayingRef.current = false;
-          playNextWebAudioSegment();
-        };
-        source.start();
-      })
-      .catch((err) => {
-        console.error("Web Audio decode failed:", err);
-        ttsWebAudioPlayingRef.current = false;
-        playNextWebAudioSegment();
-      });
-  }
-
-  function stopTtsPlayback() {
-    // Stop <audio> mode
-    if (ttsCurrentAudioRef.current) {
-      ttsCurrentAudioRef.current.pause();
-      ttsCurrentAudioRef.current.currentTime = 0;
-      ttsCurrentAudioRef.current.src = "";
-      ttsCurrentAudioRef.current = null;
-    }
-    if (ttsCurrentUrlRef.current) {
-      URL.revokeObjectURL(ttsCurrentUrlRef.current);
-      ttsCurrentUrlRef.current = null;
-    }
-    for (const item of ttsPlaybackQueueRef.current) {
-      URL.revokeObjectURL(item.url);
-    }
-    ttsPlaybackQueueRef.current = [];
-    ttsSegmentBuffersRef.current.clear();
-    ttsSegmentMetaRef.current.clear();
-    // Stop Web Audio mode
-    ttsWebAudioQueueRef.current = [];
-    ttsWebAudioPlayingRef.current = false;
-    if (ttsAudioContextRef.current) {
-      ttsAudioContextRef.current.close().catch(() => {});
-      ttsAudioContextRef.current = null;
-    }
-  }
+  // (Old TTS playback functions removed — audio playback now handled by useSyncedSubtitle)
 
   function isolateComposerKeyboard(event: React.KeyboardEvent<HTMLTextAreaElement>) {
     event.stopPropagation();
@@ -1247,9 +1020,15 @@ export default function App() {
   }
 
   async function ragFetch(path: string, init?: RequestInit) {
-    const response = await fetch(`${ragApiBaseUrl}${path}`, init);
+    const requestUrl = `${ragApiBaseUrl}${path}`;
+    const response = await fetch(requestUrl, init);
     const text = await response.text();
-    const data = text ? JSON.parse(text) : {};
+    let data: any = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      throw new Error(`Invalid JSON from ${requestUrl}: ${text.slice(0, 120)}`);
+    }
     if (!response.ok) {
       throw new Error(data?.error ?? `Request failed: ${response.status}`);
     }
@@ -1429,7 +1208,13 @@ export default function App() {
 
   useEffect(() => {
     if (!ragOpen) return;
-    void Promise.all([refreshRagStatus(), refreshRagExhibits(), refreshRagJobs(), loadGraph()]);
+    void (async () => {
+      try {
+        await Promise.all([refreshRagStatus(), refreshRagExhibits(), refreshRagJobs(), loadGraph()]);
+      } catch (error) {
+        setRagStatus(`RAG 加载失败：${String(error)}`);
+      }
+    })();
   }, [ragOpen]);
 
   useEffect(() => {
@@ -1440,7 +1225,13 @@ export default function App() {
   useEffect(() => {
     if (!ragOpen) return undefined;
     const timer = window.setInterval(() => {
-      void Promise.all([refreshRagJobs(), refreshRagStatus()]);
+      void (async () => {
+        try {
+          await Promise.all([refreshRagJobs(), refreshRagStatus()]);
+        } catch (error) {
+          setRagStatus(`RAG 刷新失败：${String(error)}`);
+        }
+      })();
     }, 3000);
     return () => window.clearInterval(timer);
   }, [ragOpen, ragTenantId]);
@@ -1455,51 +1246,64 @@ export default function App() {
             <div>{loadingProgress}%</div>
           </div>
         )}
+        <ParticleBackground dimmed={stageMode === "media" || stageMode === "loading"} />
         <div className={`stage-avatar-shell ${stageMode === "media" || stageMode === "loading" ? "is-dimmed" : ""}`}>
           <canvas ref={canvasRef} className="unity-canvas" />
         </div>
-        <div className={`stage-media-shell ${stageMediaRef ? "is-mounted" : ""} ${stageMode === "media" ? "is-visible" : ""} ${stageMode === "loading" ? "is-loading" : ""} ${stageMode === "exiting" ? "is-exiting" : ""}`}>
-          {stageMediaRef ? renderStageMedia(stageMediaRef, {
-            onReady: handleStageMediaReady,
-            onEnded: handleStageMediaEnded,
-            showCover: stageMode === "loading",
-          }) : null}
-        </div>
+        <MediaPresenter machine={mediaMachine} volume={stageMediaVolume} />
       </div>
 
       {/* Layer 2-3: Floating UI overlay */}
       <div className="ui-overlay">
+        {/* Top-right: double-click hotzone to toggle UI */}
+        <div
+          className="ui-toggle-hotzone"
+          onDoubleClick={() => setUiVisible((v) => !v)}
+        />
+
         {/* Top-left: branding */}
-        <div className="overlay-branding">
-          <span className="brand-name-cn">成都曜曜慧道科技有限公司</span>
-          <span className="brand-name-en">Chengdu YaoYao Huidao Exhibition Co., Ltd.</span>
-        </div>
+        {uiVisible && (
+          <div className="overlay-branding">
+            <span className="brand-name-cn">成都曜曜慧道科技有限公司</span>
+            <span className="brand-name-en">Chengdu YaoYao Huidao Exhibition Co., Ltd.</span>
+          </div>
+        )}
 
         {/* Top-right: status + fullscreen + management */}
-        <header className="overlay-header">
-          <div className={`overlay-status ${isRecording ? "is-recording" : ""}`}>{connectionLabel}</div>
-          <button
-            type="button"
-            className="overlay-btn"
-            onClick={() => void (isStageFullscreen ? exitStageFullscreen() : enterStageFullscreen())}
-            aria-label={isStageFullscreen ? "退出全屏" : "全屏"}
-          >
-            {isStageFullscreen ? <Minimize className="h-4 w-4" /> : <Maximize className="h-4 w-4" />}
-          </button>
-          <button type="button" className="overlay-btn" onClick={() => setRagOpen(true)} aria-label="打开知识库管理">
-            <Database className="h-4 w-4" />
-          </button>
-        </header>
+        {uiVisible && (
+          <header className="overlay-header">
+            <div className={`overlay-status ${isRecording ? "is-recording" : ""}`}>{connectionLabel}</div>
+            <button
+              type="button"
+              className="overlay-btn"
+              onClick={() => void (isStageFullscreen ? exitStageFullscreen() : enterStageFullscreen())}
+              aria-label={isStageFullscreen ? "退出全屏" : "全屏"}
+            >
+              {isStageFullscreen ? <Minimize className="h-4 w-4" /> : <Maximize className="h-4 w-4" />}
+            </button>
+            <button
+              type="button"
+              className={`overlay-btn ${deviceConnected ? "is-device-online" : "is-device-offline"}`}
+              onClick={() => setDevicePanelOpen(true)}
+              aria-label="设备状态"
+            >
+              <Radio className="h-4 w-4" />
+            </button>
+            <button type="button" className="overlay-btn" onClick={() => setRagOpen(true)} aria-label="打开知识库管理">
+              <Database className="h-4 w-4" />
+            </button>
+          </header>
+        )}
 
         {/* Left-bottom: media history (max 3, text cards) */}
-        {recentUniqueMedia.length > 0 ? (
+        {uiVisible && recentUniqueMedia.length > 0 ? (
           <div className="media-history">
             {recentUniqueMedia.slice(0, 3).map((item) => (
               <button
                 key={item.id}
                 type="button"
                 className={`history-card is-${item.status}`}
-                onClick={() => activateStageMedia(item.ref, item.sourceTraceId)}
+                onClick={() => mediaMachine.activate([item.ref as MediaRefType], item.sourceTraceId)}
               >
                 <span className="history-card-text">{item.ref.label}</span>
               </button>
@@ -1508,105 +1312,35 @@ export default function App() {
         ) : null}
 
         {/* Idle hint */}
-        {currentTurnMessages.length === 0 && stageMode === "avatar" ? (
+        {uiVisible && currentTurnMessages.length === 0 && stageMode === "avatar" ? (
           <div className="stage-idle-hint">点击下方麦克风开始对话</div>
         ) : null}
 
-        {/* Subtitle bar — two-line structure: question + answer */}
-        {subtitlePhase !== "hidden" && (latestUserText || displayedAssistantText) ? (
-          <div className={`subtitle-bar ${subtitlePhase === "fading" ? "is-fading" : ""}`}>
-            {/* Line 1: User question */}
-            {latestUserText ? (
-              <div className="subtitle-question">
-                <span className="subtitle-question-label">你：</span>
-                <span className="subtitle-question-text">
-                  {latestUserSource === "voice" ? (
-                    hasPlayableAudio ? (
-                      <button
-                        type="button"
-                        className="subtitle-question-audio-btn"
-                        onClick={() => {
-                          // Play via Web Audio API (works in both Tauri and browser)
-                          const playFromArrayBuffer = (buf: ArrayBuffer) => {
-                            const ctx = new AudioContext();
-                            ctx.decodeAudioData(buf).then(decoded => {
-                              const src = ctx.createBufferSource();
-                              src.buffer = decoded;
-                              src.connect(ctx.destination);
-                              src.onended = () => ctx.close();
-                              src.start();
-                            }).catch(e => console.error("Audio decode failed", e));
-                          };
-                          if (latestUserAudioId && isTauriEnv()) {
-                            // Fetch from Rust gateway cache by audioId
-                            tauriGetCachedAudio(latestUserAudioId).then(result => {
-                              if (!result) return;
-                              const bin = atob(result.audioData);
-                              const bytes = new Uint8Array(bin.length);
-                              for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-                              playFromArrayBuffer(bytes.buffer);
-                            }).catch(e => console.error("Play cached audio failed", e));
-                          } else if (latestUserAudioBase64) {
-                            const bin = atob(latestUserAudioBase64);
-                            const bytes = new Uint8Array(bin.length);
-                            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-                            playFromArrayBuffer(bytes.buffer);
-                          } else if (latestUserAudioUrl) {
-                            // Blob URL (from browser recording)
-                            fetch(latestUserAudioUrl).then(r => r.arrayBuffer()).then(playFromArrayBuffer)
-                              .catch(e => console.error("Play audio failed", e));
-                          }
-                        }}
-                        aria-label="播放识别前的原始语音"
-                      >
-                        <Volume2 className="subtitle-question-audio-icon" />
-                      </button>
-                    ) : (
-                      <Volume2 className="subtitle-question-audio-icon" />
-                    )
-                  ) : null}
-                  <span>{latestUserText}</span>
+        {/* Live subtitle panel — always visible, not controlled by uiVisible */}
+        {(syncSub.userPhase !== "hidden" || syncSub.assistantPhase !== "hidden") ? (
+          <div className="live-subtitle-panel">
+            {/* Line 1: User voice + text */}
+            {syncSub.userPhase !== "hidden" && syncSub.userVoice ? (
+              <div className={`live-subtitle-line live-subtitle-user ${syncSub.userPhase === "fading" ? "is-fading" : ""}`}>
+                {!syncSub.userVoice.audioId.startsWith("text-") && (
+                  <Volume2 className="live-subtitle-voice-icon" />
+                )}
+                <span className="live-subtitle-text">
+                  {syncSub.userVoice.text || "语音识别中…"}
                 </span>
               </div>
             ) : null}
-            {/* Line 2: Assistant answer (scrollable, uniform-speed reveal) */}
-            {displayedAssistantText ? (
-              <div ref={subtitleScrollRef} className="subtitle-answer chat-scrollbar">
-                <div className="markdown-body">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                    {displayedAssistantText}
-                  </ReactMarkdown>
-                </div>
-                {latestAssistantMediaRefs.length > 0 ? (
-                  <div className="subtitle-media">
-                    {latestAssistantMediaRefs.map((ref) => (
-                      <button
-                        key={`${ref.assetId}-${ref.url}`}
-                        type="button"
-                        className="subtitle-media-chip"
-                        onClick={() => {
-                          if (isPlayableMedia(ref.assetType)) {
-                            activateStageMedia(ref, ref.traceId);
-                            return;
-                          }
-                          window.open(ref.url, "_blank", "noopener,noreferrer");
-                        }}
-                      >
-                        {renderMediaIcon(ref.assetType)}
-                        <span>{ref.label}</span>
-                      </button>
-                    ))}
-                  </div>
-                ) : null}
-                <div ref={subtitleEndRef} />
-                <div ref={messagesEndRef} />
+            {/* Line 2: Assistant text (synced with TTS audio) */}
+            {syncSub.assistantPhase !== "hidden" && syncSub.assistantText ? (
+              <div className={`live-subtitle-line live-subtitle-assistant ${syncSub.assistantPhase === "fading" ? "is-fading" : ""}`}>
+                <span className="live-subtitle-text">{syncSub.assistantText}</span>
               </div>
             ) : null}
           </div>
         ) : null}
 
         {/* Action bar */}
-        <div className="action-bar">
+        {uiVisible && <div className="action-bar">
           {showTextInput ? (
             <div className="action-text-input">
               <textarea
@@ -1651,8 +1385,134 @@ export default function App() {
               </button>
             </>
           )}
-        </div>
+        </div>}
       </div>
+
+      {/* Device status panel */}
+      {devicePanelOpen ? (
+        <aside className="rag-drawer">
+          <div className="rag-drawer-backdrop" onClick={() => setDevicePanelOpen(false)} />
+          <div className="rag-panel device-panel">
+            <header className="rag-panel-header">
+              <div>
+                <div className="rag-eyebrow">Device</div>
+                <h3>设备状态</h3>
+              </div>
+              <button type="button" className="icon-button" onClick={() => setDevicePanelOpen(false)}>
+                <X className="h-4 w-4" />
+              </button>
+            </header>
+            <div className="device-panel-body">
+              {/* Section: Connection */}
+              <div className="device-section">
+                <div className="device-section-title">
+                  <Radio className="h-3.5 w-3.5" />
+                  <span>连接</span>
+                </div>
+                <div className="device-status-row">
+                  <span className="device-status-label">设备</span>
+                  <span className={`device-status-badge ${deviceConnected ? "is-online" : "is-offline"}`}>
+                    {deviceConnected ? "在线" : "离线"}
+                  </span>
+                </div>
+                <div className="device-status-row">
+                  <span className="device-status-label">后端</span>
+                  <span className={`device-status-badge ${connectionStatus.includes("已连接") || connectionStatus.includes("ready") || connectionStatus.includes("Tauri") ? "is-online" : "is-offline"}`}>
+                    {connectionStatus}
+                  </span>
+                </div>
+                <div className="device-status-row">
+                  <span className="device-status-label">设备地址</span>
+                  <span className="device-status-value">{deviceAddr || "—"}</span>
+                </div>
+              </div>
+
+              {/* Section: Vision (Camera) */}
+              <div className="device-section">
+                <div className="device-section-title">
+                  <Camera className="h-3.5 w-3.5" />
+                  <span>摄像头</span>
+                </div>
+                <div className="device-status-row">
+                  <span className="device-status-label">
+                    <User className="h-3 w-3" style={{display:'inline',verticalAlign:'middle',marginRight:4}} />
+                    人脸
+                  </span>
+                  <span className="device-status-value device-value-highlight">
+                    {deviceState?.vision?.faces ?? "—"}
+                  </span>
+                </div>
+                <div className="device-status-row">
+                  <span className="device-status-label">
+                    <Ruler className="h-3 w-3" style={{display:'inline',verticalAlign:'middle',marginRight:4}} />
+                    距离
+                  </span>
+                  <span className="device-status-value">
+                    {deviceState?.vision?.distance_m != null ? `${deviceState.vision.distance_m.toFixed(1)}m` : "—"}
+                  </span>
+                </div>
+                <div className="device-status-row">
+                  <span className="device-status-label">唇动</span>
+                  <span className={`device-status-badge ${deviceState?.vision?.is_talking ? "is-online" : "is-muted"}`}>
+                    {deviceState?.vision?.is_talking ? "说话中" : "静止"}
+                  </span>
+                </div>
+                <div className="device-status-row">
+                  <span className="device-status-label">视觉唤醒</span>
+                  <span className={`device-status-badge ${deviceState?.vision?.active ? "is-online" : "is-muted"}`}>
+                    {deviceState?.vision?.active ? "激活" : "未激活"}
+                  </span>
+                </div>
+              </div>
+
+              {/* Section: Audio (Microphone) */}
+              <div className="device-section">
+                <div className="device-section-title">
+                  <Mic className="h-3.5 w-3.5" />
+                  <span>麦克风</span>
+                </div>
+                <div className="device-status-row">
+                  <span className="device-status-label">
+                    <Activity className="h-3 w-3" style={{display:'inline',verticalAlign:'middle',marginRight:4}} />
+                    状态
+                  </span>
+                  <span className={`device-status-badge ${
+                    deviceState?.state === "listening" ? "is-listening" :
+                    deviceState?.state === "speaking" ? "is-speaking" :
+                    deviceState?.state === "thinking" ? "is-thinking" :
+                    "is-muted"
+                  }`}>
+                    {deviceState?.state === "listening" ? "拾音中" :
+                     deviceState?.state === "speaking" ? "播报中" :
+                     deviceState?.state === "thinking" ? "思考中" :
+                     deviceState?.state === "idle" ? "空闲" : "未知"}
+                  </span>
+                </div>
+                <div className="device-status-row">
+                  <span className="device-status-label">交互模式</span>
+                  <span className={`device-status-badge ${deviceState?.audio?.interactive ? "is-online" : "is-muted"}`}>
+                    {deviceState?.audio?.interactive ? "对话中" : "待机"}
+                  </span>
+                </div>
+                <div className="device-status-row">
+                  <span className="device-status-label">TTS</span>
+                  <span className={`device-status-badge ${deviceState?.audio?.tts_playing ? "is-speaking" : "is-muted"}`}>
+                    {deviceState?.audio?.tts_playing ? "播放中" : "静默"}
+                  </span>
+                </div>
+              </div>
+
+              {/* Footer: last seen */}
+              {deviceLastSeen ? (
+                <div className="device-status-row device-footer">
+                  <span className="device-status-label">最后更新</span>
+                  <span className="device-status-value">{new Date(deviceLastSeen).toLocaleTimeString()}</span>
+                </div>
+              ) : null}
+            </div>
+          </div>
+        </aside>
+      ) : null}
 
       {/* RAG drawer */}
       {ragOpen ? (
@@ -1838,13 +1698,38 @@ function inferSourceType(file: File): "document" | "image" | "video" | "audio" |
   return "document";
 }
 
+// Cached backend host for URL rewriting (set from tauriGetBackendHost or page location)
+let _rewriteHost: string | null = null;
+function initRewriteHost() {
+  if (_rewriteHost) return;
+  if (isTauriEnv()) {
+    tauriGetBackendHost().then((h) => { _rewriteHost = h.split(":")[0]; });
+  } else if (typeof window !== "undefined" && window.location.hostname && window.location.hostname !== "localhost") {
+    _rewriteHost = window.location.hostname;
+  }
+}
+initRewriteHost();
+
+function rewriteMediaUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if ((parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost") && _rewriteHost && _rewriteHost !== "127.0.0.1") {
+      parsed.hostname = _rewriteHost;
+      return parsed.toString();
+    }
+  } catch {
+    // Not a valid URL, return as-is
+  }
+  return url;
+}
+
 function normalizeMediaRef(data: any): MediaRef {
   return {
     assetId: String(data.assetId ?? data.url),
     assetType: String(data.assetType ?? "document"),
-    url: String(data.url),
+    url: rewriteMediaUrl(String(data.url)),
     label: String(data.label ?? data.url),
-    frameUrl: data.frameUrl ? String(data.frameUrl) : undefined,
+    frameUrl: data.frameUrl ? rewriteMediaUrl(String(data.frameUrl)) : undefined,
     startMs: typeof data.startMs === "number" ? data.startMs : undefined,
     endMs: typeof data.endMs === "number" ? data.endMs : undefined,
     traceId: data.traceId ? String(data.traceId) : undefined,
@@ -1879,70 +1764,7 @@ function renderMediaIcon(assetType: string) {
   return <FileText className="h-4 w-4" />;
 }
 
-function isPlayableMedia(assetType: string) {
-  return assetType === "image" || assetType === "video" || assetType === "audio";
-}
-
-function renderStageMedia(
-  ref: MediaRef,
-  callbacks?: { onReady?: () => void; onEnded?: () => void; showCover?: boolean },
-) {
-  const playbackUrl = stripPlaybackFragment(ref.url);
-  if (ref.assetType === "image") {
-    return (
-      <div className="stage-media-body">
-        <img src={playbackUrl} alt={ref.label} className="stage-media-image" onLoad={callbacks?.onReady} />
-      </div>
-    );
-  }
-  if (ref.assetType === "video") {
-    return (
-      <div className="stage-media-body">
-        <video
-          src={playbackUrl}
-          className="stage-media-video"
-          controls
-          autoPlay
-          playsInline
-          preload="auto"
-          poster={ref.frameUrl}
-          onCanPlay={callbacks?.onReady}
-          onPlaying={callbacks?.onReady}
-          onEnded={callbacks?.onEnded}
-        />
-        {ref.frameUrl ? <img src={ref.frameUrl} alt="" className={`stage-media-cover ${callbacks?.showCover ? "is-visible" : ""}`} /> : null}
-      </div>
-    );
-  }
-  if (ref.assetType === "audio") {
-    return (
-      <div className="stage-media-body stage-media-audio-wrap">
-        <div className="stage-audio-visual">
-          <Volume2 className="h-10 w-10" />
-          <div>
-            <strong>{ref.label}</strong>
-            <p>音频资料已切换到舞台区播放。</p>
-          </div>
-        </div>
-        <audio
-          src={playbackUrl}
-          className="stage-media-audio"
-          controls
-          autoPlay
-          preload="auto"
-          onCanPlay={callbacks?.onReady}
-          onPlaying={callbacks?.onReady}
-          onEnded={callbacks?.onEnded}
-        />
-      </div>
-    );
-  }
-  return null;
-}
-
-function stripPlaybackFragment(url: string) {
-  return url.split("#")[0];
-}
+// isPlayableMedia and renderStageMedia moved to media/ module
 
 function formatBytes(size: number) {
   if (size < 1024) return `${size} B`;

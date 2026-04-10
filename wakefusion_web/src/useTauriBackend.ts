@@ -51,6 +51,21 @@ export async function tauriListen<T>(
  * Subscribe to all Tauri events that the Rust host emits.
  * Returns a cleanup function.
  */
+export interface DeviceStatePayload {
+  state: string; // idle | listening | thinking | speaking
+  vision?: {
+    faces: number;
+    distance_m: number | null;
+    is_talking: boolean;
+    active: boolean;
+  };
+  audio?: {
+    interactive: boolean;
+    tts_playing: boolean;
+  };
+  timestamp?: number;
+}
+
 export interface VoiceMessage {
   traceId: string;
   text: string;
@@ -58,6 +73,21 @@ export interface VoiceMessage {
   audioId?: string;
   audioData?: string; // base64
   audioMime?: string;
+}
+
+/** Get the backend host address from Rust config (e.g. "192.168.0.97:7788") */
+let _cachedBackendHost: string | null = null;
+export async function tauriGetBackendHost(): Promise<string> {
+  if (_cachedBackendHost) return _cachedBackendHost;
+  if (!isTauriEnv()) return "127.0.0.1:7788";
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const result = await invoke<{ backendHost: string }>("host_status");
+    _cachedBackendHost = result.backendHost || "127.0.0.1:7788";
+    return _cachedBackendHost;
+  } catch {
+    return "127.0.0.1:7788";
+  }
 }
 
 /** Get cached audio from Rust host by audioId */
@@ -80,8 +110,17 @@ export async function subscribeTauriEvents(handlers: {
   onRoute?: (traceId: string, route: string) => void;
   onConnectionStatus?: (connected: boolean, message: string) => void;
   onVoiceMessage?: (msg: VoiceMessage) => void;
-  onTtsAudioChunk?: (data: string, mimeType: string) => void;
+  onUserVoiceStart?: (audioId: string) => void;
+  onUserVoiceText?: (audioId: string | undefined, traceId: string, text: string) => void;
+  onSentenceBoundary?: (traceId: string, sentenceIndex: number, text: string) => void;
+  onSentencePack?: (sentenceIndex: number, text: string, audio: string, mimeType: string, sampleRate: number) => void;
+  onSentencePackDone?: () => void;
+  onMediaControl?: (action: string, message: string) => void;
+  onTtsAudioChunk?: (data: string, mimeType: string, sentenceIndex?: number) => void;
   onTtsAudioEnd?: () => void;
+  onDeviceStatus?: (connected: boolean, deviceAddr: string) => void;
+  onDeviceState?: (state: DeviceStatePayload) => void;
+  onSessionUpdate?: (sessionId: string, sessionAction: string, traceId: string) => void;
 }): Promise<() => void> {
   if (!isTauriEnv()) return () => {};
 
@@ -145,11 +184,61 @@ export async function subscribeTauriEvents(handlers: {
     );
   }
 
+  if (handlers.onUserVoiceStart) {
+    const h = handlers.onUserVoiceStart;
+    unlisteners.push(
+      await tauriListen<{ audioId: string }>("user_voice_start", (p) => h(p.audioId))
+    );
+  }
+
+  if (handlers.onUserVoiceText) {
+    const h = handlers.onUserVoiceText;
+    unlisteners.push(
+      await tauriListen<{ audioId?: string; traceId: string; text: string }>("user_voice_text", (p) =>
+        h(p.audioId, p.traceId, p.text)
+      )
+    );
+  }
+
+  if (handlers.onSentenceBoundary) {
+    const h = handlers.onSentenceBoundary;
+    unlisteners.push(
+      await tauriListen<{ traceId: string; sentenceIndex: number; text: string }>("sentence_boundary", (p) =>
+        h(p.traceId, p.sentenceIndex, p.text)
+      )
+    );
+  }
+
+  if (handlers.onSentencePack) {
+    const h = handlers.onSentencePack;
+    unlisteners.push(
+      await tauriListen<{ sentenceIndex: number; text: string; audio: string; mimeType: string; sampleRate: number }>("sentence_pack", (p) =>
+        h(p.sentenceIndex, p.text, p.audio, p.mimeType, p.sampleRate)
+      )
+    );
+  }
+
+  if (handlers.onSentencePackDone) {
+    const h = handlers.onSentencePackDone;
+    unlisteners.push(
+      await tauriListen<{}>("sentence_pack_done", () => h())
+    );
+  }
+
+  if (handlers.onMediaControl) {
+    const h = handlers.onMediaControl;
+    unlisteners.push(
+      await tauriListen<{ action: string; message: string }>("media_control", (p) =>
+        h(p.action ?? "", p.message ?? "")
+      )
+    );
+  }
+
   if (handlers.onTtsAudioChunk) {
     const h = handlers.onTtsAudioChunk;
     unlisteners.push(
-      await tauriListen<{ data: string; mimeType: string }>("tts_audio_chunk", (p) =>
-        h(p.data, p.mimeType)
+      await tauriListen<{ data: string; mimeType: string; sentenceIndex?: number }>("tts_audio_chunk", (p) =>
+        h(p.data, p.mimeType, p.sentenceIndex)
       )
     );
   }
@@ -158,6 +247,31 @@ export async function subscribeTauriEvents(handlers: {
     const h = handlers.onTtsAudioEnd;
     unlisteners.push(
       await tauriListen<{}>("tts_audio_end", () => h())
+    );
+  }
+
+  if (handlers.onDeviceStatus) {
+    const h = handlers.onDeviceStatus;
+    unlisteners.push(
+      await tauriListen<{ connected: boolean; deviceAddr: string }>("device_status", (p) =>
+        h(p.connected, p.deviceAddr ?? "")
+      )
+    );
+  }
+
+  if (handlers.onDeviceState) {
+    const h = handlers.onDeviceState;
+    unlisteners.push(
+      await tauriListen<DeviceStatePayload>("device_state", (p) => h(p))
+    );
+  }
+
+  if (handlers.onSessionUpdate) {
+    const h = handlers.onSessionUpdate;
+    unlisteners.push(
+      await tauriListen<{ sessionId: string; sessionAction: string; traceId: string }>("session_update", (p) =>
+        h(p.sessionId, p.sessionAction, p.traceId)
+      )
     );
   }
 

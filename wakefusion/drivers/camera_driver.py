@@ -7,15 +7,23 @@ import os
 import sys
 
 # 添加 pyorbbecsdk DLL 搜索路径（Windows）
-# 优先使用项目内嵌的 lib/orbbec 目录（便携部署开箱即用）
+# 搜索多个可能的位置（开发环境 + 便携部署）
 _module_dir = os.path.dirname(os.path.abspath(__file__))
-_project_root = os.path.dirname(os.path.dirname(_module_dir))  # wakefusion_wake_module/
-_bundled_dll_path = os.path.join(_project_root, "lib", "orbbec")
-_legacy_dll_path = r"D:\tools\cursor_project\Orbbec Gemini 335336\Orbbec Gemini 335336 SDK\bin"
+_wakefusion_dir = os.path.dirname(_module_dir)  # wakefusion/
+_project_root = os.path.dirname(_wakefusion_dir)  # wakefusion_wake_module/ or release/
 
-for _dll_path in [_bundled_dll_path, _legacy_dll_path]:
+_dll_search_paths = [
+    os.path.join(_wakefusion_dir, "lib", "orbbec"),     # wakefusion/lib/orbbec (release)
+    os.path.join(_project_root, "lib", "orbbec"),        # ../lib/orbbec (dev)
+    os.path.join(os.getcwd(), "wakefusion", "lib", "orbbec"),  # cwd/wakefusion/lib/orbbec
+]
+
+for _dll_path in _dll_search_paths:
     if os.path.isdir(_dll_path):
         os.add_dll_directory(_dll_path)
+        # Also add to sys.path for .pyd import
+        if _dll_path not in os.sys.path:
+            os.sys.path.insert(0, _dll_path)
         break
 
 import asyncio

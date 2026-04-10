@@ -24,6 +24,44 @@ pub struct SubtitleAiCommitEvent {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct SentenceBoundaryEvent {
+    #[serde(rename = "traceId")]
+    pub trace_id: String,
+    #[serde(rename = "sentenceIndex")]
+    pub sentence_index: u32,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UserVoiceStartEvent {
+    #[serde(rename = "audioId")]
+    pub audio_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UserVoiceTextEvent {
+    #[serde(rename = "audioId")]
+    pub audio_id: Option<String>,
+    #[serde(rename = "traceId")]
+    pub trace_id: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SentencePackEvent {
+    #[serde(rename = "traceId")]
+    pub trace_id: String,
+    #[serde(rename = "sentenceIndex")]
+    pub sentence_index: u32,
+    pub text: String,
+    pub audio: String, // base64
+    #[serde(rename = "mimeType")]
+    pub mime_type: String,
+    #[serde(rename = "sampleRate")]
+    pub sample_rate: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct SubtitleClearEvent {}
 
 #[derive(Debug, Clone, Serialize)]

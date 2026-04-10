@@ -28,6 +28,7 @@
     "vite": "^6.2.0"
   },
   "devDependencies": {
+    "@rollup/rollup-linux-x64-gnu": "^4.60.0",
     "@tauri-apps/cli": "^2.8.0",
     "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",

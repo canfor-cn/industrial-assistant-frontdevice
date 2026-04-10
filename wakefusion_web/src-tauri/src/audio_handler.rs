@@ -1,4 +1,5 @@
 use crate::device_ws_server::VoiceMessageEvent;
+use crate::events::UserVoiceStartEvent;
 use crate::ws_protocol::{self, UpstreamMessage};
 use crossbeam_channel::Sender;
 use std::collections::HashMap;
@@ -67,7 +68,12 @@ pub fn handle_incoming_audio(
         *current = audio_id.clone();
     }
 
-    // 2. Notify WebView — send audioId only, no audio data
+    // 2a. Immediate voice indicator — UI shows 🔊 icon right away
+    let _ = app.emit("user_voice_start", UserVoiceStartEvent {
+        audio_id: audio_id.clone(),
+    });
+
+    // 2b. Full voice_message for backward compat
     let _ = app.emit(
         "voice_message",
         VoiceMessageEvent {
@@ -87,8 +93,9 @@ pub fn handle_incoming_audio(
     // 3. Forward to backend WS — ASR will process and respond
     let ts = ws_protocol::now_ts;
     let did = device_id.to_string();
+    let audio_len = audio_data.len();
 
-    let _ = ws_tx.send(UpstreamMessage::AudioSegmentBegin {
+    let r1 = ws_tx.send(UpstreamMessage::AudioSegmentBegin {
         trace_id: trace_id.clone(),
         device_id: did.clone(),
         mime_type: audio_mime.clone(),
@@ -99,7 +106,7 @@ pub fn handle_incoming_audio(
         audio_id: Some(audio_id.clone()),
     });
 
-    let _ = ws_tx.send(UpstreamMessage::AudioSegmentChunk {
+    let r2 = ws_tx.send(UpstreamMessage::AudioSegmentChunk {
         trace_id: trace_id.clone(),
         device_id: did.clone(),
         seq: 0,
@@ -107,10 +114,20 @@ pub fn handle_incoming_audio(
         timestamp: ts(),
     });
 
-    let _ = ws_tx.send(UpstreamMessage::AudioSegmentEnd {
+    let r3 = ws_tx.send(UpstreamMessage::AudioSegmentEnd {
         trace_id: trace_id.clone(),
         device_id: did,
         reason: format!("{}_recording_complete", source),
         timestamp: ts(),
     });
+
+    tracing::info!(
+        trace_id = %trace_id,
+        audio_id = %audio_id,
+        audio_bytes = audio_len,
+        begin_ok = r1.is_ok(),
+        chunk_ok = r2.is_ok(),
+        end_ok = r3.is_ok(),
+        "audio forwarded to backend WS"
+    );
 }

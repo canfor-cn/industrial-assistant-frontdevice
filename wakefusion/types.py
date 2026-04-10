@@ -181,7 +181,10 @@ class AudioConfig(BaseModel):
 class KWSConfig(BaseModel):
     """KWS配置"""
     enabled: bool = True
+    engine: str = "openwakeword"       # KWS引擎: matchboxnet 或 openwakeword
     model: str = "openwakeword"        # 模型类型
+    model_name: str = ""               # 预训练模型名称（matchboxnet用）
+    device: str = "cpu"                # 推理设备: cpu 或 cuda
     keyword: str = "hey_assistant"     # 唤醒词
     threshold: float = 0.55            # 检测阈值
     cooldown_ms: int = 1200            # 冷却时长（毫秒）
@@ -324,7 +327,7 @@ class AudioPlaybackConfig(BaseModel):
 
 class LLMAgentConfig(BaseModel):
     """LLM Agent配置（统一WebSocket协议）"""
-    host: str = "127.0.0.1:8080"  # LLM Agent服务地址（格式：host:port）
+    host: str = "127.0.0.1:7788"  # LLM Agent服务地址（格式：host:port）
     device_id: str = "wakefusion-device-01"  # 设备标识
     token: str = "your-token-here"  # 认证令牌
     use_ssl: bool = False  # 是否使用SSL（true for wss://, false for ws://）

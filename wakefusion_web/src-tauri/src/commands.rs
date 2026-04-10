@@ -8,11 +8,17 @@ pub type WsSender = crossbeam_channel::Sender<UpstreamMessage>;
 /// Holds the device_id that the Rust host registered with the backend WS
 pub struct HostDeviceId(pub String);
 
+/// Holds the backend host address (e.g. "192.168.0.97:7788")
+pub struct BackendHost(pub String);
+
 #[derive(Debug, Clone, Serialize)]
 pub struct HostStatusResult {
     pub mode: String,
     pub connected: bool,
+    #[serde(rename = "deviceId")]
     pub device_id: String,
+    #[serde(rename = "backendHost")]
+    pub backend_host: String,
 }
 
 #[tauri::command]
@@ -76,10 +82,14 @@ pub struct CachedAudioResult {
 }
 
 #[tauri::command]
-pub async fn host_status(host_id: State<'_, HostDeviceId>) -> Result<HostStatusResult, String> {
+pub async fn host_status(
+    host_id: State<'_, HostDeviceId>,
+    backend_host: State<'_, BackendHost>,
+) -> Result<HostStatusResult, String> {
     Ok(HostStatusResult {
         mode: "tauri-rust".into(),
         connected: true,
         device_id: host_id.0.clone(),
+        backend_host: backend_host.0.clone(),
     })
 }

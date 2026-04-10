@@ -1,10 +1,99 @@
+# Fix Windows GBK encoding crash when spawned without terminal
+import sys as _sys
+if hasattr(_sys.stdout, 'reconfigure'):
+    try:
+        _sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        _sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 """
 视觉桥接服务
 在独立进程中运行 MediaPipe，计算结果通过 UDP 发出
 """
 
-# 强力导入（显式物理路径），绕过包解析差异
-import mediapipe.python.solutions.face_detection as mp_face
+# MediaPipe face detection — try legacy solutions API, fall back to shim
+try:
+    import mediapipe.python.solutions.face_detection as mp_face
+except (ImportError, ModuleNotFoundError):
+    # mediapipe >= 0.10.30 removed solutions; provide a thin shim using OpenCV YuNet
+    import os as _os
+
+    class _FakeKeypoint:
+        def __init__(self, x, y):
+            self.x = x
+            self.y = y
+
+    class _FakeBBox:
+        def __init__(self, xmin, ymin, w, h):
+            self.xmin = xmin
+            self.ymin = ymin
+            self.width = w
+            self.height = h
+
+    class _FakeLocationData:
+        def __init__(self, bbox, keypoints):
+            self.relative_bounding_box = bbox
+            self.relative_keypoints = keypoints
+
+    class _FakeDetection:
+        def __init__(self, score, location_data):
+            self.score = [score]
+            self.location_data = location_data
+
+    class _FakeResult:
+        def __init__(self, detections):
+            self.detections = detections
+
+    class _YuNetFaceDetection:
+        """Drop-in shim matching mp_face.FaceDetection interface using OpenCV YuNet."""
+        def __init__(self, model_selection=1, min_detection_confidence=0.5):
+            import cv2
+            # Search multiple locations for the model
+            candidates = [
+                _os.path.join(_os.path.dirname(__file__), "..", "models", "face_detection_yunet.onnx"),
+                _os.path.join(_os.path.dirname(__file__), "..", "..", "models", "face_detection_yunet.onnx"),
+                "wakefusion/models/face_detection_yunet.onnx",
+                "models/face_detection_yunet.onnx",
+            ]
+            model_path = None
+            for c in candidates:
+                if _os.path.exists(c):
+                    model_path = c
+                    break
+            if not model_path:
+                raise FileNotFoundError(f"YuNet model not found in: {candidates}")
+            self._detector = cv2.FaceDetectorYN.create(model_path, "", (320, 320), min_detection_confidence)
+            self._conf = min_detection_confidence
+
+        def process(self, rgb_image):
+            import cv2
+            h, w = rgb_image.shape[:2]
+            self._detector.setInputSize((w, h))
+            _, faces = self._detector.detect(rgb_image)
+            if faces is None or len(faces) == 0:
+                return _FakeResult(None)
+            detections = []
+            for face in faces:
+                x, y, fw, fh = float(face[0]/w), float(face[1]/h), float(face[2]/w), float(face[3]/h)
+                conf = float(face[-1])
+                if conf < self._conf:
+                    continue
+                # YuNet keypoints: right_eye, left_eye, nose, right_mouth, left_mouth
+                kps = [
+                    _FakeKeypoint(float(face[4]/w), float(face[5]/h)),   # right eye
+                    _FakeKeypoint(float(face[6]/w), float(face[7]/h)),   # left eye
+                    _FakeKeypoint(float(face[8]/w), float(face[9]/h)),   # nose
+                    _FakeKeypoint(float(face[10]/w), float(face[11]/h)), # right mouth
+                    _FakeKeypoint(float(face[12]/w), float(face[13]/h)), # left mouth
+                ]
+                detections.append(_FakeDetection(conf, _FakeLocationData(_FakeBBox(x, y, fw, fh), kps)))
+            return _FakeResult(detections if detections else None)
+
+    class _mp_face_module:
+        FaceDetection = _YuNetFaceDetection
+
+    mp_face = _mp_face_module()
 
 # MediaPipe Tasks（Gesture Recognizer）
 import mediapipe as mp
@@ -23,7 +112,6 @@ import os
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from collections import deque
-import zmq
 from wakefusion.config import get_config
 from wakefusion.workers.lip_sync_detector import LipSyncDetector
 
@@ -65,46 +153,35 @@ class VisionService:
         config_path: Optional[str] = None,
         target_fps: int = 15,
         jpeg_quality: int = 55,  # 默认55，在画质和性能之间取得平衡（降低约8%文件大小，画质几乎无影响）
+        output_queue: Optional["queue.Queue"] = None,
+        lip_sync_event: Optional[threading.Event] = None,
     ):
         """
         初始化视觉服务
-        
+
         Args:
             config_path: 配置文件路径（可选）
             target_fps: 目标帧率
             jpeg_quality: JPEG 压缩质量（0-100）
+            output_queue: 输出队列（替代 ZMQ PUB，传视觉数据给 core_server）
+            lip_sync_event: 唇动检测控制事件（替代 ZMQ SUB，core_server set/clear）
         """
         # 加载配置
         self.config = get_config(config_path)
         self.vision_wake_config = self.config.vision_wake
-        self.zmq_config = self.config.zmq
-        
+
         self.target_fps = target_fps
         self.frame_time = 1.0 / target_fps
         self.jpeg_quality = int(jpeg_quality)
-        
+
         # 性能优化：跳帧处理计数器（降低CPU负担）
         self._process_frame_counter = 0  # MediaPipe处理跳帧计数器
         self._depth_send_counter = 0      # 深度图发送跳帧计数器
-        
-        # 初始化 ZMQ Context 和 PUB Socket
-        self.zmq_context = zmq.Context()
-        self._zmq_pub_socket = self.zmq_context.socket(zmq.PUB)
-        vision_pub_port = self.zmq_config.vision_pub_port
-        self._zmq_pub_socket.bind(f"tcp://127.0.0.1:{vision_pub_port}")
-        vision_logger.info(f"ZMQ PUB Socket bound to tcp://127.0.0.1:{vision_pub_port}")
-        
-        # 初始化 ZMQ SUB Socket（接收Core Server的控制消息）
-        self._vision_ctrl_sub_socket = self.zmq_context.socket(zmq.SUB)
-        vision_ctrl_pub_port = self.zmq_config.vision_ctrl_pub_port
-        self._vision_ctrl_sub_socket.connect(f"tcp://127.0.0.1:{vision_ctrl_pub_port}")
-        self._vision_ctrl_sub_socket.setsockopt_string(zmq.SUBSCRIBE, "")  # 订阅所有消息
-        vision_logger.info(f"ZMQ SUB Socket connected to tcp://127.0.0.1:{vision_ctrl_pub_port}")
-        
-        # 启动控制消息接收线程
-        self._ctrl_thread_stop = threading.Event()
-        self._ctrl_thread = threading.Thread(target=self._control_message_loop, daemon=True)
-        self._ctrl_thread.start()
+
+        # 内存队列通信（替代 ZMQ PUB/SUB）
+        self._output_queue = output_queue
+        self._lip_sync_event = lip_sync_event
+        self._lip_sync_was_active = False  # 跟踪上一次状态，避免重复调用
         
         # 视觉唤醒状态机已移除，业务逻辑移至core_server
         
@@ -210,7 +287,7 @@ class VisionService:
         self.lip_detector = LipSyncDetector()
         
         vision_logger.info(
-            f"VisionService initialized: ZMQ PUB tcp://127.0.0.1:{vision_pub_port}, "
+            f"VisionService initialized: queue={'yes' if output_queue else 'no'}, "
             f"IMG UDP 127.0.0.1:{self.udp_image_port}, DEPTH UDP 127.0.0.1:{self.udp_depth_port}, "
             f"FPS={target_fps}, JPEG={self.jpeg_quality}, Max Hands=4"
         )
@@ -270,38 +347,19 @@ class VisionService:
                 # 发送缓冲满或临时错误：丢包即可（实时视频允许）
                 break
 
-    def _control_message_loop(self):
-        """控制消息接收循环（接收Core Server的控制消息）"""
-        vision_logger.info("控制消息接收线程已启动")
-        while not self._ctrl_thread_stop.is_set():
-            try:
-                # 使用非阻塞接收，带超时
-                try:
-                    message = self._vision_ctrl_sub_socket.recv_json(zmq.NOBLOCK)
-                    event = message.get("event")
-                    
-                    if event == "START_LIP_SYNC":
-                        vision_logger.info("🎬 收到START_LIP_SYNC，启动口型同步")
-                        # 通知lip_detector开始检测
-                        if self.lip_detector:
-                            self.lip_detector.start_sync()
-                    elif event == "STOP_LIP_SYNC":
-                        vision_logger.info("🛑 收到STOP_LIP_SYNC，停止口型同步")
-                        # 通知lip_detector停止检测
-                        if self.lip_detector:
-                            self.lip_detector.stop_sync()
-                    else:
-                        vision_logger.debug(f"收到未知控制事件: {event}")
-                except zmq.Again:
-                    # 没有消息，继续等待
-                    time.sleep(0.1)
-                except Exception as e:
-                    vision_logger.error(f"处理控制消息异常: {e}")
-                    time.sleep(0.1)
-            except Exception as e:
-                vision_logger.error(f"控制消息循环异常: {e}")
-                time.sleep(0.1)
-        vision_logger.info("控制消息接收线程已退出")
+    def _check_lip_sync_event(self):
+        """检查唇动检测控制事件（替代 ZMQ 控制消息循环）"""
+        if self._lip_sync_event is None or self.lip_detector is None:
+            return
+        is_active = self._lip_sync_event.is_set()
+        if is_active != self._lip_sync_was_active:
+            if is_active:
+                vision_logger.info("🎬 lip_sync_event SET，启动口型同步")
+                self.lip_detector.start_sync()
+            else:
+                vision_logger.info("🛑 lip_sync_event CLEAR，停止口型同步")
+                self.lip_detector.stop_sync()
+            self._lip_sync_was_active = is_active
     
     def _image_sender_loop(self):
         """后台线程：从队列取帧，做 JPEG 压缩 + UDP 发送。"""
@@ -891,31 +949,44 @@ class VisionService:
     
     def send_result(self, result: Dict[str, Any]):
         """
-        通过 ZMQ PUB 发送检测结果（纯传感器数据，不包含业务逻辑）
-        
+        通过内存队列发送检测结果（纯传感器数据，不包含业务逻辑）
+
         Args:
             result: 检测结果字典
         """
         try:
             is_talking = result.get("is_talking", False)
-            # 🌟 调试：记录 is_talking 状态变化（仅在状态改变时打印）
+            # 调试：记录 is_talking 状态变化（仅在状态改变时打印）
             if not hasattr(self, '_last_sent_is_talking'):
                 self._last_sent_is_talking = None
             if self._last_sent_is_talking != is_talking:
                 vision_logger.info(f"👄 [VisionService] 发送 is_talking 状态: {self._last_sent_is_talking} → {is_talking}")
                 self._last_sent_is_talking = is_talking
-            
-            # 只发送原始数据，不包含wake字段（业务逻辑在core_server中处理）
-            zmq_data = {
+
+            data = {
                 "faces": result.get("faces", []),
                 "hands": result.get("hands", []),
                 "is_talking": is_talking,
                 "timestamp": time.time()
             }
-            # 通过ZMQ PUB发送
-            self._zmq_pub_socket.send_json(zmq_data)
+            # 通过内存队列发送（满则丢弃旧帧）
+            if self._output_queue is not None:
+                if self._output_queue.full():
+                    try:
+                        self._output_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                self._output_queue.put_nowait(data)
+
+            if not hasattr(self, '_send_count'):
+                self._send_count = 0
+            self._send_count += 1
+            if self._send_count <= 3 or self._send_count % 100 == 0:
+                faces = data.get("faces", [])
+                dist = faces[0].get("distance_m", "?") if faces else "no face"
+                print(f"[vision] Queue #{self._send_count}: faces={len(faces)}, dist={dist}m, talking={data.get('is_talking')}", flush=True)
         except Exception as e:
-            vision_logger.error(f"Error sending ZMQ data: {e}")
+            vision_logger.error(f"Error sending vision data: {e}")
 
     def send_frame_image_async(self, bgr_frame: np.ndarray):
         """
@@ -976,194 +1047,141 @@ class VisionService:
     
     def run(self, camera_index: int = 0):
         """
-        运行视觉服务（主循环）
-        
+        运行视觉服务（主循环）— 使用 OpenCV VideoCapture 采集 RGB
+
         Args:
             camera_index: 相机索引
         """
-        # 采集 RGB+Depth：使用 Gemini330Driver（避免 GUI 进程抢占设备）
-        # 先设置日志级别（在创建 driver 之前，避免初始化时的 DEBUG 日志）
+        print(f"启动相机（pyorbbecsdk, RGB + 人脸距离估算）...", flush=True)
+
+        # 使用 pyorbbecsdk 采集 RGB（Orbbec 不支持标准 UVC/DirectShow）
+        import os as _os
+        _module_dir = _os.path.dirname(_os.path.abspath(__file__))
+        for _dll_candidate in [
+            _os.path.join(_os.path.dirname(_module_dir), "lib", "orbbec"),
+            _os.path.join(_os.getcwd(), "wakefusion", "lib", "orbbec"),
+        ]:
+            if _os.path.isdir(_dll_candidate):
+                _os.add_dll_directory(_dll_candidate)
+                if _dll_candidate not in _os.sys.path:
+                    _os.sys.path.insert(0, _dll_candidate)
+                print(f"[INFO] Added Orbbec DLL path: {_dll_candidate}", flush=True)
+                break
+
         try:
-            from wakefusion.logging import get_logger
-            camera_logger = get_logger("camera_driver")
-            camera_logger.logger.setLevel(logging.ERROR)
-            face_gate_logger = get_logger("face_gate")
-            face_gate_logger.logger.setLevel(logging.ERROR)
-        except Exception:
-            # 如果导入失败，回退到标准日志库设置
-            logging.getLogger("camera_driver").setLevel(logging.ERROR)
-            logging.getLogger("face_gate").setLevel(logging.ERROR)
-        
-        try:
-            from wakefusion.drivers import Gemini330Driver, CameraConfig
+            import pyorbbecsdk as ob
+            print("[INFO] pyorbbecsdk imported OK", flush=True)
         except Exception as e:
-            print(f"[ERROR] 无法导入 Gemini330Driver/CameraConfig：{e}")
-            print("[ERROR] 当前版本的 vision_service.py 需要 Orbbec 驱动以采集 Depth。")
+            print(f"[ERROR] pyorbbecsdk import failed: {e}", flush=True)
             return
 
-        driver = Gemini330Driver(
-            config=CameraConfig(
-                rgb_width=640,
-                rgb_height=480,
-                rgb_fps=self.target_fps,
-                depth_width=640,
-                depth_height=480,
-                depth_fps=self.target_fps,
-                enable_rgb=True,
-                enable_depth=True,
-            ),
-            callback=None,
-        )
+        pipeline = ob.Pipeline()
+        config = ob.Config()
+        color_pl = pipeline.get_stream_profile_list(ob.OBSensorType.COLOR_SENSOR).get_default_video_stream_profile()
+        config.enable_stream(color_pl)
+        self._color_width = color_pl.get_width()
+        self._face_width_cm = 15.0
+        self._focal_length_px = self._color_width * 0.55
+        print(f"[INFO] Color: {color_pl.get_width()}x{color_pl.get_height()} @ {color_pl.get_fps()}fps", flush=True)
+        pipeline.start(config)
+        time.sleep(1)
 
-        print("启动相机（Gemini330Driver）...")
-        driver.start()
-        
-        # 创建退出控制窗口（改善退出体验）
-        cv2.namedWindow("VisionServiceControl", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("VisionServiceControl", 200, 100)
-        # 在窗口内绘制提示文字（红色加粗，居中显示）
-        control_img = np.zeros((100, 200, 3), dtype=np.uint8)
-        # 使用醒目的红色文字 "CLICK HERE & PRESS Q"，居中显示
-        text = "CLICK HERE & PRESS Q"
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.5
-        thickness = 2
-        (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
-        text_x = (200 - text_width) // 2
-        text_y = (100 + text_height) // 2
-        cv2.putText(control_img, text, (text_x, text_y), font, font_scale, (0, 0, 255), thickness, cv2.LINE_AA)
-        cv2.imshow("VisionServiceControl", control_img)
-        
-        print(f"VisionService started, capturing from Gemini330Driver, camera_index={camera_index}")
-        print("Press 'q' in VisionServiceControl window to quit")
-        
+        print(f"VisionService started (pyorbbecsdk), camera_index={camera_index}", flush=True)
+
         last_time = time.time()
-        
+        frame_count = 0
+        no_frame_count = 0
+
         try:
             while True:
-                frame_data = driver.capture_frame()
-                if frame_data is None or frame_data.rgb is None:
+                frameset = pipeline.wait_for_frames(1000)
+                if not frameset or not frameset.get_color_frame():
+                    no_frame_count += 1
+                    if no_frame_count <= 3 or no_frame_count % 30 == 0:
+                        print(f"[vision] No frame #{no_frame_count}", flush=True)
                     time.sleep(0.005)
                     continue
-                
+                cf = frameset.get_color_frame()
+                raw = np.frombuffer(cf.get_data(), dtype=np.uint8)
+                bgr = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+                if bgr is None:
+                    continue
+                frame_count += 1
+                if frame_count <= 3 or frame_count % 100 == 0:
+                    print(f"[vision] Frame #{frame_count} OK", flush=True)
+
                 # 控制帧率
                 current_time = time.time()
                 elapsed = current_time - last_time
                 if elapsed < self.frame_time:
                     time.sleep(self.frame_time - elapsed)
                 last_time = time.time()
-                
-                rgb_rgb = frame_data.rgb  # Gemini330Driver 输出为 RGB
-                depth_mm = frame_data.depth  # uint16 深度（mm）
 
-                # GUI/发送：转 BGR（OpenCV/JPEG）
-                bgr = cv2.cvtColor(rgb_rgb, cv2.COLOR_RGB2BGR)
+                # 检查唇动控制事件
+                self._check_lip_sync_event()
 
                 # 性能优化：MediaPipe 处理半速
-                # - 偶数帧：运行 MediaPipe，更新质心追踪器与静态手势判定
-                # - 奇数帧：不再做速度外推，仅复用上一帧检测结果，避免框抖动与"乱飞"
-                # 注意：即使跳帧，也要更新 track 的 missing_frames，确保手离开后及时消失
                 self._process_frame_counter += 1
                 if self._process_frame_counter % 2 == 0 or not hasattr(self, "_last_result"):
-                    # 处理帧（MediaPipe）
                     result = self.process_frame(bgr)
                     self._last_result = result
                 else:
-                    # 跳帧：复用上一帧的检测结果，不要去破坏原本的 track 状态
                     if hasattr(self, "_last_result") and self._last_result:
                         faces = self._last_result.get("faces", [])
-                        # 直接基于现有的 track 重建结果，不用传空数组去清理
                         result = self._build_result_from_tracks(faces)
                         result["faces"] = faces
                         result["hand_distance_m"] = self._last_result.get("hand_distance_m")
                         result["distance_m"] = self._last_result.get("distance_m")
                         result["presence"] = self._last_result.get("presence", False)
                         result["confidence"] = self._last_result.get("confidence", 0.0)
-                        # 继承唇动状态
                         result["is_talking"] = self._last_result.get("is_talking", False)
-                        
                         self._last_result = result
                     else:
                         result = self.process_frame(bgr)
                         self._last_result = result
 
-                # 深度采样：补全手部距离/人脸距离（供 face_gate 业务逻辑使用）
-                hands = result.get("hands", []) if isinstance(result.get("hands", []), list) else []
-                if depth_mm is not None and hands:
-                    for hand in hands:
-                        try:
-                            hd = self._sample_depth_m(depth_mm, float(hand["x"]), float(hand["y"]), box_px=50)
-                            hand["distance_m"] = float(hd) if hd is not None else None
-                        except Exception:
-                            hand["distance_m"] = None
-                
-                # 向后兼容：第一只手的距离
-                hand_distance_m = hands[0].get("distance_m") if hands and hands[0].get("distance_m") is not None else None
-                result["hand_distance_m"] = float(hand_distance_m) if hand_distance_m is not None else None
-
+                # 距离估算：用人脸宽度像素推算距离
                 faces = result.get("faces", []) if isinstance(result.get("faces", []), list) else []
                 global_distance_m = None
-                if depth_mm is not None and faces:
-                    for f in faces:
-                        try:
-                            cx = float(f["x"]) + float(f["w"]) / 2.0
-                            cy = float(f["y"]) + float(f["h"]) / 2.0
-                            fd = self._sample_depth_m(depth_mm, cx, cy, box_px=60)
-                            f["distance_m"] = float(fd) if fd is not None else None
-                        except Exception:
+                for f in faces:
+                    try:
+                        face_w_px = float(f.get("w", 0)) * self._color_width
+                        if face_w_px > 10:
+                            distance_m = (self._face_width_cm * self._focal_length_px) / (face_w_px * 100)
+                            f["distance_m"] = round(distance_m, 2)
+                        else:
                             f["distance_m"] = None
-                    if faces and faces[0].get("distance_m") is not None:
-                        global_distance_m = float(faces[0]["distance_m"])
+                    except Exception:
+                        f["distance_m"] = None
+                if faces and faces[0].get("distance_m") is not None:
+                    global_distance_m = faces[0]["distance_m"]
 
                 result["distance_m"] = float(global_distance_m) if global_distance_m is not None else None
-                
-                # 视觉唤醒状态机逻辑已移除，业务逻辑移至core_server
-                
-                # 发送结果（通过ZMQ PUB，纯传感器数据）
+                result["hand_distance_m"] = None
+
+                # 发送结果（通过内存队列）
                 self.send_result(result)
-                
-                # 发送 RGB 图像（JPEG，异步）- 每帧都发送以保持流畅
+
+                # 发送 RGB 图像（JPEG，异步）
                 self.send_frame_image_async(bgr)
 
-                # 性能优化：深度图发送跳帧（每2帧发送一次，减少约50%的深度图处理负担）
-                # 深度图主要用于可视化，降低频率不影响核心检测功能
-                self._depth_send_counter += 1
-                if depth_mm is not None and self._depth_send_counter % 2 == 0:
-                    color_depth_bgr = self.depth_to_colormap(depth_mm)
-                    self.send_depth_image_async(color_depth_bgr)
-                
-                # 'q' 键退出检测
-                # 更新退出控制窗口（保持窗口可见）
-                cv2.imshow("VisionServiceControl", control_img)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    break
-        
         except KeyboardInterrupt:
             print("\nVisionService stopped by user")
+        except Exception as e:
+            print(f"[vision] 主循环异常: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
         finally:
             try:
-                driver.stop()
-            except Exception:
-                pass
-            cv2.destroyAllWindows()
-            # 关闭ZMQ socket
-            try:
-                self._ctrl_thread_stop.set()
-                if hasattr(self, '_vision_ctrl_sub_socket'):
-                    self._vision_ctrl_sub_socket.close()
-                self._zmq_pub_socket.close()
-                self.zmq_context.term()
+                pipeline.stop()
             except Exception:
                 pass
             try:
                 self._img_thread_stop.set()
-                # 给线程一点时间退出（不 join 也可，daemon=True）
                 self.udp_image_socket.close()
                 self.udp_depth_socket.close()
             except Exception:
                 pass
-            # 安全关闭 MediaPipe 检测器
             if self.face_detector is not None:
                 try:
                     self.face_detector.close()
@@ -1182,26 +1200,33 @@ class VisionService:
             print("VisionService cleaned up")
 
 
+def run_in_thread(output_queue: "queue.Queue", lip_sync_event: threading.Event,
+                  target_fps: int = 15, camera_index: int = 0):
+    """线程入口：由 device_main 调用"""
+    service = VisionService(
+        target_fps=target_fps,
+        output_queue=output_queue,
+        lip_sync_event=lip_sync_event,
+    )
+    service.run(camera_index=camera_index)
+
+
 def main():
-    """主函数"""
+    """独立进程入口（调试用）"""
     import argparse
-    
+
     parser = argparse.ArgumentParser(description="Vision Service with MediaPipe")
-    parser.add_argument("--host", type=str, default="127.0.0.1", help="UDP host")
-    parser.add_argument("--port", type=int, default=9999, help="UDP port")
-    parser.add_argument("--img-port", type=int, default=10000, help="UDP image port (JPEG)")
-    parser.add_argument("--depth-port", type=int, default=10001, help="UDP depth image port (JPEG)")
-    parser.add_argument("--fps", type=int, default=30, help="Target FPS")
+    parser.add_argument("--fps", type=int, default=15, help="Target FPS")
     parser.add_argument("--camera", type=int, default=0, help="Camera index")
-    parser.add_argument("--jpeg-quality", type=int, default=55, help="JPEG quality (0-100), default 55 for better performance")
-    
+    parser.add_argument("--jpeg-quality", type=int, default=55, help="JPEG quality")
+
     args = parser.parse_args()
-    
+
+    # 独立运行时无队列，结果只打印到控制台
     service = VisionService(
         target_fps=args.fps,
-        jpeg_quality=args.jpeg_quality
+        jpeg_quality=args.jpeg_quality,
     )
-    
     service.run(camera_index=args.camera)
 
 

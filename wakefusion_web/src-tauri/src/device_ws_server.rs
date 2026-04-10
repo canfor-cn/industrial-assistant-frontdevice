@@ -1,6 +1,7 @@
 use crate::audio_handler;
 use crate::events::*;
 use crate::ws_protocol::UpstreamMessage;
+use base64::Engine;
 use crossbeam_channel::Sender;
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -37,6 +38,17 @@ pub struct VoiceMessageEvent {
     pub audio_data: Option<String>,
     #[serde(rename = "audioMime", skip_serializing_if = "Option::is_none")]
     pub audio_mime: Option<String>,
+}
+
+/// Global channel for sending messages TO the device (Rust → Device)
+static DEVICE_DOWN_TX: std::sync::LazyLock<std::sync::Mutex<Option<crossbeam_channel::Sender<String>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// Send a JSON message to the connected device
+pub fn send_to_device(json: &str) {
+    if let Some(tx) = DEVICE_DOWN_TX.lock().unwrap().as_ref() {
+        let _ = tx.send(json.to_string());
+    }
 }
 
 /// Spawn the device WS server on a dedicated thread.
@@ -83,7 +95,32 @@ pub fn spawn_device_ws_server(
                         }
                     };
 
+                    // Notify WebView: device connected
+                    let _ = app_clone.emit("device_status", serde_json::json!({
+                        "connected": true,
+                        "deviceAddr": &peer,
+                        "timestamp": crate::ws_protocol::now_ts(),
+                    }));
+
+                    // Set up downstream channel for Rust → Device messages
+                    let (down_tx, down_rx) = crossbeam_channel::unbounded::<String>();
+                    *DEVICE_DOWN_TX.lock().unwrap() = Some(down_tx);
+
+                    // Non-blocking for interleaved read/write
+                    let _ = ws.get_mut().set_nonblocking(true);
+
                     loop {
+                        // Send downstream messages to device
+                        while let Ok(json) = down_rx.try_recv() {
+                            let _ = ws.get_mut().set_nonblocking(false);
+                            if let Err(e) = ws.send(Message::Text(json.into())) {
+                                tracing::warn!("Device WS downstream send failed: {e}");
+                                break;
+                            }
+                            let _ = ws.get_mut().set_nonblocking(true);
+                        }
+
+                        // Read upstream messages from device
                         match ws.read() {
                             Ok(Message::Text(text)) => {
                                 if let Ok(msg) = serde_json::from_str::<DeviceMessage>(&text) {
@@ -99,6 +136,11 @@ pub fn spawn_device_ws_server(
                                 tracing::info!("Device disconnected: {}", peer);
                                 break;
                             }
+                            Err(tungstenite::Error::Io(ref e))
+                                if e.kind() == std::io::ErrorKind::WouldBlock =>
+                            {
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                            }
                             Err(e) => {
                                 tracing::debug!("Device WS read error: {}", e);
                                 break;
@@ -106,6 +148,16 @@ pub fn spawn_device_ws_server(
                             _ => {}
                         }
                     }
+
+                    // Clear downstream channel on disconnect
+                    *DEVICE_DOWN_TX.lock().unwrap() = None;
+
+                    // Notify WebView: device disconnected
+                    let _ = app_clone.emit("device_status", serde_json::json!({
+                        "connected": false,
+                        "deviceAddr": &peer,
+                        "timestamp": crate::ws_protocol::now_ts(),
+                    }));
                 });
             }
         })
@@ -121,6 +173,8 @@ fn handle_device_message(
     let trace_id = msg
         .trace_id
         .unwrap_or_else(|| format!("device-{}", uuid::Uuid::new_v4()));
+
+    tracing::info!(msg_type = %msg.msg_type, trace_id = %trace_id, "Device message received");
 
     match msg.msg_type.as_str() {
         // User speech with audio — unified handling (display + forward to ASR)
@@ -139,8 +193,9 @@ fn handle_device_message(
                     "device",
                 );
             } else {
-                // Text only — just display
+                // Text only — display + forward to backend
                 if !text.is_empty() {
+                    let stage = msg.stage.unwrap_or_else(|| "final".into());
                     let _ = app.emit(
                         "voice_message",
                         VoiceMessageEvent {
@@ -155,11 +210,20 @@ fn handle_device_message(
                     let _ = app.emit(
                         "subtitle_user",
                         SubtitleUserEvent {
-                            trace_id,
-                            text,
-                            stage: msg.stage.unwrap_or_else(|| "final".into()),
+                            trace_id: trace_id.clone(),
+                            text: text.clone(),
+                            stage: stage.clone(),
                         },
                     );
+                    // Forward text to backend voice gateway as ASR message
+                    let _ = ws_tx.send(UpstreamMessage::Asr {
+                        stage,
+                        text,
+                        trace_id: trace_id,
+                        device_id: device_id.to_string(),
+                        timestamp: crate::ws_protocol::now_ts(),
+                        context: None,
+                    });
                 }
             }
         }
@@ -200,8 +264,76 @@ fn handle_device_message(
             let _ = app.emit("media_duck", msg.extra);
         }
 
+        // Audio segment protocol — device sends audio in chunks, collect and forward
+        "audio_segment_begin" => {
+            tracing::info!(trace_id = %trace_id, "Device audio_segment_begin");
+            // Store segment metadata in thread-local or ignore (begin is informational)
+            // The actual audio comes in audio_segment_chunk
+        }
+
+        "audio_segment_chunk" => {
+            let data = msg.extra.get("data").and_then(|v| v.as_str()).unwrap_or("");
+            let seq = msg.extra.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+            tracing::info!(trace_id = %trace_id, seq = seq, data_len = data.len(), "Device audio_segment_chunk");
+            // Buffer chunks — for simplicity, send each chunk through audio_handler immediately
+            // (audio_handler will forward to backend)
+            if !data.is_empty() {
+                // Accumulate in a simple approach: treat each chunk as a complete segment
+                // This works because audio_handler sends begin+chunk+end atomically
+                PENDING_AUDIO.lock().unwrap()
+                    .entry(trace_id.clone())
+                    .or_insert_with(Vec::new)
+                    .push(data.to_string());
+            }
+        }
+
+        "audio_segment_end" => {
+            let reason = msg.extra.get("reason").and_then(|v| v.as_str()).unwrap_or("unknown");
+            tracing::info!(trace_id = %trace_id, reason = reason, "Device audio_segment_end");
+
+            // Collect all buffered chunks, merge, and send through audio_handler
+            let chunks = PENDING_AUDIO.lock().unwrap().remove(&trace_id);
+            if let Some(chunks) = chunks {
+                if !chunks.is_empty() {
+                    // Merge base64 chunks — decode, concat, re-encode
+                    let mut merged = Vec::new();
+                    for chunk_b64 in &chunks {
+                        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(chunk_b64) {
+                            merged.extend_from_slice(&decoded);
+                        }
+                    }
+                    let merged_b64 = base64::engine::general_purpose::STANDARD.encode(&merged);
+                    let mime = msg.extra.get("mimeType").and_then(|v| v.as_str()).unwrap_or("audio/wav");
+                    tracing::info!(trace_id = %trace_id, chunks = chunks.len(), total_bytes = merged.len(), "Device audio merged, forwarding to backend");
+                    audio_handler::handle_incoming_audio(
+                        app,
+                        ws_tx,
+                        device_id,
+                        trace_id,
+                        String::new(),
+                        merged_b64,
+                        mime.to_string(),
+                        "device",
+                    );
+                }
+            }
+        }
+
+        "device_state" => {
+            // Forward device state to WebView for status panel
+            let _ = app.emit("device_state", &msg.extra);
+        }
+
+        "ping" => {
+            // Ignore device keepalive pings
+        }
+
         other => {
-            tracing::debug!("Device WS: unhandled message type: {}", other);
+            tracing::info!("Device WS: unhandled message type: {}", other);
         }
     }
 }
+
+// Buffer for accumulating audio_segment_chunks per traceId
+static PENDING_AUDIO: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));

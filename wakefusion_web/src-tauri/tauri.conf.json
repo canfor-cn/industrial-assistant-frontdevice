@@ -25,10 +25,8 @@
   },
   "bundle": {
     "active": true,
-    "resources": [
-      "host-config.json"
-    ],
-    "targets": "all",
-    "icon": []
+    "resources": [],
+    "targets": [],
+    "icon": ["icons/icon.ico", "icons/icon.png"]
   }
 }

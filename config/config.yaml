@@ -2,7 +2,7 @@
 
 # 音频配置
 audio:
-  device_match: "default"  # 设备匹配: "XVF3800" 或 "default" (测试用)
+  device_match: "XVF3800"  # 设备匹配: "XVF3800" 或 "default" (测试用)
   capture_sample_rate: 48000  # 采集采样率
   work_sample_rate: 16000  # 工作采样率
   frame_ms: 20  # 帧长（毫秒）
@@ -14,7 +14,7 @@ audio:
 # KWS配置
 kws:
   enabled: true
-  engine: "matchboxnet"  # KWS引擎: matchboxnet (推荐) 或 openwakeword
+  engine: "openwakeword"  # KWS引擎: matchboxnet (推荐) 或 openwakeword
   model: "matchboxnet"
   model_name: "commandrecognition_en_matchboxnet3x1x64_v1"  # 预训练模型名称
   device: "cpu"  # 推理设备: cpu 或 cuda
@@ -88,7 +88,7 @@ vision_wake:
 
 # 音频动态阈值配置
 audio_threshold:
-  default: 0.9  # 默认高阈值（无人时，纯语音唤醒模式）
+  default: 0.5  # 默认阈值（XVF3800 AEC通道信号弱，降低以提高召回率）
   visual_wake: 0.6  # 视觉唤醒后的低阈值（视觉降维打击模式）
   change_timeout_ms: 100  # 阈值修改指令超时（毫秒）
 
@@ -141,7 +141,7 @@ conversation:
 
 # 音频播放配置（从服务器端接收的音频流）
 audio_playback:
-  sample_rate: 16000  # 采样率（Hz），必须与服务器端TTS输出一致
+  sample_rate: 22050  # 采样率（Hz），必须与服务器端TTS输出一致（f5tts输出22050Hz）
   # 重要提示：
   # - 如果服务器端使用Qwen3-TTS，其默认输出为24000Hz，此处应设置为24000
   # - 如果服务器端使用其他TTS引擎输出16000Hz，则设置为16000
@@ -154,9 +154,9 @@ audio_playback:
 
 # LLM Agent 配置（统一WebSocket协议）
 llm_agent:
-  host: "127.0.0.1:8080"  # LLM Agent服务地址（格式：host:port）
+  host: "127.0.0.1:7788"  # LLM Agent服务地址
   device_id: "wakefusion-device-01"  # 设备标识
-  token: "your-token-here"  # 认证令牌
+  token: "test-voice-token"  # 认证令牌
   use_ssl: false  # 是否使用SSL（true for wss://, false for ws://）
   reconnect_interval_sec: 5.0  # 断线重连间隔（秒）
   ping_interval_sec: 30.0  # 保活ping间隔（秒）

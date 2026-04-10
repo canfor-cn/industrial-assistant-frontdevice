@@ -1,3 +1,12 @@
+# Fix Windows GBK encoding crash when spawned without terminal
+import sys as _sys
+if hasattr(_sys.stdout, 'reconfigure'):
+    try:
+        _sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        _sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 """
 核心决策模块 (Core Server)
 整合视觉和音频输入，实现多模态唤醒和状态管理
@@ -31,12 +40,16 @@ logger.addHandler(handler)
 class CoreServer:
     """核心决策服务器"""
     
-    def __init__(self, config_path: Optional[str] = None):
+    def __init__(self, config_path: Optional[str] = None,
+                 vision_queue: Optional["queue.Queue"] = None,
+                 lip_sync_event: Optional[threading.Event] = None):
         """
         初始化核心服务器
-        
+
         Args:
             config_path: 配置文件路径（可选）
+            vision_queue: 视觉数据队列（替代 ZMQ SUB :5555）
+            lip_sync_event: 唇动检测控制事件（替代 ZMQ PUB :5564）
         """
         # 加载配置
         self.config = get_config(config_path)
@@ -50,10 +63,9 @@ class CoreServer:
         # 初始化ZMQ Context
         self.zmq_context = zmq.Context()
         
-        # ZMQ SUB Sockets（订阅视觉和音频数据）
-        self.vision_sub_socket = self.zmq_context.socket(zmq.SUB)
-        self.vision_sub_socket.connect(f"tcp://127.0.0.1:{self.zmq_config.vision_pub_port}")
-        self.vision_sub_socket.setsockopt_string(zmq.SUBSCRIBE, "")
+        # 视觉数据队列（替代 ZMQ SUB :5555）
+        self._vision_queue = vision_queue
+        self._lip_sync_event = lip_sync_event
         
         self.audio_sub_socket = self.zmq_context.socket(zmq.SUB)
         self.audio_sub_socket.connect(f"tcp://127.0.0.1:{self.zmq_config.audio_pub_port}")
@@ -75,8 +87,7 @@ class CoreServer:
         # ZMQ REP Socket（接收LLM控制指令）
         self._control_rep_socket: Optional[zmq.Socket] = None
         
-        # ZMQ PUB Socket（向视觉模块发送控制消息）
-        self._vision_ctrl_pub_socket: Optional[zmq.Socket] = None
+        # 视觉控制通过 lip_sync_event（threading.Event）替代 ZMQ PUB :5564
         
         # 音频播放队列（可清空）
         self.audio_playback_queue = queue.Queue()
@@ -106,12 +117,11 @@ class CoreServer:
         
         # ZMQ Socket 线程安全锁 (防止跨线程并发调用导致C++底层崩溃)
         self._audio_req_lock = threading.Lock()
-        self._vision_ctrl_lock = threading.Lock()
+        # _vision_ctrl_lock removed (lip_sync_event is thread-safe)
         self._state_lock = threading.Lock()  # 用于保护布尔标志位的修改
         
         # Poller用于同时监听多个socket
         self.poller = zmq.Poller()
-        self.poller.register(self.vision_sub_socket, zmq.POLLIN)
         self.poller.register(self.audio_sub_socket, zmq.POLLIN)
         
         # 状态管理（使用布尔标志位替代SystemState枚举）
@@ -193,7 +203,7 @@ class CoreServer:
         logger.info(f"  Audio SUB: tcp://127.0.0.1:{self.zmq_config.audio_pub_port}")
         logger.info(f"  Audio REQ: tcp://127.0.0.1:{self.zmq_config.audio_ctrl_port}")
         logger.info(f"  ASR Result PULL: tcp://127.0.0.1:{self.zmq_config.asr_result_push_port}")
-        logger.info(f"  Vision Ctrl PUB: tcp://127.0.0.1:{self.zmq_config.vision_ctrl_pub_port}")
+        logger.info(f"  Vision Data: {'queue' if vision_queue else 'disabled'}")
         logger.info(f"  Control REP: tcp://127.0.0.1:{self.zmq_config.core_control_rep_port}")
         logger.info(f"  LLM Agent: {self.llm_agent_config.host} (deviceId: {self.llm_agent_config.device_id})")
         logger.info(f"  Initial timeout: {self.current_silence_timeout}s")
@@ -217,6 +227,16 @@ class CoreServer:
             logger.error(f"❌ 音频REQ socket重连失败: {e}")
             return False
     
+    def _send_vision_command(self, command: str):
+        """向音频模块发送视觉触发命令"""
+        try:
+            with self._audio_req_lock:
+                self.audio_req_socket.send_json({"command": command})
+                reply = self.audio_req_socket.recv_json()
+                logger.info(f"👁️ 视觉命令 {command}: {reply}")
+        except Exception as e:
+            logger.warning(f"⚠️ 视觉命令 {command} 发送失败: {e}")
+
     def _send_threshold_command(self, threshold: float):
         """向音频模块发送阈值调整指令（带自动重连）"""
         max_retries = 2
@@ -251,10 +271,8 @@ class CoreServer:
         self.poller.register(self._control_rep_socket, zmq.POLLIN)
     
     def _init_vision_ctrl_socket(self):
-        """初始化视觉控制socket（向vision_service发送控制消息）"""
-        self._vision_ctrl_pub_socket = self.zmq_context.socket(zmq.PUB)
-        self._vision_ctrl_pub_socket.bind(f"tcp://127.0.0.1:{self.zmq_config.vision_ctrl_pub_port}")
-        logger.info(f"  Vision Ctrl PUB: tcp://127.0.0.1:{self.zmq_config.vision_ctrl_pub_port}")
+        """视觉控制已改为 threading.Event，此方法保留为空"""
+        logger.info("  Vision Ctrl: threading.Event (in-process)")
     
     # ASR相关方法已删除（ASR已迁移到服务器端）
     
@@ -273,17 +291,8 @@ class CoreServer:
         logger.info("🌐 WebSocket Client线程已启动")
     
     def _init_ui_websocket_server(self):
-        """初始化本地WebSocket Server（用于转发消息给UI）"""
-        try:
-            import websockets
-        except ImportError:
-            logger.warning("⚠️ websockets未安装，UI WebSocket Server无法启动")
-            return
-        
-        # 启动UI WebSocket Server线程
-        self._ui_ws_thread = threading.Thread(target=self._ui_websocket_server_worker, daemon=True)
-        self._ui_ws_thread.start()
-        logger.info("🎨 UI WebSocket Server线程已启动 (ws://127.0.0.1:8765)")
+        """UI WebSocket Server已废弃 — UI由Rust宿主WebView提供"""
+        logger.info("UI WebSocket Server已禁用（由Rust宿主管理）")
     
     def _ui_websocket_server_worker(self):
         """UI WebSocket Server工作线程"""
@@ -315,8 +324,9 @@ class CoreServer:
         
         async def server_main():
             """启动WebSocket服务器"""
-            async with websockets.serve(handle_ui_client, "127.0.0.1", 8765):
-                logger.info("✅ UI WebSocket Server已启动 (ws://127.0.0.1:8765)")
+            ui_port = self._ui_ws_port
+            async with websockets.serve(handle_ui_client, "127.0.0.1", ui_port):
+                logger.info(f"✅ UI WebSocket Server已启动 (ws://127.0.0.1:{ui_port})")
                 await asyncio.Future()  # 永久运行
         
         try:
@@ -369,15 +379,18 @@ class CoreServer:
         asyncio.set_event_loop(loop)
         self._ws_loop = loop
         
-        # 构建WebSocket URL
-        protocol = "wss" if self.llm_agent_config.use_ssl else "ws"
-        host = self.llm_agent_config.host
-        device_id = self.llm_agent_config.device_id
-        token = self.llm_agent_config.token
-        url = f"{protocol}://{host}/api/voice/ws?deviceId={device_id}&token={token}"
-        
-        reconnect_interval = self.llm_agent_config.reconnect_interval_sec
-        ping_interval = self.llm_agent_config.ping_interval_sec
+        # 构建WebSocket URL — 连接到Rust宿主的device_ws_server
+        device_upstream = getattr(self.config, 'device_upstream', None)
+        if device_upstream and hasattr(device_upstream, 'host'):
+            upstream_host = device_upstream.host
+            upstream_port = getattr(device_upstream, 'port', 8765)
+            url = f"ws://{upstream_host}:{upstream_port}"
+        else:
+            # Fallback: 连接Rust宿主默认地址
+            url = "ws://127.0.0.1:8765"
+
+        reconnect_interval = getattr(self.llm_agent_config, 'reconnect_interval_sec', 5.0)
+        ping_interval = getattr(self.llm_agent_config, 'ping_interval_sec', 30.0)
         
         async def client_main():
             """WebSocket客户端主循环"""
@@ -517,7 +530,15 @@ class CoreServer:
                 "endMs": data.get("endMs")
             })
         elif msg_type == "audio_begin":
-            logger.info("🎵 收到 audio_begin，重置本地播放缓冲")
+            # 从 audio_begin 中读取实际采样率，动态适配播放参数
+            server_sr = data.get("sampleRate")
+            if server_sr and isinstance(server_sr, (int, float)) and int(server_sr) > 0:
+                new_sr = int(server_sr)
+                if new_sr != self._current_playback_sample_rate:
+                    logger.info(f"🎵 采样率切换: {self._current_playback_sample_rate} → {new_sr}Hz")
+                    self._current_playback_sample_rate = new_sr
+                    self._need_reopen_stream = True
+            logger.info(f"🎵 收到 audio_begin，重置本地播放缓冲 (sampleRate={self._current_playback_sample_rate}Hz)")
             self._current_audio_session_id = str(uuid.uuid4())
             self._audio_prebuffer.clear()
             self._is_prebuffering = True
@@ -562,6 +583,16 @@ class CoreServer:
             # 3. 彻底退出交互模式（自动通知底层断开推流、重置冷却，阈值恢复 0.9）
             if self.is_interactive_mode:
                 self._exit_interactive_mode()
+        elif msg_type == "tts_playing":
+            # Rust 前端正在播放 TTS — 保持交互模式，刷新活动时间
+            self.is_playing_tts = True
+            self._last_speech_time = time.time()
+            logger.debug("🔊 [持续对话] TTS 播放中，保持交互模式")
+        elif msg_type == "tts_idle":
+            # Rust 前端 TTS 播完 — 开始等待用户下一句话
+            self.is_playing_tts = False
+            self._last_speech_time = time.time()  # 从现在开始计算空闲
+            logger.info("🔇 [持续对话] TTS 播放完毕，等待用户继续对话...")
         elif msg_type == "pong":
             # Ping响应
             pass
@@ -654,12 +685,37 @@ class CoreServer:
             logger.error(f"❌ 发送WebSocket消息失败: {e}")
     
     def _report_device_state(self, state: str):
-        """上报设备状态（idle/listening/thinking/speaking）"""
+        """上报设备状态（idle/listening/thinking/speaking），包含视觉和音频详情"""
+        # 视觉状态
+        vision_faces = 0
+        vision_distance = None
+        vision_talking = False
+        if hasattr(self, '_latest_vision_is_talking'):
+            vision_talking = self._latest_vision_is_talking
+        if hasattr(self, '_vision_data_count'):
+            # 从最近一帧视觉数据中提取
+            pass
+        # 从 _process_vision_data 中缓存的最新数据
+        if hasattr(self, '_last_vision_faces'):
+            vision_faces = self._last_vision_faces
+        if hasattr(self, '_last_vision_distance'):
+            vision_distance = self._last_vision_distance
+
         message = {
             "type": "device_state",
             "state": state,
             "deviceId": self.llm_agent_config.device_id,
-            "timestamp": time.time()
+            "timestamp": time.time(),
+            "vision": {
+                "faces": vision_faces,
+                "distance_m": vision_distance,
+                "is_talking": vision_talking,
+                "active": getattr(self, '_is_vision_wake_active', False),
+            },
+            "audio": {
+                "interactive": self.is_interactive_mode,
+                "tts_playing": self.is_playing_tts,
+            },
         }
         self._send_websocket_message(message)
         logger.debug(f"📊 设备状态已上报: {state}")
@@ -679,7 +735,8 @@ class CoreServer:
     def _start_playback_thread(self):
         """启动音频播放线程"""
         self._playback_active = True
-        self._current_playback_sample_rate = 24000  # 默认采样率
+        self._current_playback_sample_rate = self.audio_playback_config.sample_rate  # 从配置读取默认采样率
+        self._need_reopen_stream = False  # 标记是否需要重建播放流
         self._playback_thread = threading.Thread(target=self._audio_playback_worker, daemon=True)
         self._playback_thread.start()
         logger.info("🎵 音频播放线程已启动")
@@ -718,40 +775,49 @@ class CoreServer:
             )
             return
         
-        # 使用OutputStream进行流式播放
-        sample_rate = self.audio_playback_config.sample_rate
+        # 使用OutputStream进行流式播放（支持动态采样率切换）
         channels = self.audio_playback_config.channels
-        
-        try:
-            with sd.OutputStream(samplerate=sample_rate,
-                               channels=channels,
-                               dtype=np.int16,
-                               device=output_device) as stream:
-                logger.info(f"🎵 音频流式播放已启动 (采样率: {sample_rate}Hz, 声道: {channels})")
-                
-                while self._playback_active:
-                    try:
-                        # 尝试获取音频帧（PCM int16裸流字节）
-                        audio_data = self.audio_playback_queue.get(timeout=0.1)
-                        
-                        # 转换为numpy数组并播放
-                        audio_array = np.frombuffer(audio_data, dtype=np.int16)
-                        stream.write(audio_array)  # 无缝拼接
-                        
-                    except queue.Empty:
-                        # 队列为空时的处理（完美触发排空）
-                        if self._wait_for_audio_drain:
-                            logger.info("✅ 音频队列已彻底排空，安全切换到 LISTENING 状态")
-                            self._wait_for_audio_drain = False
-                            self._is_prebuffering = True      # 为下一轮对话重置预缓冲
-                            self._audio_prebuffer.clear()
-                            self._current_audio_session_id = None  # 重置session
-                            self._stop_tts_playback()  # 停止TTS播放，触发免唤醒等后续逻辑
-                        continue
-                    except Exception as e:
-                        logger.error(f"❌ 音频播放异常: {e}")
-        except Exception as e:
-            logger.error(f"❌ 创建音频输出流失败: {e}")
+        current_sr = self._current_playback_sample_rate
+
+        while self._playback_active:
+            try:
+                with sd.OutputStream(samplerate=current_sr,
+                                   channels=channels,
+                                   dtype=np.int16,
+                                   device=output_device) as stream:
+                    logger.info(f"🎵 音频流式播放已启动 (采样率: {current_sr}Hz, 声道: {channels})")
+                    self._need_reopen_stream = False
+
+                    while self._playback_active and not self._need_reopen_stream:
+                        try:
+                            # 尝试获取音频帧（PCM int16裸流字节）
+                            audio_data = self.audio_playback_queue.get(timeout=0.1)
+
+                            # 转换为numpy数组并播放
+                            audio_array = np.frombuffer(audio_data, dtype=np.int16)
+                            stream.write(audio_array)  # 无缝拼接
+
+                        except queue.Empty:
+                            # 队列为空时的处理（完美触发排空）
+                            if self._wait_for_audio_drain:
+                                logger.info("✅ 音频队列已彻底排空，安全切换到 LISTENING 状态")
+                                self._wait_for_audio_drain = False
+                                self._is_prebuffering = True      # 为下一轮对话重置预缓冲
+                                self._audio_prebuffer.clear()
+                                self._current_audio_session_id = None  # 重置session
+                                self._stop_tts_playback()  # 停止TTS播放，触发免唤醒等后续逻辑
+                            continue
+                        except Exception as e:
+                            logger.error(f"❌ 音频播放异常: {e}")
+
+                # 流关闭后检查是否需要以新采样率重新打开
+                if self._need_reopen_stream:
+                    current_sr = self._current_playback_sample_rate
+                    logger.info(f"🔄 以新采样率重建播放流: {current_sr}Hz")
+
+            except Exception as e:
+                logger.error(f"❌ 创建音频输出流失败: {e}")
+                break  # 避免无限重试
     
     def clear_playback_queue(self):
         """清空播放队列（硬打断）"""
@@ -928,14 +994,10 @@ class CoreServer:
             logger.info("状态转换: 退出交互模式，通知底层结束推流并关闭唇动检测")
             self._send_stop_streaming_command()
             
-            # 🌟 新增：休眠时关闭唇动检测，大幅节省 CPU/GPU 算力
-            if getattr(self, '_vision_ctrl_pub_socket', None):
-                try:
-                    with self._vision_ctrl_lock:
-                        self._vision_ctrl_pub_socket.send_json({"event": "STOP_LIP_SYNC"}, zmq.NOBLOCK)
-                    logger.info("🛑 交互结束，已通知视觉模块休眠唇动检测")
-                except Exception:
-                    pass
+            # 休眠时关闭唇动检测，节省 CPU/GPU 算力
+            if self._lip_sync_event is not None:
+                self._lip_sync_event.clear()
+                logger.info("🛑 交互结束，已关闭唇动检测")
             
             # 退出交互时才重置底层唤醒冷却
             self._send_reset_cooldown_command()
@@ -983,14 +1045,10 @@ class CoreServer:
                 self._interactive_timeout_thread = threading.Thread(target=self._interactive_timeout_checker, daemon=True)
                 self._interactive_timeout_thread.start()
             
-            # 🌟 新增：唤醒时开启唇动检测，用于防伪和微观截断
-            if getattr(self, '_vision_ctrl_pub_socket', None):
-                try:
-                    with self._vision_ctrl_lock:
-                        self._vision_ctrl_pub_socket.send_json({"event": "START_LIP_SYNC"}, zmq.NOBLOCK)
-                    logger.info("🎬 唤醒成功，已通知视觉模块全速开启唇动检测！")
-                except Exception as e:
-                    logger.debug(f"发送START_LIP_SYNC失败（已忽略）: {e}")
+            # 唤醒时开启唇动检测
+            if self._lip_sync_event is not None:
+                self._lip_sync_event.set()
+                logger.info("🎬 唤醒成功，已开启唇动检测")
             
             self.is_interactive_mode = True
             
@@ -1093,30 +1151,36 @@ class CoreServer:
         pass
     
     def _interactive_timeout_checker(self):
-        """后台线程：仅负责 90秒 纯语音唤醒的全局超时停止判定"""
-        logger.info("⏱️ [90秒交互超时检查线程] 已启动")
+        """后台线程：持续对话空闲超时检测
+        TTS 播放中不计时，TTS 播完后开始 15 秒倒计时"""
+        logger.info("⏱️ [持续对话超时检查线程] 已启动")
+        IDLE_TIMEOUT = 15.0  # TTS 播完后等待用户下一句话的时间
+        MAX_TIMEOUT = 120.0  # 极限保底（防死锁）
         while True:
             if self._interactive_timeout_should_exit:
-                logger.info("⏱️ [90秒交互超时检查线程] 收到退出信号")
+                logger.info("⏱️ [持续对话超时检查线程] 收到退出信号")
                 break
-            
+
             time.sleep(1.0)
-            
+
             if not self.is_interactive_mode:
                 continue
-                
+
             if self.is_playing_tts:
+                # TTS 正在播放，用户在听，不计时
                 self._last_speech_time = time.time()
                 continue
-                
+
             now = time.time()
-            wake_path = getattr(self, '_current_wake_path', 'unknown')
-            
-            # 纯语音唤醒：90秒内没说话则停止唤醒。视觉唤醒：依靠视觉斩断，但给120秒极限保底防死锁
-            timeout_limit = 90.0 if wake_path == "纯语音唤醒" else 120.0
-            
-            if self._last_speech_time and (now - self._last_speech_time) > timeout_limit:
-                logger.warning(f"🛑 [唤醒停止] 超过 {timeout_limit} 秒无人声，退出交互模式！")
+            elapsed = now - self._last_speech_time if self._last_speech_time else 0
+
+            # 空闲超时：TTS 播完后 15 秒无新语音 → 退出
+            if elapsed > IDLE_TIMEOUT:
+                logger.warning(f"🛑 [持续对话] 空闲 {elapsed:.0f}秒，退出交互模式")
+                self._exit_interactive_mode()
+            # 极限保底
+            elif elapsed > MAX_TIMEOUT:
+                logger.warning(f"🛑 [持续对话] 极限保底 {MAX_TIMEOUT}秒，强制退出")
                 self._exit_interactive_mode()
     
     def _start_tts_playback(self):
@@ -1173,15 +1237,6 @@ class CoreServer:
         self._current_audio_session_id = str(uuid.uuid4())
         self._binary_frame_shield_until = time.time() + 0.5
         
-        # 通知视觉模块闭嘴
-        if getattr(self, '_vision_ctrl_pub_socket', None):
-            try:
-                with self._vision_ctrl_lock:
-                    # 🌟 修复：已删除发送STOP_LIP_SYNC给视觉模块的代码，防止误杀用户唇动检测
-                    pass
-            except Exception:
-                pass
-                
         # 退出交互模式
         self._exit_interactive_mode(use_abort=True)
     
@@ -1207,27 +1262,25 @@ class CoreServer:
                 # 使用Poller同时监听视觉和音频数据
                 socks = dict(self.poller.poll(timeout=100))  # 100ms超时
                 
-                # 处理视觉数据
-                if self.vision_sub_socket in socks:
+                # 处理视觉数据（从内存队列读取，替代 ZMQ SUB）
+                if self._vision_queue is not None:
                     latest_vision_data = None
                     try:
-                        # 🌟 修复：疯狂读取，榨干ZMQ队列里积压的所有历史旧帧，只保留最新的一帧
                         while True:
-                            latest_vision_data = self.vision_sub_socket.recv_json(zmq.NOBLOCK)
-                    except zmq.Again:
-                        pass  # 队列已抽干
+                            latest_vision_data = self._vision_queue.get_nowait()
+                    except queue.Empty:
+                        pass
                     except Exception as e:
                         logger.error(f"处理视觉数据异常: {e}", exc_info=True)
-                    
+
                     if latest_vision_data:
-                        # 调试：记录视觉数据接收（每10次打印一次，避免刷屏）
                         if not hasattr(self, '_vision_data_count'):
                             self._vision_data_count = 0
                         self._vision_data_count += 1
                         if self._vision_data_count % 10 == 0:
                             faces_count = len(latest_vision_data.get("faces", []))
                             logger.debug(f"📥 收到最新视觉数据 (第{self._vision_data_count}帧, {faces_count}个人脸)")
-                        
+
                         self._process_vision_data(latest_vision_data)
                 
                 # 处理音频数据
@@ -1303,10 +1356,13 @@ class CoreServer:
     
     def _process_vision_data(self, vision_data: dict):
         """处理视觉数据（纯传感器数据，业务逻辑在core_server中处理）"""
-        # 🌟 核心修复：在方法开头统一提取所有需要的变量，避免 UnboundLocalError
         faces = vision_data.get("faces", [])
         distance_m = vision_data.get("distance_m")
         is_talking = vision_data.get("is_talking", False)
+
+        # 缓存最新视觉状态（供 _report_device_state 使用）
+        self._last_vision_faces = len(faces)
+        self._last_vision_distance = distance_m
         
         # 🌟 增加视觉流实时诊断日志，让用户看清摄像头每秒的真实判定
         if not hasattr(self, '_diag_last_lip') or self._diag_last_lip != is_talking:
@@ -1385,8 +1441,9 @@ class CoreServer:
                 # 进入防抖完成，切换阈值
                 if not getattr(self, '_is_vision_wake_active', False):
                     self._send_threshold_command(self.audio_threshold_config.visual_wake)
+                    self._send_vision_command("vision_wake")
                     self._is_vision_wake_active = True
-                    logger.info(f"👁️ 视觉降维打击激活，阈值已降至{self.audio_threshold_config.visual_wake:.2f}")
+                    logger.info(f"👁️ 视觉降维打击激活，阈值已降至{self.audio_threshold_config.visual_wake:.2f}，视觉触发模式开启")
             
             # 🌟 注意：如果防抖时间还没到，这里没有 else，什么都不做，安静等待 200ms 走完
             
@@ -1406,19 +1463,16 @@ class CoreServer:
             elif time.time() - self._vision_leave_debounce_start >= (self.vision_wake_config.leave_debounce_ms / 1000.0):
                 # 离开防抖完成，彻底离开，恢复阈值
                 if getattr(self, '_is_vision_wake_active', False):
-                    # 1. 恢复默认听力阈值
+                    # 1. 恢复默认听力阈值 + 关闭视觉触发模式
                     self._send_threshold_command(self.audio_threshold_config.default)
-                    logger.info(f"👁️ 视觉降维打击结束，阈值已恢复至{self.audio_threshold_config.default:.2f}")
+                    self._send_vision_command("vision_leave")
+                    logger.info(f"👁️ 视觉降维打击结束，阈值已恢复至{self.audio_threshold_config.default:.2f}，视觉触发模式关闭")
                     self._is_vision_wake_active = False
-                    
-                    # 2. 只对"视觉降维打击"唤醒的会话执行强制挂断
-                    if self.is_interactive_mode and getattr(self, '_current_wake_path', 'unknown') == "视觉降维打击":
-                        min_dist, max_dist = self.vision_wake_config.distance_range
-                        if distance_m is None or not (min_dist <= distance_m <= max_dist):
-                            logger.info(f"🛑 视觉降维唤醒：用户离开 [{min_dist}m, {max_dist}m] 绝对安全区 (当前 {distance_m}m)，触发视觉斩断，终止唤醒！")
-                            self._exit_interactive_mode()
-                        else:
-                            logger.info(f"🛡️ 视觉降维唤醒：用户虽丢失人脸，但仍在 {distance_m}m 处，处于 [{min_dist}m, {max_dist}m] 安全区间内，保持唤醒状态！")
+
+                    # 2. 无人时强制终止交互模式（无论什么唤醒路径）
+                    if self.is_interactive_mode:
+                        logger.info(f"🛑 视觉检测无人，强制退出交互模式（唤醒路径={getattr(self, '_current_wake_path', 'unknown')}，距离={distance_m}m）")
+                        self._exit_interactive_mode()
         
         # ========== 视觉区间判断（用于视觉斩断） ==========
         vision_target_present = self._check_vision_target_present(faces)
@@ -1815,10 +1869,7 @@ class CoreServer:
             # ASR相关socket已删除
             if self._control_rep_socket:
                 sockets_to_close.append(self._control_rep_socket)
-            if hasattr(self, '_vision_ctrl_pub_socket') and self._vision_ctrl_pub_socket:
-                sockets_to_close.append(self._vision_ctrl_pub_socket)
             sockets_to_close.extend([
-                self.vision_sub_socket,
                 self.audio_sub_socket,
                 self.audio_req_socket
             ])

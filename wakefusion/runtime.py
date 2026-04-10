@@ -65,21 +65,16 @@ class WakeFusionRuntime:
     async def start(self):
         """启动运行时"""
         logger.info("Starting WakeFusion runtime...")
+        self._loop = asyncio.get_running_loop()
 
         try:
-            # 1. 启动WebSocket发布器
-            self.ws_publisher = WSEventPublisher(
-                host="0.0.0.0",
-                port=self.config.runtime.websocket_port
-            )
-            await self.ws_publisher.start()
+            # 1. WebSocket发布器已废弃（由Rust宿主管理）
+            self.ws_publisher = None
+            logger.info("WSEventPublisher disabled (managed by Rust host)")
 
-            # 2. 启动健康检查服务
-            self.health_server = HealthServer(
-                host="0.0.0.0",
-                port=self.config.runtime.health_port
-            )
-            await self.health_server.start()
+            # 2. 健康检查服务已废弃（由Rust宿主管理设备状态）
+            self.health_server = None
+            logger.info("HealthServer disabled (managed by Rust host)")
 
             # 3. 初始化决策引擎
             self.decision_engine = DecisionEngine(
@@ -119,11 +114,24 @@ class WakeFusionRuntime:
                 )
             else:
                 # 使用 openWakeWord (备选)
-                logger.info(f"Initializing openWakeWord KWS with keyword: {self.config.kws.keyword}")
+                # Resolve model path: check config, then default locations
+                oww_model_path = getattr(self.config.kws, 'model_path', None)
+                if not oww_model_path:
+                    from pathlib import Path
+                    for candidate in [
+                        "xiaokang_oww.onnx",
+                        "models/xiaokang_oww.onnx",
+                        "wakefusion/models/xiaokang_oww.onnx",
+                    ]:
+                        if Path(candidate).exists():
+                            oww_model_path = candidate
+                            break
+                logger.info(f"Initializing openWakeWord KWS with keyword: {self.config.kws.keyword}, model: {oww_model_path or 'default'}")
                 self.kws_worker = KWSWorker(
                     keyword=self.config.kws.keyword,
                     threshold=self.config.kws.threshold,
                     cooldown_ms=self.config.kws.cooldown_ms,
+                    model_path=oww_model_path,
                     event_callback=self._on_kws_event
                 )
 
@@ -193,17 +201,19 @@ class WakeFusionRuntime:
 
                 logger.info("Vision components started successfully")
 
-            # 9. 注册健康检查回调
-            self.health_server.register_component("audio", self._get_audio_status)
-            self.health_server.register_component("kws", self.kws_worker.get_stats)
-            self.health_server.register_component("vad", self.vad_worker.get_stats)
-            self.health_server.register_component("fusion", self.decision_engine.get_stats)
-            self.health_server.register_component("ws", self.ws_publisher.get_stats)
+            # 9. 注册健康检查回调（health_server/ws_publisher 可能被禁用）
+            if self.health_server:
+                self.health_server.register_component("audio", self._get_audio_status)
+                self.health_server.register_component("kws", self.kws_worker.get_stats)
+                self.health_server.register_component("vad", self.vad_worker.get_stats)
+                self.health_server.register_component("fusion", self.decision_engine.get_stats)
+                if self.ws_publisher:
+                    self.health_server.register_component("ws", self.ws_publisher.get_stats)
 
-            if self.config.vision.enabled:
-                self.health_server.register_component("camera", self.camera_driver.get_device_status)
-                self.health_server.register_component("vision", self.vision_router.get_stats)
-                self.health_server.register_component("face_gate", self.face_gate.get_stats)
+                if self.config.vision.enabled:
+                    self.health_server.register_component("camera", self.camera_driver.get_device_status)
+                    self.health_server.register_component("vision", self.vision_router.get_stats)
+                    self.health_server.register_component("face_gate", self.face_gate.get_stats)
 
             # 10. 启动健康检查报告任务
             asyncio.create_task(self._health_report_loop())
@@ -292,27 +302,32 @@ class WakeFusionRuntime:
 
     def _on_kws_event(self, event: BaseEvent):
         """
-        KWS事件回调
-
-        Args:
-            event: KWS事件
+        KWS事件回调（从工作线程调用，需线程安全地调度到 event loop）
         """
-        # 提交给决策引擎
         if event.type == EventType.KWS_HIT:
             result = self.decision_engine.process_kws_hit(event)
-
-            # 发布KWS_HIT事件
-            asyncio.create_task(self.ws_publisher.publish(event))
+            self._schedule_publish(event)
 
     def _on_vad_event(self, event: BaseEvent):
         """
-        VAD事件回调
-
-        Args:
-            event: VAD事件
+        VAD事件回调（从工作线程调用）
         """
-        # 发布VAD事件
-        asyncio.create_task(self.ws_publisher.publish(event))
+        self._schedule_publish(event)
+
+    def _schedule_publish(self, event: BaseEvent):
+        """线程安全地将事件发布调度到 asyncio event loop"""
+        if not self.ws_publisher:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.ws_publisher.publish(event))
+        except RuntimeError:
+            # Called from a worker thread — use thread-safe scheduling
+            try:
+                loop = self._loop
+                asyncio.run_coroutine_threadsafe(self.ws_publisher.publish(event), loop)
+            except Exception as e:
+                logger.error(f"Failed to schedule publish: {e}")
 
     def _on_vision_frame(self, frame: VisionFrame):
         """
@@ -340,7 +355,8 @@ class WakeFusionRuntime:
             event: 视觉事件
         """
         # 发布视觉事件
-        asyncio.create_task(self.ws_publisher.publish(event))
+        if self.ws_publisher:
+            asyncio.create_task(self.ws_publisher.publish(event))
 
     def _on_decision_event(self, event: BaseEvent):
         """
@@ -350,7 +366,8 @@ class WakeFusionRuntime:
             event: 决策事件
         """
         # 发布决策事件
-        asyncio.create_task(self.ws_publisher.publish(event))
+        if self.ws_publisher:
+            asyncio.create_task(self.ws_publisher.publish(event))
 
     async def _health_report_loop(self):
         """健康检查报告循环"""
@@ -421,8 +438,12 @@ async def main():
         runtime.shutdown_event.set()
 
     loop = asyncio.get_event_loop()
-    loop.add_signal_handler(signal.SIGINT, signal_handler)
-    loop.add_signal_handler(signal.SIGTERM, signal_handler)
+    try:
+        loop.add_signal_handler(signal.SIGINT, signal_handler)
+        loop.add_signal_handler(signal.SIGTERM, signal_handler)
+    except NotImplementedError:
+        # Windows does not support add_signal_handler
+        pass
 
     # 运行
     try:
