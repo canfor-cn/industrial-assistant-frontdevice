@@ -1035,6 +1035,26 @@ class CoreServer:
             # 如果是进入免唤醒持续对话或视觉直接触发，必须主动通知音频底层拉起流模式
             if wake_path in ("持续对话", "视觉直接触发"):
                 self._send_start_streaming_command()
+
+            # 🌟 视觉直接触发：主动问候 "你好，我是小慧"（带 60 秒冷却防止重复）
+            if wake_path == "视觉直接触发":
+                now = time.time()
+                last_greeting = getattr(self, '_last_greeting_at', 0)
+                if now - last_greeting >= 60.0:
+                    self._last_greeting_at = now
+                    logger.info("👋 [视觉直接触发] 触发主动问候")
+                    # 向后端发送 greeting 上行消息，后端会播报固定欢迎语
+                    try:
+                        self._send_websocket_message({
+                            "type": "greeting",
+                            "deviceId": self.llm_agent_config.device_id,
+                            "timestamp": now,
+                        })
+                    except Exception as e:
+                        logger.warning(f"⚠️ 发送 greeting 消息失败: {e}")
+                else:
+                    elapsed = now - last_greeting
+                    logger.info(f"👋 问候冷却中（已过 {elapsed:.0f}s / 60s），跳过问候")
         
             # 🌟 修复1：消除轮询执念 - 不再启动独立的VAD超时检查线程
             # VAD超时检查已移至 _process_audio_data 中，实现纯事件驱动
