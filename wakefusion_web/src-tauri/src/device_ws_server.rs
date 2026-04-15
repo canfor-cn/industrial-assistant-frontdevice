@@ -44,11 +44,23 @@ pub struct VoiceMessageEvent {
 static DEVICE_DOWN_TX: std::sync::LazyLock<std::sync::Mutex<Option<crossbeam_channel::Sender<String>>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
+/// Global device connection state (for late-mount UI sync via host_status)
+static DEVICE_CONNECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static DEVICE_ADDR: std::sync::LazyLock<std::sync::Mutex<String>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(String::new()));
+
 /// Send a JSON message to the connected device
 pub fn send_to_device(json: &str) {
     if let Some(tx) = DEVICE_DOWN_TX.lock().unwrap().as_ref() {
         let _ = tx.send(json.to_string());
     }
+}
+
+/// Snapshot of current device connection (used by host_status command)
+pub fn device_snapshot() -> (bool, String) {
+    let connected = DEVICE_CONNECTED.load(std::sync::atomic::Ordering::Relaxed);
+    let addr = DEVICE_ADDR.lock().unwrap().clone();
+    (connected, addr)
 }
 
 /// Spawn the device WS server on a dedicated thread.
@@ -95,7 +107,9 @@ pub fn spawn_device_ws_server(
                         }
                     };
 
-                    // Notify WebView: device connected
+                    // Update global state + notify WebView: device connected
+                    DEVICE_CONNECTED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    *DEVICE_ADDR.lock().unwrap() = peer.clone();
                     let _ = app_clone.emit("device_status", serde_json::json!({
                         "connected": true,
                         "deviceAddr": &peer,
@@ -152,7 +166,9 @@ pub fn spawn_device_ws_server(
                     // Clear downstream channel on disconnect
                     *DEVICE_DOWN_TX.lock().unwrap() = None;
 
-                    // Notify WebView: device disconnected
+                    // Update global state + notify WebView: device disconnected
+                    DEVICE_CONNECTED.store(false, std::sync::atomic::Ordering::Relaxed);
+                    DEVICE_ADDR.lock().unwrap().clear();
                     let _ = app_clone.emit("device_status", serde_json::json!({
                         "connected": false,
                         "deviceAddr": &peer,

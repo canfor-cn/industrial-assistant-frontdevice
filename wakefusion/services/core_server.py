@@ -118,7 +118,7 @@ class CoreServer:
         # ZMQ Socket 线程安全锁 (防止跨线程并发调用导致C++底层崩溃)
         self._audio_req_lock = threading.Lock()
         # _vision_ctrl_lock removed (lip_sync_event is thread-safe)
-        self._state_lock = threading.Lock()  # 用于保护布尔标志位的修改
+        self._state_lock = threading.RLock()  # 可重入锁：允许同一线程多次获取（例如 _process_vision_data 持有锁后调用 _exit_interactive_mode）
         
         # Poller用于同时监听多个socket
         self.poller = zmq.Poller()
@@ -1032,8 +1032,8 @@ class CoreServer:
             self._interactive_start_time = time.time()  # 记录交互模式开始时间
             logger.info(f"⏱️ [保底机制] 开始计时，30秒交流上限时间已启动")
             
-            # 如果是进入免唤醒持续对话，必须主动通知音频底层拉起流模式
-            if wake_path == "持续对话":
+            # 如果是进入免唤醒持续对话或视觉直接触发，必须主动通知音频底层拉起流模式
+            if wake_path in ("持续对话", "视觉直接触发"):
                 self._send_start_streaming_command()
         
             # 🌟 修复1：消除轮询执念 - 不再启动独立的VAD超时检查线程
@@ -1152,10 +1152,13 @@ class CoreServer:
     
     def _interactive_timeout_checker(self):
         """后台线程：持续对话空闲超时检测
-        TTS 播放中不计时，TTS 播完后开始 15 秒倒计时"""
+        TTS 播放中不计时，TTS 播完后开始倒计时"""
         logger.info("⏱️ [持续对话超时检查线程] 已启动")
-        IDLE_TIMEOUT = 15.0  # TTS 播完后等待用户下一句话的时间
-        MAX_TIMEOUT = 120.0  # 极限保底（防死锁）
+        # 视觉直接触发模式下：只要人还在镜头前就不退出，人离开会通过
+        # _vision_leave_debounce_start 机制触发退出（见 _process_vision_data）
+        IDLE_TIMEOUT_SHORT = 15.0   # 纯语音/视觉降维路径：15 秒空闲退出
+        IDLE_TIMEOUT_LONG = 60.0    # 视觉直接触发：60 秒空闲退出（人可以慢慢想）
+        MAX_TIMEOUT = 180.0         # 极限保底
         while True:
             if self._interactive_timeout_should_exit:
                 logger.info("⏱️ [持续对话超时检查线程] 收到退出信号")
@@ -1174,9 +1177,13 @@ class CoreServer:
             now = time.time()
             elapsed = now - self._last_speech_time if self._last_speech_time else 0
 
-            # 空闲超时：TTS 播完后 15 秒无新语音 → 退出
-            if elapsed > IDLE_TIMEOUT:
-                logger.warning(f"🛑 [持续对话] 空闲 {elapsed:.0f}秒，退出交互模式")
+            # 持续对话模式用长超时；其他模式用短超时
+            wake_path = getattr(self, '_current_wake_path', 'unknown')
+            idle_timeout = IDLE_TIMEOUT_LONG if wake_path == "视觉直接触发" else IDLE_TIMEOUT_SHORT
+
+            # 空闲超时：退出（人离开通常先由视觉防抖触发退出）
+            if elapsed > idle_timeout:
+                logger.warning(f"🛑 [持续对话] 空闲 {elapsed:.0f}秒 (路径={wake_path}，阈值={idle_timeout}s)，退出交互模式")
                 self._exit_interactive_mode()
             # 极限保底
             elif elapsed > MAX_TIMEOUT:
@@ -1256,9 +1263,15 @@ class CoreServer:
     def run(self):
         """运行核心服务器主循环（带全局崩溃护盾）"""
         logger.info("🚀 Core Server started")
-        
+        _heartbeat_last = time.time()
+
         while True:
             try:
+                # 💓 心跳日志：每 10 秒打印一次，证明主循环还活着
+                if time.time() - _heartbeat_last >= 10.0:
+                    logger.info(f"💓 [core_server] heartbeat | interactive={self.is_interactive_mode} | wake_path={getattr(self, '_current_wake_path', '?')} | vision_active={getattr(self, '_is_vision_wake_active', False)}")
+                    _heartbeat_last = time.time()
+
                 # 使用Poller同时监听视觉和音频数据
                 socks = dict(self.poller.poll(timeout=100))  # 100ms超时
                 
@@ -1345,13 +1358,30 @@ class CoreServer:
         return False
     
     def _check_vision_wake_condition(self, faces: list) -> bool:
-        """检查是否满足视觉降维打击条件（4m内且正面>=40%）"""
+        """检查是否满足视觉唤醒条件（持续对话模式：只要有人在 4m 内）。
+
+        旧策略要求 frontal_percent >= 40% 过滤背对镜头的路人，但在持续对话
+        场景下这个门限会导致侧面/低头用户无法激活。改为：只要有人脸且距离
+        <= 4m 就满足。LLM 侧通过 DECISION:ignore 过滤"旁人闲聊"的噪音。
+        """
+        if not faces:
+            return False
+        best_dist = None
+        best_frontal = 0.0
         for face in faces:
             distance_m = face.get("distance_m") or face.get("distance")
             frontal_percent = face.get("frontal_percent", 0.0)
-            
-            if distance_m and distance_m <= 4.0 and frontal_percent >= 40.0:
-                return True
+            if distance_m and distance_m <= 4.0:
+                if best_dist is None or distance_m < best_dist:
+                    best_dist = distance_m
+                    best_frontal = frontal_percent
+        if best_dist is not None:
+            # 诊断日志：打印第一次满足条件时的数值（用于调参）
+            if not getattr(self, '_vision_wake_diag_logged', False):
+                logger.info(f"👁️ [视觉唤醒诊断] 满足条件: 最近距离={best_dist}m, frontal={best_frontal}%")
+                self._vision_wake_diag_logged = True
+            return True
+        self._vision_wake_diag_logged = False
         return False
     
     def _process_vision_data(self, vision_data: dict):
@@ -1444,6 +1474,12 @@ class CoreServer:
                     self._send_vision_command("vision_wake")
                     self._is_vision_wake_active = True
                     logger.info(f"👁️ 视觉降维打击激活，阈值已降至{self.audio_threshold_config.visual_wake:.2f}，视觉触发模式开启")
+
+                    # 🌟 持续对话模式：人在摄像头前就直接进入交互模式，跳过 KWS
+                    # 所有 VAD 分段的音频都送给后端，由 LLM 的 DECISION:respond/wait/ignore 决定是否回答
+                    if not self.is_interactive_mode:
+                        logger.info("🤝 [视觉直接触发] 跳过 KWS，直接进入持续对话模式")
+                        self._enter_interactive_mode("视觉直接触发")
             
             # 🌟 注意：如果防抖时间还没到，这里没有 else，什么都不做，安静等待 200ms 走完
             
@@ -1457,10 +1493,13 @@ class CoreServer:
                 delattr(self, '_vision_wake_debounce_start')
             
             # 2. 处理"离开防抖"逻辑
+            # 🌟 持续对话模式下人脸丢失的容错窗口延长到 5 秒（避免转头/遮挡时误退出）
+            wake_path = getattr(self, '_current_wake_path', 'unknown')
+            leave_debounce_s = 5.0 if wake_path == "视觉直接触发" else (self.vision_wake_config.leave_debounce_ms / 1000.0)
             if not hasattr(self, '_vision_leave_debounce_start'):
                 # 刚开始离开防抖
                 self._vision_leave_debounce_start = time.time()
-            elif time.time() - self._vision_leave_debounce_start >= (self.vision_wake_config.leave_debounce_ms / 1000.0):
+            elif time.time() - self._vision_leave_debounce_start >= leave_debounce_s:
                 # 离开防抖完成，彻底离开，恢复阈值
                 if getattr(self, '_is_vision_wake_active', False):
                     # 1. 恢复默认听力阈值 + 关闭视觉触发模式
@@ -1471,7 +1510,7 @@ class CoreServer:
 
                     # 2. 无人时强制终止交互模式（无论什么唤醒路径）
                     if self.is_interactive_mode:
-                        logger.info(f"🛑 视觉检测无人，强制退出交互模式（唤醒路径={getattr(self, '_current_wake_path', 'unknown')}，距离={distance_m}m）")
+                        logger.info(f"🛑 视觉检测无人 {leave_debounce_s}s，强制退出交互模式（唤醒路径={wake_path}，距离={distance_m}m）")
                         self._exit_interactive_mode()
         
         # ========== 视觉区间判断（用于视觉斩断） ==========
@@ -1538,37 +1577,47 @@ class CoreServer:
             logger.debug(f"🛡️ 物理防抖护盾生效中，忽略音频输入（剩余 {self._ignore_audio_until - current_time:.2f}秒），已冻结所有计时器")
             return
         
-        # 🌟 修复声学反馈问题：在TTS播放状态下，忽略所有音频输入（除了唤醒词）
-        # 防止TTS播放的音频被麦克风拾取后误识别为ASR输入
+        # 🌟 TTS 播放状态下的音频处理：
+        # - 旧策略：完全丢弃除唤醒词外的所有音频（防止声学反馈自循环）
+        # - 持续对话模式（视觉直接触发）：允许用户任何时候说话打断，不要求唤醒词
+        #   依靠后端 LLM 的 DECISION:ignore 过滤回声，XVF3800 的 AEC 通道已经做了回声消除
+        wake_path = getattr(self, '_current_wake_path', 'unknown')
         if self.is_playing_tts:
-            # 🌟 核心修复：只冻结静音超时，绝对不伪造用户的唇动时间！
+            # 冻结静音超时（无论走哪条路径）
             self._vad_silence_start = current_time
             self._lip_silence_start = current_time
             if self._interactive_start_time:
                 self._interactive_start_time = current_time
             self._last_speech_time = current_time
-            
-            # 在TTS播放状态下，只处理唤醒词（用于硬打断），不处理VAD，不转发音频
-            wake_word = metadata.get("wake_word", {})
-            if wake_word.get("detected", False):
-                confidence = wake_word.get("confidence", 0.0)
-                # 根据视觉唤醒状态选择阈值
-                if hasattr(self, '_is_vision_wake_active') and self._is_vision_wake_active:
-                    threshold = self.audio_threshold_config.visual_wake
-                else:
-                    threshold = self.audio_threshold_config.default
-                
-                if confidence >= threshold:
-                    logger.info(f"⚡ 交互中检测到唤醒词，触发硬打断！")
-                    self._stop_tts_playback()
-                    self._send_interrupt(reason="wake_word")
-                    # 重置当前句子收音状态，但不退出交互模式！
-                    self._current_trace_id = None
-                    self._user_has_spoken = False
-                    self._vad_silence_start = time.time()
-                    self._lip_silence_start = time.time()
-            # 其他情况直接返回，不处理VAD，不转发音频
-            return
+
+            if wake_path != "视觉直接触发":
+                # 非持续对话模式：保持原策略 —— 只处理唤醒词
+                wake_word = metadata.get("wake_word", {})
+                if wake_word.get("detected", False):
+                    confidence = wake_word.get("confidence", 0.0)
+                    if hasattr(self, '_is_vision_wake_active') and self._is_vision_wake_active:
+                        threshold = self.audio_threshold_config.visual_wake
+                    else:
+                        threshold = self.audio_threshold_config.default
+
+                    if confidence >= threshold:
+                        logger.info(f"⚡ 交互中检测到唤醒词，触发硬打断！")
+                        self._stop_tts_playback()
+                        self._send_interrupt(reason="wake_word")
+                        self._current_trace_id = None
+                        self._user_has_spoken = False
+                        self._vad_silence_start = time.time()
+                        self._lip_silence_start = time.time()
+                return
+            # 持续对话模式：允许 VAD 触发的真人说话打断
+            # 不 return，继续往下走正常 VAD → audio forwarding 流程
+            # 依赖：后端 likelyEcho 过滤 TTS 回声，LLM DECISION:ignore 过滤噪音
+            vad_now = metadata.get("vad", False)
+            if vad_now and not self._user_has_spoken:
+                logger.info("🗣️ [持续对话] TTS 播放中检测到用户说话，触发软打断，交由后端判定")
+                self._stop_tts_playback()
+                self._send_interrupt(reason="continuous_barge_in")
+                # 继续流程让音频被转发到后端，由 LLM 决定如何处理
         
         vad = metadata.get("vad", False)
         wake_word = metadata.get("wake_word", {})
@@ -1586,6 +1635,7 @@ class CoreServer:
         wake_path = getattr(self, '_current_wake_path', 'unknown')
         
         # 门槛设定：纯语音只要声音；视觉降维必须【声音 + 最近2.0秒内有唇动】
+        # 视觉直接触发（持续对话模式）：只需要声音，跳过唇动门控（让 LLM 用 DECISION 过滤）
         is_valid_speech_start = vad
         if wake_path == "视觉降维打击":
             # 🌟 核心修复：放宽到 2.0 秒，抵抗嘴唇检测的瞬间闪烁误差
@@ -1670,21 +1720,28 @@ class CoreServer:
                 # 从配置读取参数
                 micro_limit = self.conversation_config.vad_fast_cutoff_sec
                 macro_limit = self.conversation_config.vad_silence_timeout_default_sec if wake_path == "纯语音唤醒" else self.conversation_config.vad_silence_timeout_visual_sec
-                
+
                 trigger_cut = False
                 cut_reason = ""
-                
+
                 # 🛡️ 状态 A：已经开口（有单号） -> 走微观关门
                 if self._current_trace_id is not None:
                     if wake_path == "纯语音唤醒" and vad_silence_time >= micro_limit:
                         trigger_cut = True
                         cut_reason = f"{micro_limit}s纯语音微观超时"
-                    elif wake_path == "视觉降维打击":
-                        # 🌟 微观 OR 逻辑：只要声音停了，或者嘴巴闭上了，立刻关门！（极速响应，抗噪）
-                        if vad_silence_time >= micro_limit or lip_silence_time >= micro_limit:
-                            trigger_cut = True
-                            cut_reason = f"{micro_limit}s单模态微观超时 (声音或唇动静默)"
-                        
+                    elif wake_path in ("视觉降维打击", "视觉直接触发"):
+                        # 🌟 微观：用 VAD 静默判断（视觉直接触发不依赖唇动）
+                        if wake_path == "视觉直接触发":
+                            # 持续对话模式：只看 VAD，不看唇动（唇动在远距离/角度下不稳定）
+                            if vad_silence_time >= micro_limit:
+                                trigger_cut = True
+                                cut_reason = f"{micro_limit}s持续对话微观超时 (VAD静默)"
+                        else:
+                            # 视觉降维打击：保持原双模 OR 逻辑
+                            if vad_silence_time >= micro_limit or lip_silence_time >= micro_limit:
+                                trigger_cut = True
+                                cut_reason = f"{micro_limit}s单模态微观超时 (声音或唇动静默)"
+
                 # 👻 状态 B：根本没开口（没单号） -> 走宏观发呆
                 elif self._current_trace_id is None:
                     if wake_path == "纯语音唤醒" and vad_silence_time >= macro_limit:
@@ -1695,6 +1752,11 @@ class CoreServer:
                         if vad_silence_time >= macro_limit or lip_silence_time >= macro_limit:
                             trigger_cut = True
                             cut_reason = f"{macro_limit}s视觉宏观发呆 (声音或唇动已静默)"
+                    elif wake_path == "视觉直接触发":
+                        # 🌟 持续对话模式：人在镜头前时不主动丢弃音频，只做 no-op
+                        # 让用户长时间思考/沉默不会触发"发呆"退出；
+                        # 真的一直不说话时，退出由 _interactive_timeout_checker 线程负责
+                        pass
 
                 # ⚠️ 状态 C：30秒长句兜底（仅限有单号的情况下兜底长语音）
                 if self._current_trace_id is not None and self._interactive_start_time and (now - self._interactive_start_time) >= self.conversation_config.long_sentence_timeout_s:

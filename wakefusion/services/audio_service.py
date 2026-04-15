@@ -54,7 +54,7 @@ BUFFER_DURATION = 2.0
 STEP_DURATION = 0.2          # 推理步长 0.2 秒，连续确认延迟约 0.4s
 CONSECUTIVE_HITS_REQUIRED = 1  # 暂改1次命中即唤醒（XVF3800 AEC通道信号弱，连续2次难以达到）
 VAD_RMS_THRESHOLD = 0.003    # 静音门限：已废弃，由Silero VAD替代（保留用于兼容）
-DEVICE_ID = 2
+DEVICE_ID = None             # 由 resolve_input_device() 在 main() 中按配置解析
 COOLDOWN_SECONDS = 2.0
 AUDIO_GAIN = 10.0            # XVF3800 AEC通道增益（太高会clip成方波导致VAD失效）
 RESCUE_SECONDS = 1.0         # 唤醒时回捞前 N 秒音频，防止指令开头丢失
@@ -244,6 +244,87 @@ def network_sender():
             pass
 
 
+def resolve_input_device():
+    """按名字在 PyAudio/sounddevice 设备列表中查找输入设备。
+
+    优先级：
+      1. 环境变量 WAKEFUSION_INPUT_DEVICE_INDEX（调试用）
+      2. config.yaml 里 audio.device_match 字段（默认 "XVF3800"）
+      3. 若 device_match == "default"，返回系统默认输入设备
+      4. 若找不到匹配设备，抛出 RuntimeError 明确报错（不静默回退）
+    """
+    import os
+    # 调试覆盖：允许环境变量强制指定索引
+    override = os.environ.get("WAKEFUSION_INPUT_DEVICE_INDEX")
+    if override is not None:
+        idx = int(override)
+        print(f"⚠️  使用环境变量指定的输入设备索引: {idx}")
+        return idx
+
+    # 从配置读取设备匹配名（AppConfig 是 Pydantic 模型，按属性访问）
+    device_match = "XVF3800"
+    try:
+        from wakefusion.config import get_config
+        cfg = get_config()
+        audio_cfg = getattr(cfg, "audio", None)
+        if audio_cfg is not None:
+            device_match = getattr(audio_cfg, "device_match", "XVF3800") or "XVF3800"
+    except Exception as e:
+        print(f"⚠️  无法读取 config.yaml 的 audio.device_match，使用默认值 'XVF3800': {e}")
+
+    # "default" 关键字：用系统默认输入设备
+    if str(device_match).strip().lower() == "default":
+        default_idx = sd.default.device[0] if isinstance(sd.default.device, (list, tuple)) else sd.default.device
+        print(f"📻 使用系统默认输入设备: index={default_idx}")
+        return int(default_idx)
+
+    # 按名字（不区分大小写、子串匹配）查找所有输入设备
+    match_lower = str(device_match).lower()
+    devices = sd.query_devices()
+    hostapis = sd.query_hostapis()
+    candidates = []
+    for i, d in enumerate(devices):
+        if d.get("max_input_channels", 0) <= 0:
+            continue
+        name = str(d.get("name", ""))
+        if match_lower in name.lower():
+            api_name = hostapis[d.get("hostapi", 0)].get("name", "")
+            rate = int(d.get("default_samplerate", 0))
+            candidates.append((i, name, int(d.get("max_input_channels", 0)), api_name, rate))
+
+    if candidates:
+        # 排序优先级：
+        #   1) Host API: WASAPI > WDM-KS > DirectSound > MME（越底层延迟越低）
+        #   2) 原生采样率 == SAMPLE_RATE 的优先（避免重采样抖动）
+        api_priority = {"Windows WASAPI": 0, "Windows WDM-KS": 1, "Windows DirectSound": 2, "MME": 3}
+        candidates.sort(key=lambda c: (
+            0 if c[4] == SAMPLE_RATE else 1,      # 原生 16kHz 优先
+            api_priority.get(c[3], 99),            # 再按 API 优先级
+            c[0],                                   # 最后按索引
+        ))
+        idx, name, ch, api, rate = candidates[0]
+        print(f"🎯 按名字匹配到输入设备: device_match={device_match!r}")
+        print(f"   选中: [{idx}] {name!r} (api={api}, rate={rate}Hz, max_in={ch})")
+        if len(candidates) > 1:
+            print(f"   其他匹配项 (按优先级排序)：")
+            for i, n, c, a, r in candidates[1:]:
+                print(f"      [{i}] {n!r} (api={a}, rate={r}Hz)")
+        return idx
+
+    # 找不到匹配设备：列出所有输入设备帮助诊断，然后硬失败
+    print(f"\n❌ 找不到匹配 {device_match!r} 的输入设备。")
+    print(f"当前系统可用的输入设备：")
+    for i, d in enumerate(devices):
+        if d.get("max_input_channels", 0) > 0:
+            print(f"  [{i}] {d.get('name', '?')!r} (ch={d.get('max_input_channels')}, rate={int(d.get('default_samplerate', 0))})")
+    print(f"\n提示：")
+    print(f"  - 确认 {device_match} 设备已正确连接到 USB，系统能识别为音频设备")
+    print(f"  - 或者修改 config.yaml 里 audio.device_match 为其他名字（子串匹配）")
+    print(f"  - 或者设为 'default' 使用系统默认麦克风")
+    print(f"  - 或者设置环境变量 WAKEFUSION_INPUT_DEVICE_INDEX=<索引号> 强制指定")
+    raise RuntimeError(f"Input device not found: {device_match}")
+
+
 def main():
     global is_streaming, cooldown_until, write_pos, active_threshold
     global zmq_context, zmq_pub_socket, zmq_rep_socket, vad_engine
@@ -431,10 +512,12 @@ def main():
                     audio_buffer[:n - first_part] = new_data[first_part:]
                     write_pos = n - first_part
 
-    # 🌟 任务1：智能声道降级策略
-    global opened_channels
+    # 🌟 任务0：按名字解析输入设备（避免硬编码索引打开错的设备）
+    global DEVICE_ID, opened_channels
+    DEVICE_ID = resolve_input_device()
     device_info = sd.query_devices(DEVICE_ID, 'input')
     max_hw_channels = int(device_info.get('max_input_channels', 1))
+    print(f"🎯 选定输入设备: index={DEVICE_ID}, name={device_info.get('name', '?')!r}, max_ch={max_hw_channels}")
     
     stream = None
     opened_channels = 1

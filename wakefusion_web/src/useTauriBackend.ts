@@ -75,15 +75,34 @@ export interface VoiceMessage {
   audioMime?: string;
 }
 
+export type TauriHostStatus = {
+  mode: string;
+  connected: boolean;
+  deviceId: string;
+  backendHost: string;
+  deviceConnected: boolean;
+  deviceAddr: string;
+};
+
+/** Get the full host status including current device connection (for late-mount UI sync). */
+export async function tauriGetHostStatus(): Promise<TauriHostStatus | null> {
+  if (!isTauriEnv()) return null;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return await invoke<TauriHostStatus>("host_status");
+  } catch {
+    return null;
+  }
+}
+
 /** Get the backend host address from Rust config (e.g. "192.168.0.97:7788") */
 let _cachedBackendHost: string | null = null;
 export async function tauriGetBackendHost(): Promise<string> {
   if (_cachedBackendHost) return _cachedBackendHost;
   if (!isTauriEnv()) return "127.0.0.1:7788";
   try {
-    const { invoke } = await import("@tauri-apps/api/core");
-    const result = await invoke<{ backendHost: string }>("host_status");
-    _cachedBackendHost = result.backendHost || "127.0.0.1:7788";
+    const status = await tauriGetHostStatus();
+    _cachedBackendHost = status?.backendHost || "127.0.0.1:7788";
     return _cachedBackendHost;
   } catch {
     return "127.0.0.1:7788";

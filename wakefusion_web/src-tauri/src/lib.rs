@@ -202,16 +202,21 @@ pub fn run() {
                         .create(true).write(true).truncate(true)
                         .open(&log_file).ok();
 
+                    // 同一个日志文件收集 stdout + stderr（Python logger.info 默认写 stderr）
                     #[cfg(target_os = "windows")]
                     let child_result = std::process::Command::new(&python)
                         .args(["-m", &module, "--config", &config_file.to_string_lossy()])
                         .env("PYTHONIOENCODING", "utf-8")
+                        .env("PYTHONUNBUFFERED", "1")
                         .current_dir(&cwd)
                         .stdout(device_log.as_ref().map_or(
                             std::process::Stdio::null(),
                             |f| std::process::Stdio::from(f.try_clone().unwrap())
                         ))
-                        .stderr(std::process::Stdio::null())
+                        .stderr(device_log.as_ref().map_or(
+                            std::process::Stdio::null(),
+                            |f| std::process::Stdio::from(f.try_clone().unwrap())
+                        ))
                         .creation_flags(CREATE_NO_WINDOW)
                         .spawn();
 
@@ -219,12 +224,16 @@ pub fn run() {
                     let child_result = std::process::Command::new(&python)
                         .args(["-m", &module, "--config", &config_file.to_string_lossy()])
                         .env("PYTHONIOENCODING", "utf-8")
+                        .env("PYTHONUNBUFFERED", "1")
                         .current_dir(&cwd)
                         .stdout(device_log.as_ref().map_or(
                             std::process::Stdio::null(),
                             |f| std::process::Stdio::from(f.try_clone().unwrap())
                         ))
-                        .stderr(std::process::Stdio::null())
+                        .stderr(device_log.as_ref().map_or(
+                            std::process::Stdio::null(),
+                            |f| std::process::Stdio::from(f.try_clone().unwrap())
+                        ))
                         .spawn();
 
                     match child_result {

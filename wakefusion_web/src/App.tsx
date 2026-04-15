@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { isTauriEnv, tauriSendText, tauriSendAudio, tauriGetCachedAudio, tauriGetBackendHost, subscribeTauriEvents, type VoiceMessage, type DeviceStatePayload } from "./useTauriBackend";
+import { isTauriEnv, tauriSendText, tauriSendAudio, tauriGetCachedAudio, tauriGetBackendHost, tauriGetHostStatus, subscribeTauriEvents, type VoiceMessage, type DeviceStatePayload } from "./useTauriBackend";
 import { ParticleBackground } from "./ParticleBackground";
 import {
   Mic,
@@ -416,6 +416,16 @@ export default function App() {
         unsub();
       } else {
         cleanup = unsub;
+        // After subscription is active, pull initial device status.
+        // Rust only emits device_status on connect/disconnect transitions, so if
+        // the device connected before this component mounted we'd miss the event.
+        // This recovers the current state on late mounts.
+        tauriGetHostStatus().then((status) => {
+          if (cancelled || !status) return;
+          setDeviceConnected(status.deviceConnected);
+          setDeviceAddr(status.deviceAddr);
+          if (status.deviceConnected) setDeviceLastSeen(Date.now());
+        });
       }
     });
     return () => {

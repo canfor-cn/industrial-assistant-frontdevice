@@ -19,6 +19,12 @@ pub struct HostStatusResult {
     pub device_id: String,
     #[serde(rename = "backendHost")]
     pub backend_host: String,
+    /// Whether the Python device module is currently connected to the Rust host
+    #[serde(rename = "deviceConnected")]
+    pub device_connected: bool,
+    /// Device peer address (e.g. "127.0.0.1:53591") or empty if disconnected
+    #[serde(rename = "deviceAddr")]
+    pub device_addr: String,
 }
 
 #[tauri::command]
@@ -86,10 +92,13 @@ pub async fn host_status(
     host_id: State<'_, HostDeviceId>,
     backend_host: State<'_, BackendHost>,
 ) -> Result<HostStatusResult, String> {
+    let (device_connected, device_addr) = crate::device_ws_server::device_snapshot();
     Ok(HostStatusResult {
         mode: "tauri-rust".into(),
         connected: true,
         device_id: host_id.0.clone(),
         backend_host: backend_host.0.clone(),
+        device_connected,
+        device_addr,
     })
 }
