@@ -137,6 +137,10 @@ export default function App() {
   const [connectionStatus, setConnectionStatus] = useState("未连接");
   const [isRecording, setIsRecording] = useState(false);
   const [ragOpen, setRagOpen] = useState(false);
+  const [personaOpen, setPersonaOpen] = useState(false);
+  const [personaData, setPersonaData] = useState<Record<string, string>>({});
+  const [personaSaving, setPersonaSaving] = useState(false);
+  const [personaStatus, setPersonaStatus] = useState("");
   const [devicePanelOpen, setDevicePanelOpen] = useState(false);
   const [deviceConnected, setDeviceConnected] = useState(false);
   const [deviceAddr, setDeviceAddr] = useState("");
@@ -1227,6 +1231,23 @@ export default function App() {
     })();
   }, [ragOpen]);
 
+  // Auto-load persona when panel opens
+  useEffect(() => {
+    if (!personaOpen) return;
+    void (async () => {
+      try {
+        const res = await fetch(`${ragApiBaseUrl}/api/persona`);
+        if (res.ok) {
+          const data = await res.json();
+          setPersonaData(data);
+          setPersonaStatus("");
+        }
+      } catch (e) {
+        setPersonaStatus(`加载失败: ${String(e)}`);
+      }
+    })();
+  }, [personaOpen]);
+
   useEffect(() => {
     if (!ragOpen || !selectedExhibitId) return;
     void refreshRagAssets(selectedExhibitId);
@@ -1301,6 +1322,9 @@ export default function App() {
             </button>
             <button type="button" className="overlay-btn" onClick={() => setRagOpen(true)} aria-label="打开知识库管理">
               <Database className="h-4 w-4" />
+            </button>
+            <button type="button" className="overlay-btn" onClick={() => setPersonaOpen(true)} aria-label="人设管理">
+              <User className="h-4 w-4" />
             </button>
           </header>
         )}
@@ -1709,6 +1733,73 @@ export default function App() {
             <div className="rag-footer-status">{ragStatus || `后端接口：${ragApiBaseUrl}`}</div>
           </div>
         </aside>
+      ) : null}
+
+      {/* ── Persona Settings Drawer ── */}
+      {personaOpen ? (
+        <>
+          <div className="rag-drawer-backdrop" onClick={() => setPersonaOpen(false)} />
+          <aside className="rag-drawer">
+            <div className="rag-drawer-header">
+              <h2>人设管理</h2>
+              <button type="button" className="rag-close" onClick={() => setPersonaOpen(false)}>✕</button>
+            </div>
+            <div className="rag-drawer-body" style={{padding: "16px", display: "flex", flexDirection: "column", gap: "12px"}}>
+              {[
+                { key: "name", label: "名字", placeholder: "小慧" },
+                { key: "role", label: "角色", placeholder: "展厅的真人讲解员" },
+                { key: "venue", label: "展厅地址", placeholder: "四川省成都市成华区" },
+                { key: "greeting", label: "问候语", placeholder: "你好，我是小慧，请问有什么可以帮您的？" },
+                { key: "personality", label: "性格特点", placeholder: "热情专业、什么问题都能聊、自然口语化" },
+                { key: "restrictions", label: "限制/禁忌", placeholder: "不说系统术语；用第一人称" },
+                { key: "asrCorrections", label: "ASR 纠错规则", placeholder: "兴龙→兴蓉、成化→成华" },
+              ].map(({ key, label, placeholder }) => (
+                <label key={key} style={{display:"flex", flexDirection:"column", gap:"4px", fontSize:"13px"}}>
+                  <span style={{fontWeight:600, color:"#ccc"}}>{label}</span>
+                  <textarea
+                    rows={key === "personality" || key === "restrictions" || key === "asrCorrections" ? 3 : 1}
+                    placeholder={placeholder}
+                    value={personaData[key] ?? ""}
+                    onChange={(e) => setPersonaData((prev) => ({ ...prev, [key]: e.target.value }))}
+                    style={{
+                      background:"rgba(255,255,255,0.05)", border:"1px solid rgba(255,255,255,0.15)",
+                      borderRadius:"6px", padding:"8px", color:"#eee", fontSize:"13px", resize:"vertical",
+                    }}
+                  />
+                </label>
+              ))}
+              <button
+                type="button"
+                disabled={personaSaving}
+                onClick={async () => {
+                  setPersonaSaving(true);
+                  setPersonaStatus("保存中...");
+                  try {
+                    const res = await fetch(`${ragApiBaseUrl}/api/persona`, {
+                      method: "POST",
+                      headers: { "content-type": "application/json" },
+                      body: JSON.stringify({ ...personaData, name: personaData.name || "小慧" }),
+                    });
+                    const d = await res.json();
+                    setPersonaStatus(d.ok ? "✓ 已保存，下次对话自动生效" : `✗ ${d.error}`);
+                  } catch (e) {
+                    setPersonaStatus(`✗ 保存失败: ${String(e)}`);
+                  } finally {
+                    setPersonaSaving(false);
+                  }
+                }}
+                style={{
+                  padding:"10px", borderRadius:"8px", border:"none", cursor:"pointer",
+                  background:"linear-gradient(135deg,#4f8cff,#6c63ff)", color:"#fff",
+                  fontWeight:600, fontSize:"14px",
+                }}
+              >
+                {personaSaving ? "保存中..." : "保存人设（热重载）"}
+              </button>
+              {personaStatus && <div style={{fontSize:"12px",color:personaStatus.startsWith("✓") ? "#4ade80" : "#f87171"}}>{personaStatus}</div>}
+            </div>
+          </aside>
+        </>
       ) : null}
     </div>
   );
