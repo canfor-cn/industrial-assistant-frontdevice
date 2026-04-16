@@ -41,10 +41,19 @@ export function MediaPresenter({ machine, volume }: MediaPresenterProps) {
   const isLoading = state === "loading";
   const isExiting = state === "exiting";
 
+  const handleClose = () => {
+    machine.dismiss("user_close");
+  };
+
   return (
     <div
       className={`stage-media-shell is-mounted ${isVisible ? "is-visible" : ""} ${isLoading ? "is-loading" : ""} ${isExiting ? "is-exiting" : ""}`}
     >
+      {/* 关闭按钮 */}
+      <button className="stage-media-close" onClick={handleClose} title="关闭">
+        ✕
+      </button>
+
       {mediaKind === "video" || mediaKind === "audio" ? (
         <VideoPlayer
           mediaRef={currentRefs[0]}
