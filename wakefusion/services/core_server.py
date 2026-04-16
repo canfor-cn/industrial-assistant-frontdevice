@@ -68,6 +68,7 @@ class CoreServer:
         self._lip_sync_event = lip_sync_event
         
         self.audio_sub_socket = self.zmq_context.socket(zmq.SUB)
+        self.audio_sub_socket.setsockopt(zmq.RCVHWM, 200)  # 接收高水位与 PUB 端匹配
         self.audio_sub_socket.connect(f"tcp://127.0.0.1:{self.zmq_config.audio_pub_port}")
         self.audio_sub_socket.setsockopt_string(zmq.SUBSCRIBE, "")
         
@@ -1694,6 +1695,10 @@ class CoreServer:
                     self._current_trace_id = str(uuid.uuid4())
                     logger.info(f"🗣️ 检测到用户真实开口(双模防伪通过)，生成 traceId: {self._current_trace_id}，已完全交由微观接管！")
                     self._send_audio_segment_begin(self._current_trace_id, 16000)
+                    # 🌟 P0 修复：begin 后立即发送当前 chunk 作为前置音频
+                    # 这个 chunk 就是触发 VAD=True 的那一帧，包含说话的开头
+                    # 不发的话用户说的第一个字会丢失
+                    self._send_audio_segment_chunk(self._current_trace_id, audio_binary)
 
         # 更新VAD状态
         prev_vad_state = self._last_vad_state

@@ -381,9 +381,10 @@ def main():
     
     # ZMQ PUB Socket（数据流）
     zmq_pub_socket = zmq_context.socket(zmq.PUB)
+    zmq_pub_socket.setsockopt(zmq.SNDHWM, 200)  # 高水位：最多缓存 200 帧（~40 秒），减少丢帧
     audio_pub_port = zmq_config.audio_pub_port
     zmq_pub_socket.bind(f"tcp://127.0.0.1:{audio_pub_port}")
-    print(f"✅ ZMQ PUB Socket bound to tcp://127.0.0.1:{audio_pub_port}")
+    print(f"✅ ZMQ PUB Socket bound to tcp://127.0.0.1:{audio_pub_port} (HWM=200)")
     
     # ZMQ REP Socket（控制流）
     zmq_rep_socket = zmq_context.socket(zmq.REP)

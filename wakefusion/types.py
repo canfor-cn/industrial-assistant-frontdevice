@@ -269,8 +269,8 @@ class ConversationConfig(BaseModel):
     """持续对话配置"""
     vad_silence_timeout_default_sec: float = 5.0  # 宏观超时（秒）：纯语音唤醒模式下，5秒无语音则结束对话
     vad_silence_timeout_visual_sec: float = 5.0  # 宏观超时（秒）：视觉降维打击模式下，5秒无语音且无唇动则结束对话
-    vad_fast_cutoff_sec: float = 1.5  # 双模态快刀超时（秒）：连续1.5秒无声音且无唇动则结束对话
-    micro_timeout_s: float = 1.5  # 🌟 微观超时（秒）：用户说完一句话后的截断阈值
+    vad_fast_cutoff_sec: float = 2.5  # 微观超时（秒）：用户停顿 2.5 秒才截断（留足思考/想词时间）
+    micro_timeout_s: float = 2.5  # 🌟 微观超时（秒）：用户说完一句话后的截断阈值
     macro_timeout_s: float = 5.0  # 🌟 宏观超时（秒）：唤醒后发呆/误唤醒的截断阈值
     lip_recent_window_s: float = 0.8  # 🌟 视觉堆叠端点：最近唇动窗口（秒），用于判断视觉唤醒下的真实开口
     min_sentence_duration_s: float = 0.5  # 🌟 最短有效句子时长（秒），防止把极短杂音当成一句话
