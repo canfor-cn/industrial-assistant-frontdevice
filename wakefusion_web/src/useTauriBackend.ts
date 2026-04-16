@@ -62,6 +62,11 @@ export interface DeviceStatePayload {
   audio?: {
     interactive: boolean;
     tts_playing: boolean;
+    micReady?: boolean;
+  };
+  hardware?: {
+    micReady: boolean;
+    cameraReady: boolean;
   };
   timestamp?: number;
 }

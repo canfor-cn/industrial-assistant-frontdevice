@@ -701,6 +701,11 @@ class CoreServer:
         if hasattr(self, '_last_vision_distance'):
             vision_distance = self._last_vision_distance
 
+        # 硬件就绪状态（由 device_main 共享传入）
+        hw = getattr(self, '_hardware_status', {})
+        mic_ready = hw.get("mic_ready", True)
+        camera_ready = hw.get("camera_ready", True)
+
         message = {
             "type": "device_state",
             "state": state,
@@ -715,6 +720,11 @@ class CoreServer:
             "audio": {
                 "interactive": self.is_interactive_mode,
                 "tts_playing": self.is_playing_tts,
+                "micReady": mic_ready,
+            },
+            "hardware": {
+                "micReady": mic_ready,
+                "cameraReady": camera_ready,
             },
         }
         self._send_websocket_message(message)

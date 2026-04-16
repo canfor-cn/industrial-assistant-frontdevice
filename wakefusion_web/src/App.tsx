@@ -1482,17 +1482,25 @@ export default function App() {
                   <span>麦克风</span>
                 </div>
                 <div className="device-status-row">
+                  <span className="device-status-label">硬件</span>
+                  <span className={`device-status-badge ${deviceState?.hardware?.micReady === false ? "is-offline" : "is-online"}`}>
+                    {deviceState?.hardware?.micReady === false ? "未就绪 (XVF3800 未检测到)" : "就绪"}
+                  </span>
+                </div>
+                <div className="device-status-row">
                   <span className="device-status-label">
                     <Activity className="h-3 w-3" style={{display:'inline',verticalAlign:'middle',marginRight:4}} />
                     状态
                   </span>
                   <span className={`device-status-badge ${
+                    deviceState?.hardware?.micReady === false ? "is-offline" :
                     deviceState?.state === "listening" ? "is-listening" :
                     deviceState?.state === "speaking" ? "is-speaking" :
                     deviceState?.state === "thinking" ? "is-thinking" :
                     "is-muted"
                   }`}>
-                    {deviceState?.state === "listening" ? "拾音中" :
+                    {deviceState?.hardware?.micReady === false ? "不可用" :
+                     deviceState?.state === "listening" ? "拾音中" :
                      deviceState?.state === "speaking" ? "播报中" :
                      deviceState?.state === "thinking" ? "思考中" :
                      deviceState?.state === "idle" ? "空闲" : "未知"}

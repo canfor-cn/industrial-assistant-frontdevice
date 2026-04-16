@@ -208,9 +208,10 @@ def network_sender():
                 print(f"🎙️ [校准用] 当前环境底噪 RMS: {rms_energy:.1f}      ", end='\r')
             network_sender.log_counter = log_counter
             
-            # 🌟 修复：提高默认阈值到 1500，强行压制 XVF3800 的 AGC 增益
-            RMS_THRESHOLD = 1500.0  
-            
+            # RMS 物理能量门限：低于此值直接判静默（跳过 Silero VAD 推理节省 CPU）
+            # XVF3800 WASAPI 16kHz AEC 通道底噪通常 200-800，说话时 1000-5000+
+            RMS_THRESHOLD = 300.0
+
             if rms_energy < RMS_THRESHOLD:
                 vad_active = False
             else:

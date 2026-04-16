@@ -50,7 +50,7 @@ def run_vision_service(vision_queue, lip_sync_event):
         traceback.print_exc()
 
 
-def run_core_server(config_path, vision_queue, lip_sync_event):
+def run_core_server(config_path, vision_queue, lip_sync_event, hardware_status=None):
     """Main thread: ZMQ SUB (audio) + Queue (vision) + WS client to Rust host"""
     try:
         from wakefusion.services.core_server import CoreServer
@@ -59,6 +59,8 @@ def run_core_server(config_path, vision_queue, lip_sync_event):
             vision_queue=vision_queue,
             lip_sync_event=lip_sync_event,
         )
+        if hardware_status is not None:
+            server._hardware_status = hardware_status
         server.run()
     except Exception as e:
         print(f"[device_main] core_server crashed: {e}", flush=True)
@@ -80,6 +82,8 @@ def main():
     # Shared communication objects (vision <-> core_server)
     vision_queue = queue.Queue(maxsize=2)
     lip_sync_event = threading.Event()
+    # 硬件就绪标记：audio/vision 线程崩溃时设为 False，core_server 读取后上报前端
+    hardware_status = {"mic_ready": True, "camera_ready": True}
 
     # Start vision_service as daemon THREAD (no longer subprocess)
     vision_thread = threading.Thread(
@@ -95,8 +99,15 @@ def main():
     time.sleep(3)
 
     # Start audio_service (needs ZMQ PUB ready before core_server SUB)
+    def audio_thread_wrapper(cfg):
+        try:
+            run_audio_service(cfg)
+        finally:
+            hardware_status["mic_ready"] = False
+            print("[device_main] ⚠️ audio_service 线程退出，mic_ready=False", flush=True)
+
     audio_thread = threading.Thread(
-        target=run_audio_service,
+        target=audio_thread_wrapper,
         args=(config_path,),
         name="audio_service",
         daemon=True,
@@ -107,9 +118,14 @@ def main():
     # Wait for audio ZMQ to bind
     time.sleep(2)
 
-    # Run core_server in main thread, passing vision queue and lip sync event
+    # 检查 audio 是否存活（可能在初始化时崩溃了）
+    if not audio_thread.is_alive():
+        hardware_status["mic_ready"] = False
+        print("[device_main] ⚠️ audio_service 启动失败（线程已退出），mic_ready=False", flush=True)
+
+    # Run core_server in main thread, passing vision queue, lip sync event, and hardware status
     print("[device_main] Starting core_server in main thread", flush=True)
-    run_core_server(config_path, vision_queue, lip_sync_event)
+    run_core_server(config_path, vision_queue, lip_sync_event, hardware_status)
 
 
 if __name__ == "__main__":
