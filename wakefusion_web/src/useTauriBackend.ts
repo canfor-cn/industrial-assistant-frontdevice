@@ -145,6 +145,7 @@ export async function subscribeTauriEvents(handlers: {
   onDeviceStatus?: (connected: boolean, deviceAddr: string) => void;
   onDeviceState?: (state: DeviceStatePayload) => void;
   onSessionUpdate?: (sessionId: string, sessionAction: string, traceId: string) => void;
+  onStopTts?: (traceId: string) => void;
 }): Promise<() => void> {
   if (!isTauriEnv()) return () => {};
 
@@ -296,6 +297,13 @@ export async function subscribeTauriEvents(handlers: {
       await tauriListen<{ sessionId: string; sessionAction: string; traceId: string }>("session_update", (p) =>
         h(p.sessionId, p.sessionAction, p.traceId)
       )
+    );
+  }
+
+  if (handlers.onStopTts) {
+    const h = handlers.onStopTts;
+    unlisteners.push(
+      await tauriListen<{ traceId: string }>("stop_tts", (p) => h(p.traceId))
     );
   }
 
