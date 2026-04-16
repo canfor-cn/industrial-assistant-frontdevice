@@ -395,8 +395,14 @@ export default function App() {
       onUserVoiceText: (audioId, _traceId, text) => {
         if (!cancelled) syncSub.showVoiceText(audioId, text);
       },
-      onSentencePack: (sentenceIndex, text, audio, mimeType, _sampleRate) => {
-        if (!cancelled) syncSub.pushSentencePack(sentenceIndex, text, audio, mimeType);
+      onSentencePack: (sentenceIndex, text, audio, mimeType, _sampleRate, traceId) => {
+        if (cancelled) return;
+        if (traceId && traceId !== currentTraceRef.current) {
+          unityBridge.interrupt();
+          unityBridge.startDialogue(traceId);
+          currentTraceRef.current = traceId;
+        }
+        syncSub.pushSentencePack(sentenceIndex, text, audio, mimeType);
       },
       onSentencePackDone: () => {
         if (!cancelled) syncSub.signalPacksDone();

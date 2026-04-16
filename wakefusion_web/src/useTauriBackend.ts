@@ -137,7 +137,7 @@ export async function subscribeTauriEvents(handlers: {
   onUserVoiceStart?: (audioId: string) => void;
   onUserVoiceText?: (audioId: string | undefined, traceId: string, text: string) => void;
   onSentenceBoundary?: (traceId: string, sentenceIndex: number, text: string) => void;
-  onSentencePack?: (sentenceIndex: number, text: string, audio: string, mimeType: string, sampleRate: number) => void;
+  onSentencePack?: (sentenceIndex: number, text: string, audio: string, mimeType: string, sampleRate: number, traceId: string) => void;
   onSentencePackDone?: () => void;
   onMediaControl?: (action: string, message: string) => void;
   onTtsAudioChunk?: (data: string, mimeType: string, sentenceIndex?: number) => void;
@@ -237,8 +237,8 @@ export async function subscribeTauriEvents(handlers: {
   if (handlers.onSentencePack) {
     const h = handlers.onSentencePack;
     unlisteners.push(
-      await tauriListen<{ sentenceIndex: number; text: string; audio: string; mimeType: string; sampleRate: number }>("sentence_pack", (p) =>
-        h(p.sentenceIndex, p.text, p.audio, p.mimeType, p.sampleRate)
+      await tauriListen<{ sentenceIndex: number; text: string; audio: string; mimeType: string; sampleRate: number; traceId: string }>("sentence_pack", (p) =>
+        h(p.sentenceIndex, p.text, p.audio, p.mimeType, p.sampleRate, p.traceId)
       )
     );
   }

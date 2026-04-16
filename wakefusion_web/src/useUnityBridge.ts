@@ -8,8 +8,12 @@ import { useCallback, useRef } from "react";
 
 function sendToUnity(objectName: string, methodName: string, arg: string) {
   const instance = (window as any).unityInstance;
-  if (!instance?.SendMessage) return;
+  if (!instance?.SendMessage) {
+    console.warn("[UnityBridge] Unity not ready, skipping:", methodName);
+    return;
+  }
   try {
+    console.log("[UnityBridge]", methodName, arg.length > 200 ? arg.slice(0, 200) + "..." : arg);
     instance.SendMessage(objectName, methodName, arg);
   } catch (e) {
     console.error("[UnityBridge] SendMessage failed:", e);
