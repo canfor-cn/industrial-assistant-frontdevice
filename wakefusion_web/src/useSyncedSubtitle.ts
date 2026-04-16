@@ -11,6 +11,45 @@ import { useCallback, useRef, useState, useEffect } from "react";
 const FADE_DELAY_MS = 5000;
 const FADE_DURATION_MS = 1200;
 
+// ── WAV duration estimation ──
+
+/**
+ * Estimate duration (ms) from a WAV base64 string by parsing the RIFF header.
+ * Falls back to a rough estimate if header is non-standard.
+ */
+function estimateWavDurationMs(audioBase64: string): number {
+  try {
+    const headerB64 = audioBase64.slice(0, 172); // 128 bytes
+    const bin = atob(headerB64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const view = new DataView(bytes.buffer);
+
+    const riff = String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]);
+    const wave = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]);
+    if (riff !== "RIFF" || wave !== "WAVE") {
+      return fallbackDuration(audioBase64);
+    }
+
+    const sampleRate = view.getUint32(24, true);
+    const bitsPerSample = view.getUint16(34, true);
+    const numChannels = view.getUint16(22, true);
+    const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+    if (byteRate === 0) return fallbackDuration(audioBase64);
+
+    const totalBytes = Math.floor(audioBase64.length * 3 / 4);
+    const dataBytes = totalBytes - 44;
+    return Math.max(0, (dataBytes / byteRate) * 1000);
+  } catch {
+    return fallbackDuration(audioBase64);
+  }
+}
+
+function fallbackDuration(audioBase64: string): number {
+  const totalBytes = Math.floor(audioBase64.length * 3 / 4);
+  return Math.max(500, (totalBytes / (22050 * 2)) * 1000);
+}
+
 // ── User voice line ──
 
 interface UserVoiceState {
@@ -23,11 +62,18 @@ interface UserVoiceState {
 interface SentencePack {
   index: number;
   text: string;
-  audioBuffer: ArrayBuffer;
+  audioBase64: string;
+  durationMs: number;
   mimeType: string;
 }
 
-export function useSyncedSubtitle() {
+// ── Options ──
+
+interface SyncedSubtitleOptions {
+  onPlayAudio?: (audioBase64: string, mimeType: string) => void;
+}
+
+export function useSyncedSubtitle(options?: SyncedSubtitleOptions) {
   // ── User voice line ──
   const [userVoice, setUserVoice] = useState<UserVoiceState | null>(null);
   const [userPhase, setUserPhase] = useState<"hidden" | "active" | "fading">("hidden");
@@ -41,7 +87,6 @@ export function useSyncedSubtitle() {
   // ── Pack queue ──
   const queueRef = useRef<SentencePack[]>([]);
   const playingRef = useRef(false);
-  const audioContextRef = useRef<AudioContext | null>(null);
   const doneRef = useRef(false); // sentence_pack_done received
 
   // ── Helpers ──
@@ -102,32 +147,15 @@ export function useSyncedSubtitle() {
     setAssistantPhase("active");
     playingRef.current = true;
 
-    // Play audio
-    if (!audioContextRef.current) {
-      audioContextRef.current = new AudioContext();
-    }
-    const ctx = audioContextRef.current;
+    // Delegate audio playback to external callback (Unity bridge)
+    options?.onPlayAudio?.(pack.audioBase64, pack.mimeType);
 
-    ctx.decodeAudioData(pack.audioBuffer.slice(0))
-      .then((decoded) => {
-        const source = ctx.createBufferSource();
-        source.buffer = decoded;
-        source.connect(ctx.destination);
-        source.onended = () => {
-          // 500ms pause between sentences for natural rhythm
-          setTimeout(() => {
-            playingRef.current = false;
-            tryPlayNext();
-          }, 500);
-        };
-        source.start();
-      })
-      .catch((err) => {
-        console.error("[SyncSubtitle] Audio decode failed for sentence", pack.index, err);
-        playingRef.current = false;
-        tryPlayNext();
-      });
-  }, [startFade]);
+    // Advance to next pack after estimated duration + 500ms gap
+    setTimeout(() => {
+      playingRef.current = false;
+      tryPlayNext();
+    }, pack.durationMs + 500);
+  }, [startFade, options]);
 
   // ── Public API ──
 
@@ -137,15 +165,13 @@ export function useSyncedSubtitle() {
     audioBase64: string,
     _mimeType: string,
   ) => {
-    // Decode base64 to ArrayBuffer
-    const bin = atob(audioBase64);
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const durationMs = estimateWavDurationMs(audioBase64);
 
     queueRef.current.push({
       index: sentenceIndex,
       text,
-      audioBuffer: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+      audioBase64,
+      durationMs,
       mimeType: _mimeType,
     });
 
@@ -179,11 +205,6 @@ export function useSyncedSubtitle() {
     clearFade(userFadeRef);
     clearFade(assistantFadeRef);
 
-    if (audioContextRef.current) {
-      audioContextRef.current.close().catch(() => {});
-      audioContextRef.current = null;
-    }
-
     setUserVoice(null);
     setUserPhase("hidden");
     setAssistantText("");
@@ -195,9 +216,6 @@ export function useSyncedSubtitle() {
     return () => {
       if (userFadeRef.current) window.clearTimeout(userFadeRef.current);
       if (assistantFadeRef.current) window.clearTimeout(assistantFadeRef.current);
-      if (audioContextRef.current) {
-        audioContextRef.current.close().catch(() => {});
-      }
     };
   }, []);
 
