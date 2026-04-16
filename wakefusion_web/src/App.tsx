@@ -35,6 +35,7 @@ import { MediaPresenter } from "./media/MediaPresenter";
 import { isPlayableMedia as isPlayableMediaCheck } from "./media/types";
 import type { MediaRef as MediaRefType } from "./media/types";
 import { useSyncedSubtitle } from "./useSyncedSubtitle";
+import { useUnityBridge } from "./useUnityBridge";
 
 interface MediaRef {
   assetId: string;
@@ -214,7 +215,12 @@ export default function App() {
   const [showTextInput, setShowTextInput] = useState(false);
 
   // Live subtitle panel: sentence-level audio-text sync
-  const syncSub = useSyncedSubtitle();
+  const unityBridge = useUnityBridge();
+  const syncSub = useSyncedSubtitle({
+    onPlayAudio: (audioBase64, _mimeType) => {
+      unityBridge.playAudio(audioBase64);
+    },
+  });
   const [preferredSinkId, setPreferredSinkId] = useState<string | null>(null);
   const [directWsBaseUrl] = useState(() => {
     if (isTauriEnv()) {
@@ -411,8 +417,16 @@ export default function App() {
       },
       onSessionUpdate: (_sessionId, _sessionAction, traceId) => {
         if (cancelled) return;
+        unityBridge.interrupt();
         syncSub.reset();
+        unityBridge.startDialogue(traceId);
         currentTraceRef.current = traceId;
+      },
+      onStopTts: (_traceId) => {
+        if (cancelled) return;
+        unityBridge.interrupt();
+        syncSub.reset();
+        setConnectionStatus("播放已打断");
       },
     }).then((unsub) => {
       if (cancelled) {
@@ -831,6 +845,12 @@ export default function App() {
           return;
         }
         if (data.type === "sentence_pack" && data.text && data.audio) {
+          const traceId = data.traceId || "";
+          if (traceId && traceId !== currentTraceRef.current) {
+            unityBridge.interrupt();
+            unityBridge.startDialogue(traceId);
+            currentTraceRef.current = traceId;
+          }
           syncSub.pushSentencePack(
             typeof data.sentenceIndex === "number" ? data.sentenceIndex : 0,
             String(data.text),
@@ -860,6 +880,7 @@ export default function App() {
           return;
         }
         if (data.type === "stop_tts") {
+          unityBridge.interrupt();
           syncSub.reset();
           setConnectionStatus("播放已打断");
           return;
