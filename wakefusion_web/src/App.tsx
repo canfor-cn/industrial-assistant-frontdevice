@@ -1444,6 +1444,12 @@ export default function App() {
                   <span>摄像头</span>
                 </div>
                 <div className="device-status-row">
+                  <span className="device-status-label">硬件</span>
+                  <span className={`device-status-badge ${deviceState?.hardware?.cameraReady === false ? "is-offline" : "is-online"}`}>
+                    {deviceState?.hardware?.cameraReady === false ? "未就绪 (摄像头未检测到)" : "就绪"}
+                  </span>
+                </div>
+                <div className="device-status-row">
                   <span className="device-status-label">
                     <User className="h-3 w-3" style={{display:'inline',verticalAlign:'middle',marginRight:4}} />
                     人脸

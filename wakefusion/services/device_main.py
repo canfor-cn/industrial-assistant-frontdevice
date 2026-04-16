@@ -86,8 +86,15 @@ def main():
     hardware_status = {"mic_ready": True, "camera_ready": True}
 
     # Start vision_service as daemon THREAD (no longer subprocess)
+    def vision_thread_wrapper(vq, lse):
+        try:
+            run_vision_service(vq, lse)
+        finally:
+            hardware_status["camera_ready"] = False
+            print("[device_main] ⚠️ vision_service 线程退出，camera_ready=False", flush=True)
+
     vision_thread = threading.Thread(
-        target=run_vision_service,
+        target=vision_thread_wrapper,
         args=(vision_queue, lip_sync_event),
         name="vision_service",
         daemon=True,
@@ -97,6 +104,10 @@ def main():
 
     # Wait for camera init
     time.sleep(3)
+
+    if not vision_thread.is_alive():
+        hardware_status["camera_ready"] = False
+        print("[device_main] ⚠️ vision_service 启动失败（线程已退出），camera_ready=False", flush=True)
 
     # ── Audio service with auto-retry ──────────────────────────────────
     AUDIO_RETRY_INTERVAL = 5  # 秒：audio 线程退出后多久重试
@@ -125,31 +136,49 @@ def main():
         hardware_status["mic_ready"] = False
         print("[device_main] ⚠️ audio_service 启动失败（线程已退出），mic_ready=False", flush=True)
 
-    # 后台监控线程：audio 线程退出后定期重试，实现"热插拔"
-    def audio_watchdog():
-        nonlocal audio_thread
+    # 后台监控线程：audio/vision 线程退出后定期重试，实现"热插拔"
+    def hardware_watchdog():
+        nonlocal audio_thread, vision_thread
         while True:
             time.sleep(AUDIO_RETRY_INTERVAL)
-            if audio_thread.is_alive():
-                continue
-            # audio 线程已退出，尝试重启
-            print(f"[device_main] 🔄 audio_service 已退出，{AUDIO_RETRY_INTERVAL}s 后尝试重启...", flush=True)
-            hardware_status["mic_ready"] = False
-            audio_thread = threading.Thread(
-                target=audio_thread_wrapper,
-                args=(config_path,),
-                name="audio_service",
-                daemon=True,
-            )
-            audio_thread.start()
-            time.sleep(3)  # 等初始化
-            if audio_thread.is_alive():
-                hardware_status["mic_ready"] = True
-                print("[device_main] ✅ audio_service 热重载成功，mic_ready=True", flush=True)
-            else:
-                print("[device_main] ❌ audio_service 重启失败，下次继续尝试...", flush=True)
 
-    watchdog_thread = threading.Thread(target=audio_watchdog, name="audio_watchdog", daemon=True)
+            # ── Audio watchdog ──
+            if not audio_thread.is_alive():
+                print(f"[device_main] 🔄 audio_service 已退出，尝试重启...", flush=True)
+                hardware_status["mic_ready"] = False
+                audio_thread = threading.Thread(
+                    target=audio_thread_wrapper,
+                    args=(config_path,),
+                    name="audio_service",
+                    daemon=True,
+                )
+                audio_thread.start()
+                time.sleep(3)
+                if audio_thread.is_alive():
+                    hardware_status["mic_ready"] = True
+                    print("[device_main] ✅ audio_service 热重载成功，mic_ready=True", flush=True)
+                else:
+                    print("[device_main] ❌ audio_service 重启失败，下次继续尝试...", flush=True)
+
+            # ── Vision watchdog ──
+            if not vision_thread.is_alive():
+                print(f"[device_main] 🔄 vision_service 已退出，尝试重启...", flush=True)
+                hardware_status["camera_ready"] = False
+                vision_thread = threading.Thread(
+                    target=vision_thread_wrapper,
+                    args=(vision_queue, lip_sync_event),
+                    name="vision_service",
+                    daemon=True,
+                )
+                vision_thread.start()
+                time.sleep(3)
+                if vision_thread.is_alive():
+                    hardware_status["camera_ready"] = True
+                    print("[device_main] ✅ vision_service 热重载成功，camera_ready=True", flush=True)
+                else:
+                    print("[device_main] ❌ vision_service 重启失败，下次继续尝试...", flush=True)
+
+    watchdog_thread = threading.Thread(target=hardware_watchdog, name="hardware_watchdog", daemon=True)
     watchdog_thread.start()
 
     # Run core_server in main thread, passing vision queue, lip sync event, and hardware status
