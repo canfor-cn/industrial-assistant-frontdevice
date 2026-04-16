@@ -1004,6 +1004,17 @@ class CoreServer:
             
             logger.info("状态转换: 退出交互模式，通知底层结束推流并关闭唇动检测")
             self._send_stop_streaming_command()
+
+            # 🌟 向后端发送 timeout_exit，让后端彻底终止所有进行中的 ASR/LLM/TTS
+            try:
+                self._send_websocket_message({
+                    "type": "timeout_exit",
+                    "deviceId": self.llm_agent_config.device_id,
+                    "reason": "exit_interactive",
+                    "timestamp": time.time(),
+                })
+            except Exception as e:
+                logger.warning(f"⚠️ 发送 timeout_exit 失败: {e}")
             
             # 休眠时关闭唇动检测，节省 CPU/GPU 算力
             if self._lip_sync_event is not None:
