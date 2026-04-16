@@ -252,7 +252,7 @@ export default function App() {
     }).slice(0, 6);
   }, [playbackHistory]);
 
-  const [tauriBackendHost, setTauriBackendHost] = useState("127.0.0.1:7788");
+  const [tauriBackendHost, setTauriBackendHost] = useState("127.0.0.1:7790");
   useEffect(() => {
     if (isTauriEnv()) {
       tauriGetBackendHost().then(setTauriBackendHost);
@@ -271,9 +271,9 @@ export default function App() {
       url.hash = "";
       return url.toString().replace(/\/$/, "");
     } catch {
-      return "http://127.0.0.1:7788";
+      return "http://127.0.0.1:7790";
     }
-  }, [directWsBaseUrl]);
+  }, [directWsBaseUrl, tauriBackendHost]);
 
   const currentTurnMessages = (() => {
     const lastUserIndex = [...messages].map((message) => message.role).lastIndexOf("user");
