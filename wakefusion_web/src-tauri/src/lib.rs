@@ -105,31 +105,38 @@ pub fn run() {
 
     // Audio player thread (lazy init on first SetSampleRate)
     let pc = playback_config.clone();
-    std::thread::spawn(move || {
-        let mut player: Option<audio_playback::AudioPlayer> = None;
-        loop {
-            match audio_rx.recv() {
-                Ok(AudioCommand::Push(samples)) => {
-                    if let Some(p) = &player {
-                        p.push(samples);
+    if pc.enabled {
+        std::thread::spawn(move || {
+            let mut player: Option<audio_playback::AudioPlayer> = None;
+            loop {
+                match audio_rx.recv() {
+                    Ok(AudioCommand::Push(samples)) => {
+                        if let Some(p) = &player {
+                            p.push(samples);
+                        }
                     }
-                }
-                Ok(AudioCommand::Clear) => {}
-                Ok(AudioCommand::SetSampleRate(sr)) => {
-                    if player.as_ref().map(|p| p.sample_rate) != Some(sr) {
-                        tracing::info!("Creating/rebuilding audio player: {}Hz", sr);
-                        player = audio_playback::AudioPlayer::new(
-                            &pc.output_device_match,
-                            sr,
-                            pc.channels,
-                            false,
-                        );
+                    Ok(AudioCommand::Clear) => {}
+                    Ok(AudioCommand::SetSampleRate(sr)) => {
+                        if player.as_ref().map(|p| p.sample_rate) != Some(sr) {
+                            tracing::info!("Creating/rebuilding audio player: {}Hz", sr);
+                            player = audio_playback::AudioPlayer::new(
+                                &pc.output_device_match,
+                                sr,
+                                pc.channels,
+                                false,
+                            );
+                        }
                     }
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
-        }
-    });
+        });
+    } else {
+        tracing::info!("Audio playback disabled (audio_playback.enabled=false), Unity WebGL handles audio");
+        std::thread::spawn(move || {
+            while audio_rx.recv().is_ok() {}
+        });
+    }
 
     // Backend WS client thread
     ws_client::spawn_ws_thread(llm_config.clone(), downstream_tx.clone(), upstream_rx);

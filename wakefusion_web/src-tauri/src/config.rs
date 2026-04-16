@@ -69,6 +69,8 @@ impl Default for LlmAgentConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AudioPlaybackConfig {
+    #[serde(default)]
+    pub enabled: bool,
     #[serde(default = "default_sample_rate")]
     pub sample_rate: u32,
     #[serde(default = "default_channels")]
@@ -84,6 +86,7 @@ pub struct AudioPlaybackConfig {
 impl Default for AudioPlaybackConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             sample_rate: default_sample_rate(),
             channels: default_channels(),
             prebuffer_ms: default_prebuffer_ms(),
