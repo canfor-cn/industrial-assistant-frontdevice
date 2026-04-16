@@ -977,17 +977,75 @@ export default function App() {
 
       recorder.onstop = async () => {
         const blob = new Blob(recorderChunksRef.current, { type: recorder.mimeType || "audio/webm" });
-        const buffer = await blob.arrayBuffer();
-        const bytes = new Uint8Array(buffer);
-        let binary = "";
-        for (const byte of bytes) {
-          binary += String.fromCharCode(byte);
+
+        // Transcode browser audio (webm/opus) → 16kHz mono WAV to match device format
+        let wavBase64: string;
+        try {
+          const arrayBuf = await blob.arrayBuffer();
+          const audioCtx = new AudioContext();
+          const decoded = await audioCtx.decodeAudioData(arrayBuf);
+          audioCtx.close().catch(() => {});
+
+          // Resample to 16kHz mono via OfflineAudioContext
+          const targetRate = 16000;
+          const offlineLen = Math.round(decoded.duration * targetRate);
+          const offline = new OfflineAudioContext(1, offlineLen, targetRate);
+          const src = offline.createBufferSource();
+          src.buffer = decoded;
+          src.connect(offline.destination);
+          src.start();
+          const rendered = await offline.startRendering();
+          const float32 = rendered.getChannelData(0);
+
+          // Float32 → Int16 PCM + WAV header
+          const pcmLen = float32.length * 2;
+          const wavLen = 44 + pcmLen;
+          const wavBuf = new ArrayBuffer(wavLen);
+          const view = new DataView(wavBuf);
+          // RIFF header
+          const writeStr = (off: number, s: string) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
+          writeStr(0, "RIFF");
+          view.setUint32(4, wavLen - 8, true);
+          writeStr(8, "WAVE");
+          writeStr(12, "fmt ");
+          view.setUint32(16, 16, true);        // fmt chunk size
+          view.setUint16(20, 1, true);          // PCM
+          view.setUint16(22, 1, true);          // mono
+          view.setUint32(24, targetRate, true);  // sample rate
+          view.setUint32(28, targetRate * 2, true); // byte rate
+          view.setUint16(32, 2, true);          // block align
+          view.setUint16(34, 16, true);         // bits per sample
+          writeStr(36, "data");
+          view.setUint32(40, pcmLen, true);
+          // PCM samples
+          for (let i = 0; i < float32.length; i++) {
+            const s = Math.max(-1, Math.min(1, float32[i]));
+            view.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+          }
+
+          // ArrayBuffer → base64
+          const wavBytes = new Uint8Array(wavBuf);
+          let binary = "";
+          const chunk = 0x8000;
+          for (let i = 0; i < wavBytes.length; i += chunk) {
+            binary += String.fromCharCode.apply(null, Array.from(wavBytes.subarray(i, i + chunk)));
+          }
+          wavBase64 = btoa(binary);
+        } catch (err) {
+          console.error("[Recording] Transcode to WAV failed, falling back to raw:", err);
+          // Fallback: send original blob as-is
+          const rawBuf = await blob.arrayBuffer();
+          const rawBytes = new Uint8Array(rawBuf);
+          let binary = "";
+          for (const byte of rawBytes) binary += String.fromCharCode(byte);
+          wavBase64 = btoa(binary);
         }
-        const data = btoa(binary);
+
+        const wavMime = "audio/wav";
         try {
           if (isTauriEnv()) {
             // Tauri: send to Rust host — it will emit voice_message back to display
-            await tauriSendAudio(traceId, data, blob.type || "audio/webm", "zh");
+            await tauriSendAudio(traceId, wavBase64, wavMime, "zh");
           } else {
           // Browser: display locally + send via WS
           ensureVoiceUserMessage(traceId, "语音识别中…", URL.createObjectURL(blob));
@@ -996,8 +1054,8 @@ export default function App() {
             type: "audio_segment_begin",
             traceId,
             deviceId: directDeviceId.trim(),
-            mimeType: blob.type || "audio/webm",
-            codec: recorder.mimeType || undefined,
+            mimeType: wavMime,
+            codec: "pcm_s16le",
             language: "zh",
             context: buildMediaContext(),
           }));
@@ -1006,7 +1064,7 @@ export default function App() {
             traceId,
             deviceId: directDeviceId.trim(),
             seq: 0,
-            data,
+            data: wavBase64,
           }));
           socket.send(JSON.stringify({
             type: "audio_segment_end",
