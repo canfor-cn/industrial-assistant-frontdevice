@@ -1232,17 +1232,29 @@ class CoreServer:
             self._report_device_state("speaking")
     
     def _stop_tts_playback(self):
-        """停止TTS播放（TTS播放结束）"""
+        """停止TTS播放 —— 同时通知 Rust 宿主立刻清空音频队列"""
         with self._state_lock:
             logger.info("状态转换: TTS播放结束")
             self.is_playing_tts = False
-            
+
+            # 🌟 P0 修复：向 Rust 宿主发 stop_tts，让 cpal 立刻清空播放队列
+            # 不发这条的话，已经送到 Rust 的 audio chunks 会继续播完
+            try:
+                self._send_websocket_message({
+                    "type": "stop_tts",
+                    "deviceId": self.llm_agent_config.device_id,
+                    "reason": "barge_in",
+                    "timestamp": time.time(),
+                })
+            except Exception as e:
+                logger.warning(f"⚠️ 发送 stop_tts 给 Rust 失败: {e}")
+
             # 🌟 核心修复：开启绝对物理防抖时间！
             # 屏蔽这段时间内的任何 VAD 波动和硬打断，防止自己录到自己的尾音
             debounce_window = self.conversation_config.lip_recent_window_s
             self._ignore_audio_until = time.time() + debounce_window
             logger.info(f"🛡️ 激活物理防抖护盾：{debounce_window}秒内忽略所有音频输入（直到 {self._ignore_audio_until:.2f}）")
-            
+
             # 如果仍在交互模式，继续监听（等待用户继续说话）
             if self.is_interactive_mode:
                 self._send_start_streaming_command()
