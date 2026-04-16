@@ -200,6 +200,9 @@ pub async fn run_message_router(
             "stop_tts" => {
                 tracing::info!("stop_tts");
                 let _ = audio_tx.send(AudioCommand::Clear);
+                let _ = app.emit("stop_tts", serde_json::json!({
+                    "traceId": trace_id,
+                }));
             }
 
             "media_control" => {
