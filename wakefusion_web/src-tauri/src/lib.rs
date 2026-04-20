@@ -198,6 +198,116 @@ pub fn run() {
                 // Spawn unified device process (audio + vision + core_server in one)
                 let log_file = cwd.join("wakefusion_device.log");
                 std::thread::spawn(move || {
+                    // ── Auto-install Python dependencies ──────────────────────
+                    let req_file = cwd.join("requirements-device.txt");
+                    if req_file.exists() {
+                        let whl_dir = cwd.join("whl-cache");
+                        let pip_log = cwd.join("pip-install.log");
+                        let req_path = req_file.to_string_lossy().to_string();
+                        let mut installed = false;
+
+                        let emit_setup = |phase: &str, message: &str, done: bool, error: bool| {
+                            let _ = spawn_app.emit("setup_progress", serde_json::json!({
+                                "phase": phase,
+                                "message": message,
+                                "done": done,
+                                "error": error,
+                                "timestamp": ws_protocol::now_ts(),
+                            }));
+                        };
+
+                        let write_pip_log = |phase: &str, success: bool, stdout: &[u8], stderr: &[u8]| {
+                            let content = format!(
+                                "=== {} [{}] ===\ntime: {}\n\n--- stdout ---\n{}\n--- stderr ---\n{}\n",
+                                phase,
+                                if success { "OK" } else { "FAILED" },
+                                humanize_now(),
+                                String::from_utf8_lossy(stdout),
+                                String::from_utf8_lossy(stderr),
+                            );
+                            use std::io::Write;
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .create(true).append(true).open(&pip_log)
+                            {
+                                let _ = f.write_all(content.as_bytes());
+                            }
+                        };
+
+                        emit_setup("deps_install", "正在检查并安装设备依赖...", false, false);
+
+                        // Try 1: offline install from whl-cache (fast, no network)
+                        if whl_dir.exists() {
+                            emit_setup("deps_install", "正在从本地缓存安装依赖...", false, false);
+                            tracing::info!("Installing Python deps (offline from whl-cache)");
+                            if let Ok(out) = std::process::Command::new(&python)
+                                .args(["-m", "pip", "install",
+                                       "-r", &req_path,
+                                       "--no-index", "--find-links",
+                                       &whl_dir.to_string_lossy()])
+                                .current_dir(&cwd)
+                                .creation_flags(CREATE_NO_WINDOW)
+                                .output()
+                            {
+                                let ok = out.status.success();
+                                write_pip_log("offline install", ok, &out.stdout, &out.stderr);
+                                if ok {
+                                    tracing::info!("Python deps installed (offline)");
+                                    emit_setup("deps_install", "依赖安装完成", true, false);
+                                    installed = true;
+                                } else {
+                                    tracing::warn!("Offline install failed, will try online");
+                                    emit_setup("deps_install", "本地安装失败，正在尝试在线安装...", false, false);
+                                }
+                            }
+                        }
+
+                        // Try 2: online install (if offline failed or whl-cache missing)
+                        if !installed {
+                            emit_setup("deps_install", "正在在线安装设备依赖（首次启动需要网络）...", false, false);
+                            tracing::info!("Installing Python deps (online via pip)");
+                            match std::process::Command::new(&python)
+                                .args(["-m", "pip", "install", "-r", &req_path])
+                                .current_dir(&cwd)
+                                .creation_flags(CREATE_NO_WINDOW)
+                                .output()
+                            {
+                                Ok(out) => {
+                                    let ok = out.status.success();
+                                    write_pip_log("online install", ok, &out.stdout, &out.stderr);
+                                    if ok {
+                                        tracing::info!("Python deps installed (online)");
+                                        emit_setup("deps_install", "依赖安装完成", true, false);
+                                    } else {
+                                        let stderr = String::from_utf8_lossy(&out.stderr);
+                                        let msg = format!("依赖安装失败：{}", stderr.chars().take(200).collect::<String>());
+                                        tracing::error!("pip install failed: {}", &msg);
+                                        emit_setup("deps_install", &msg, true, true);
+                                    }
+                                }
+                                Err(e) => {
+                                    let msg = format!("无法运行 pip，请检查 Python 是否已安装：{}", e);
+                                    tracing::error!("{}", &msg);
+                                    write_pip_log("online install", false, b"", e.to_string().as_bytes());
+                                    emit_setup("deps_install", &msg, true, true);
+                                }
+                            }
+                        }
+                    }
+
+                    // ── Post-install: download openwakeword models if missing ──
+                    if req_file.exists() {
+                        let oww_check = std::process::Command::new(&python)
+                            .args(["-c", "from openwakeword.utils import download_models; download_models()"])
+                            .current_dir(&cwd)
+                            .creation_flags(CREATE_NO_WINDOW)
+                            .output();
+                        match oww_check {
+                            Ok(out) if out.status.success() => tracing::info!("OpenWakeWord models ready"),
+                            Ok(out) => tracing::warn!("OpenWakeWord model download issue: {}", String::from_utf8_lossy(&out.stderr).chars().take(200).collect::<String>()),
+                            Err(_) => {} // openwakeword not installed, skip
+                        }
+                    }
+
                     tracing::info!(
                         python = %python,
                         module = %module,
@@ -287,4 +397,15 @@ pub fn run() {
                 kill_device_process();
             }
         });
+}
+
+fn humanize_now() -> String {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = d.as_secs();
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    format!("{:02}:{:02}:{:02} UTC (epoch {})", h, m, s, secs)
 }

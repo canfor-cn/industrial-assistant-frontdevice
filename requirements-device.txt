@@ -1,0 +1,24 @@
+# WakeFusion device runtime dependencies
+# Installed automatically by Rust host on first launch.
+# If whl-cache/ directory exists alongside this file, tries offline first.
+
+# core
+numpy>=1.24.0
+pyzmq>=25.0.0
+pyyaml>=6.0
+psutil>=5.9.0
+websockets>=11.0
+aiohttp>=3.9.0
+
+# audio: VAD + KWS
+sounddevice>=0.4.6
+torch>=2.0.0
+torchaudio>=2.0.0
+onnxruntime>=1.16.0
+openwakeword>=0.6.0
+
+# vision: face detection + Orbbec depth camera
+# NOTE: Use pyorbbecsdk2 (new official package); old pyorbbecsdk 1.3.2 on PyPI is broken.
+# pyorbbecsdk2 installs as module name "pyorbbecsdk" (fully compatible with existing code).
+mediapipe>=0.10.14
+pyorbbecsdk2>=2.0.0

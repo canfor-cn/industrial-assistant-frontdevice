@@ -147,6 +147,7 @@ export default function App() {
   const [deviceAddr, setDeviceAddr] = useState("");
   const [deviceLastSeen, setDeviceLastSeen] = useState<number | null>(null);
   const [deviceState, setDeviceState] = useState<DeviceStatePayload | null>(null);
+  const [setupProgress, setSetupProgress] = useState<{ message: string; done: boolean; error: boolean } | null>(null);
   const [uiVisible, setUiVisible] = useState(false);
   const [ragTenantId, setRagTenantId] = useState("default");
   const [ragExhibits, setRagExhibits] = useState<RagExhibit[]>([]);
@@ -433,6 +434,16 @@ export default function App() {
         unityBridge.interrupt();
         syncSub.reset();
         setConnectionStatus("播放已打断");
+      },
+      onSetupProgress: (_phase, message, done, error) => {
+        if (cancelled) return;
+        if (done && !error) {
+          // Install succeeded — dismiss after 2s
+          setSetupProgress({ message, done, error });
+          setTimeout(() => setSetupProgress(null), 2000);
+        } else {
+          setSetupProgress({ message, done, error });
+        }
       },
     }).then((unsub) => {
       if (cancelled) {
@@ -1354,6 +1365,25 @@ export default function App() {
 
   return (
     <div className="app-shell" ref={appShellRef}>
+      {/* Setup progress overlay */}
+      {setupProgress && !setupProgress.done && (
+        <div className="setup-overlay">
+          <div className="setup-overlay-content">
+            <div className="setup-overlay-spinner" />
+            <div className="setup-overlay-message">{setupProgress.message}</div>
+          </div>
+        </div>
+      )}
+      {setupProgress && setupProgress.done && setupProgress.error && (
+        <div className="setup-overlay is-error">
+          <div className="setup-overlay-content">
+            <div className="setup-overlay-icon">!</div>
+            <div className="setup-overlay-message">{setupProgress.message}</div>
+            <div className="setup-overlay-hint">详情请查看 pip-install.log</div>
+            <button className="setup-overlay-dismiss" onClick={() => setSetupProgress(null)}>关闭</button>
+          </div>
+        </div>
+      )}
       {/* Layer 0-1: Full-screen stage */}
       <div className="stage-fullscreen" ref={stageSurfaceRef}>
         {!isUnityLoaded && (

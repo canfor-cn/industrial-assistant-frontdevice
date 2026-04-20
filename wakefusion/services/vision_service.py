@@ -1055,25 +1055,34 @@ class VisionService:
         print(f"启动相机（pyorbbecsdk, RGB + 人脸距离估算）...", flush=True)
 
         # 使用 pyorbbecsdk 采集 RGB（Orbbec 不支持标准 UVC/DirectShow）
+        # Import strategy:
+        # 1. Try importing pip-installed pyorbbecsdk directly (uses its bundled DLLs)
+        # 2. If that fails, fallback to project's lib/orbbec DLLs (for bundled scenarios)
         import os as _os
-        _module_dir = _os.path.dirname(_os.path.abspath(__file__))
-        for _dll_candidate in [
-            _os.path.join(_os.path.dirname(_module_dir), "lib", "orbbec"),
-            _os.path.join(_os.getcwd(), "wakefusion", "lib", "orbbec"),
-        ]:
-            if _os.path.isdir(_dll_candidate):
-                _os.add_dll_directory(_dll_candidate)
-                if _dll_candidate not in _os.sys.path:
-                    _os.sys.path.insert(0, _dll_candidate)
-                print(f"[INFO] Added Orbbec DLL path: {_dll_candidate}", flush=True)
-                break
-
+        ob = None
         try:
             import pyorbbecsdk as ob
-            print("[INFO] pyorbbecsdk imported OK", flush=True)
-        except Exception as e:
-            print(f"[ERROR] pyorbbecsdk import failed: {e}", flush=True)
-            return
+            print("[INFO] pyorbbecsdk imported directly (using bundled DLLs)", flush=True)
+        except Exception as e_direct:
+            print(f"[INFO] Direct import failed ({e_direct}), trying project DLL fallback...", flush=True)
+            _module_dir = _os.path.dirname(_os.path.abspath(__file__))
+            for _dll_candidate in [
+                _os.path.join(_os.path.dirname(_module_dir), "lib", "orbbec"),
+                _os.path.join(_os.getcwd(), "wakefusion", "lib", "orbbec"),
+            ]:
+                if _os.path.isdir(_dll_candidate):
+                    _os.add_dll_directory(_dll_candidate)
+                    if _dll_candidate not in _os.sys.path:
+                        _os.sys.path.insert(0, _dll_candidate)
+                    print(f"[INFO] Added Orbbec DLL path: {_dll_candidate}", flush=True)
+                    break
+
+            try:
+                import pyorbbecsdk as ob
+                print("[INFO] pyorbbecsdk imported with project DLL fallback", flush=True)
+            except Exception as e:
+                print(f"[ERROR] pyorbbecsdk import failed: {e}", flush=True)
+                return
 
         pipeline = ob.Pipeline()
         config = ob.Config()

@@ -6,25 +6,31 @@ Orbbec Gemini 330 系列深度相机驱动（支持 335/336）
 import os
 import sys
 
-# 添加 pyorbbecsdk DLL 搜索路径（Windows）
-# 搜索多个可能的位置（开发环境 + 便携部署）
-_module_dir = os.path.dirname(os.path.abspath(__file__))
-_wakefusion_dir = os.path.dirname(_module_dir)  # wakefusion/
-_project_root = os.path.dirname(_wakefusion_dir)  # wakefusion_wake_module/ or release/
+# pyorbbecsdk DLL loading strategy:
+# 1. If pip-installed pyorbbecsdk works directly (bundles its own DLLs), use it.
+# 2. Otherwise, fallback to project-bundled DLLs in lib/orbbec.
+# This ensures version mismatch doesn't break deployments where pip installs
+# a different pyorbbecsdk version than the project's bundled DLLs target.
+try:
+    import pyorbbecsdk as _test_ob  # noqa: F401
+    # pip-installed version works, no need to add project DLL paths
+except Exception:
+    _module_dir = os.path.dirname(os.path.abspath(__file__))
+    _wakefusion_dir = os.path.dirname(_module_dir)
+    _project_root = os.path.dirname(_wakefusion_dir)
 
-_dll_search_paths = [
-    os.path.join(_wakefusion_dir, "lib", "orbbec"),     # wakefusion/lib/orbbec (release)
-    os.path.join(_project_root, "lib", "orbbec"),        # ../lib/orbbec (dev)
-    os.path.join(os.getcwd(), "wakefusion", "lib", "orbbec"),  # cwd/wakefusion/lib/orbbec
-]
+    _dll_search_paths = [
+        os.path.join(_wakefusion_dir, "lib", "orbbec"),
+        os.path.join(_project_root, "lib", "orbbec"),
+        os.path.join(os.getcwd(), "wakefusion", "lib", "orbbec"),
+    ]
 
-for _dll_path in _dll_search_paths:
-    if os.path.isdir(_dll_path):
-        os.add_dll_directory(_dll_path)
-        # Also add to sys.path for .pyd import
-        if _dll_path not in os.sys.path:
-            os.sys.path.insert(0, _dll_path)
-        break
+    for _dll_path in _dll_search_paths:
+        if os.path.isdir(_dll_path):
+            os.add_dll_directory(_dll_path)
+            if _dll_path not in os.sys.path:
+                os.sys.path.insert(0, _dll_path)
+            break
 
 import asyncio
 import numpy as np
