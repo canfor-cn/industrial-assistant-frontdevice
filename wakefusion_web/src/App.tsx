@@ -6,6 +6,8 @@ import { ParticleBackground } from "./ParticleBackground";
 import {
   Mic,
   MicOff,
+  Phone,
+  PhoneOff,
   SendHorizontal,
   Keyboard,
   Image as ImageIcon,
@@ -137,6 +139,7 @@ export default function App() {
   const [loadingProgress, setLoadingProgress] = useState(0);
   const [connectionStatus, setConnectionStatus] = useState("未连接");
   const [isRecording, setIsRecording] = useState(false);
+  const [isPhoneCall, setIsPhoneCall] = useState(false);
   const [ragOpen, setRagOpen] = useState(false);
   const [personaOpen, setPersonaOpen] = useState(false);
   const [personaData, setPersonaData] = useState<Record<string, string>>({});
@@ -243,6 +246,12 @@ export default function App() {
   const directSocketKeyRef = useRef("");
   const recorderRef = useRef<MediaRecorder | null>(null);
   const recorderChunksRef = useRef<Blob[]>([]);
+  // Phone-call (continuous streaming) mode refs
+  const phoneCallStreamRef = useRef<MediaStream | null>(null);
+  const phoneCallCtxRef = useRef<AudioContext | null>(null);
+  const phoneCallNodeRef = useRef<ScriptProcessorNode | null>(null);
+  const phoneCallTraceIdRef = useRef<string>("");
+  const phoneCallSeqRef = useRef<number>(0);
   const currentTraceRef = useRef<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const subtitleScrollRef = useRef<HTMLDivElement>(null);
@@ -1102,6 +1111,117 @@ export default function App() {
     }
   }
 
+  // ── Phone-call mode (continuous streaming to backend realtime) ──────
+  // Uses Web Audio API to capture 16kHz mono PCM in small chunks (~100ms each),
+  // base64-encoded and sent as audio_stream_chunk. Server-side VAD (Qwen) handles
+  // utterance boundaries; client does NOT VAD.
+
+  async function startPhoneCall(): Promise<void> {
+    if (isPhoneCall) return;
+    if (isTauriEnv()) {
+      setConnectionStatus("Tauri 模式暂不支持电话模式");
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setConnectionStatus("浏览器不支持录音");
+      return;
+    }
+    try {
+      const socket = await ensureAssistantSocket();
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true },
+      });
+      phoneCallStreamRef.current = stream;
+
+      // Create AudioContext at target sample rate if possible; otherwise use default and resample.
+      const ctx = new AudioContext({ sampleRate: 16000 });
+      phoneCallCtxRef.current = ctx;
+      const source = ctx.createMediaStreamSource(stream);
+
+      // ScriptProcessorNode is deprecated but universally supported.
+      // Buffer size 2048 @ 16kHz ≈ 128ms per chunk.
+      const processor = ctx.createScriptProcessor(2048, 1, 1);
+      phoneCallNodeRef.current = processor;
+
+      const traceId = `phone-${Date.now()}`;
+      phoneCallTraceIdRef.current = traceId;
+      phoneCallSeqRef.current = 0;
+
+      // Send stream_start
+      socket.send(JSON.stringify({
+        type: "audio_stream_start",
+        traceId,
+        deviceId: directDeviceId.trim(),
+        mimeType: "audio/pcm",
+        codec: "pcm_s16le",
+        sampleRate: ctx.sampleRate,
+        channels: 1,
+        language: "zh",
+      }));
+
+      processor.onaudioprocess = (ev) => {
+        if (!phoneCallNodeRef.current) return;
+        const float32 = ev.inputBuffer.getChannelData(0);
+        // Float32 → Int16 PCM
+        const pcm = new Int16Array(float32.length);
+        for (let i = 0; i < float32.length; i++) {
+          const s = Math.max(-1, Math.min(1, float32[i]));
+          pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        // Int16Array → base64
+        const bytes = new Uint8Array(pcm.buffer);
+        let binary = "";
+        const chunkSize = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunkSize) {
+          binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunkSize)));
+        }
+        const b64 = btoa(binary);
+        socket.send(JSON.stringify({
+          type: "audio_stream_chunk",
+          traceId,
+          deviceId: directDeviceId.trim(),
+          seq: phoneCallSeqRef.current++,
+          data: b64,
+        }));
+      };
+
+      source.connect(processor);
+      processor.connect(ctx.destination);
+
+      setIsPhoneCall(true);
+      setConnectionStatus("电话模式已接通");
+    } catch (err) {
+      setConnectionStatus(err instanceof Error ? err.message : "无法启动电话模式");
+      stopPhoneCall();
+    }
+  }
+
+  function stopPhoneCall(): void {
+    const traceId = phoneCallTraceIdRef.current;
+    try {
+      // Send stream_stop over existing socket (best-effort)
+      const socket = directSocketRef.current;
+      if (socket && socket.readyState === WebSocket.OPEN && traceId) {
+        socket.send(JSON.stringify({
+          type: "audio_stream_stop",
+          traceId,
+          deviceId: directDeviceId.trim(),
+          reason: "user_ended",
+        }));
+      }
+    } catch { /* ignore */ }
+    try { phoneCallNodeRef.current?.disconnect(); } catch { /* ignore */ }
+    try { phoneCallCtxRef.current?.close(); } catch { /* ignore */ }
+    try { phoneCallStreamRef.current?.getTracks().forEach((t) => t.stop()); } catch { /* ignore */ }
+    phoneCallNodeRef.current = null;
+    phoneCallCtxRef.current = null;
+    phoneCallStreamRef.current = null;
+    phoneCallTraceIdRef.current = "";
+    phoneCallSeqRef.current = 0;
+    setIsPhoneCall(false);
+    setConnectionStatus("电话已挂断");
+  }
+
   function decodeBase64ToBytes(data: string) {
     const binary = atob(data);
     const bytes = new Uint8Array(binary.length);
@@ -1525,9 +1645,20 @@ export default function App() {
                 type="button"
                 className={`mic-button ${isRecording ? "is-recording" : ""}`}
                 onClick={() => void (isRecording ? stopRecording() : startRecording())}
+                disabled={isPhoneCall}
               >
                 {isRecording ? <MicOff className="h-5 w-5" /> : <Mic className="h-5 w-5" />}
                 <span>{isRecording ? "点击结束录音" : "点击开始对话"}</span>
+              </button>
+              <button
+                type="button"
+                className={`phone-button ${isPhoneCall ? "is-active" : ""}`}
+                onClick={() => void (isPhoneCall ? stopPhoneCall() : startPhoneCall())}
+                disabled={isRecording}
+                title={isPhoneCall ? "挂断电话" : "电话模式（连续对话）"}
+              >
+                {isPhoneCall ? <PhoneOff className="h-5 w-5" /> : <Phone className="h-5 w-5" />}
+                <span>{isPhoneCall ? "挂断" : "电话模式"}</span>
               </button>
               <button type="button" className="keyboard-toggle" onClick={() => setShowTextInput(true)} title="文字输入">
                 <Keyboard className="h-5 w-5" />

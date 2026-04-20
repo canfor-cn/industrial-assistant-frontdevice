@@ -848,6 +848,52 @@ button {
   50% { box-shadow: 0 0 36px rgba(220, 38, 38, 0.22); }
 }
 
+.phone-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  height: 56px;
+  min-width: 150px;
+  padding: 0 28px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  background: var(--glass-light);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  box-shadow: var(--shadow-md);
+  transition: all var(--duration-normal) var(--ease);
+  cursor: pointer;
+}
+
+.phone-button:hover:not(:disabled) {
+  border-color: rgba(34, 197, 94, 0.35);
+  background: rgba(34, 197, 94, 0.08);
+  transform: translateY(-1px);
+}
+
+.phone-button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.phone-button.is-active {
+  background: rgba(34, 197, 94, 0.90);
+  border-color: rgba(34, 197, 94, 0.4);
+  color: #fff;
+  box-shadow: 0 0 32px rgba(34, 197, 94, 0.18);
+  animation: phone-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes phone-pulse {
+  0%, 100% { box-shadow: 0 0 16px rgba(34, 197, 94, 0.15); }
+  50% { box-shadow: 0 0 40px rgba(34, 197, 94, 0.35); }
+}
+
 .keyboard-toggle {
   display: inline-flex;
   align-items: center;
