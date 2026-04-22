@@ -140,7 +140,8 @@ export async function subscribeTauriEvents(handlers: {
   onSentencePack?: (sentenceIndex: number, text: string, audio: string, mimeType: string, sampleRate: number, traceId: string) => void;
   onSentencePackDone?: () => void;
   onMediaControl?: (action: string, message: string) => void;
-  onTtsAudioChunk?: (data: string, mimeType: string, sentenceIndex?: number) => void;
+  onTtsAudioBegin?: (mimeType: string, codec: string, sampleRate: number) => void;
+  onTtsAudioChunk?: (data: string, mimeType: string, codec: string, sampleRate: number, sentenceIndex?: number) => void;
   onTtsAudioEnd?: () => void;
   onDeviceStatus?: (connected: boolean, deviceAddr: string) => void;
   onDeviceState?: (state: DeviceStatePayload) => void;
@@ -260,11 +261,20 @@ export async function subscribeTauriEvents(handlers: {
     );
   }
 
+  if (handlers.onTtsAudioBegin) {
+    const h = handlers.onTtsAudioBegin;
+    unlisteners.push(
+      await tauriListen<{ mimeType: string; codec: string; sampleRate: number }>("tts_audio_begin", (p) =>
+        h(p.mimeType ?? "", p.codec ?? "", p.sampleRate ?? 0)
+      )
+    );
+  }
+
   if (handlers.onTtsAudioChunk) {
     const h = handlers.onTtsAudioChunk;
     unlisteners.push(
-      await tauriListen<{ data: string; mimeType: string; sentenceIndex?: number }>("tts_audio_chunk", (p) =>
-        h(p.data, p.mimeType, p.sentenceIndex)
+      await tauriListen<{ data: string; mimeType: string; codec?: string; sampleRate?: number; sentenceIndex?: number }>("tts_audio_chunk", (p) =>
+        h(p.data, p.mimeType, p.codec ?? "", p.sampleRate ?? 0, p.sentenceIndex)
       )
     );
   }

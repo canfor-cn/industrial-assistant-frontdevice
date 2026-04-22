@@ -1,6 +1,6 @@
 use crate::audio_handler;
 use crate::events::*;
-use crate::ws_protocol::UpstreamMessage;
+use crate::ws_protocol::{self, UpstreamMessage};
 use base64::Engine;
 use crossbeam_channel::Sender;
 use std::net::TcpListener;
@@ -338,6 +338,85 @@ fn handle_device_message(
         "device_state" => {
             // Forward device state to WebView for status panel
             let _ = app.emit("device_state", &msg.extra);
+        }
+
+        // Qwen-Omni-Realtime 流式协议：直接透传到后端（不累积、不聚合）
+        "audio_stream_start" => {
+            let mime = msg.extra.get("mimeType").and_then(|v| v.as_str()).unwrap_or("audio/pcm").to_string();
+            let codec = msg.extra.get("codec").and_then(|v| v.as_str()).unwrap_or("pcm_s16le").to_string();
+            let sample_rate = msg.extra.get("sampleRate").and_then(|v| v.as_u64()).unwrap_or(16000) as u32;
+            let channels = msg.extra.get("channels").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+            let language = msg.extra.get("language").and_then(|v| v.as_str()).map(String::from);
+            tracing::info!(trace_id = %trace_id, "Device audio_stream_start → backend");
+            let _ = ws_tx.send(UpstreamMessage::AudioStreamStart {
+                trace_id,
+                device_id: device_id.to_string(),
+                mime_type: mime,
+                codec,
+                sample_rate,
+                channels,
+                language,
+                timestamp: ws_protocol::now_ts(),
+            });
+        }
+
+        "audio_stream_chunk" => {
+            let data = msg.extra.get("data").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let seq = msg.extra.get("seq").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            if data.is_empty() { return; }
+            let _ = ws_tx.send(UpstreamMessage::AudioStreamChunk {
+                trace_id,
+                device_id: device_id.to_string(),
+                seq,
+                data,
+                timestamp: ws_protocol::now_ts(),
+            });
+        }
+
+        "audio_stream_stop" => {
+            let reason = msg.extra.get("reason").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+            tracing::info!(trace_id = %trace_id, reason = %reason, "Device audio_stream_stop → backend");
+            let _ = ws_tx.send(UpstreamMessage::AudioStreamStop {
+                trace_id,
+                device_id: device_id.to_string(),
+                reason,
+                timestamp: ws_protocol::now_ts(),
+            });
+        }
+
+        "greeting" => {
+            tracing::info!("Device greeting → backend");
+            let _ = ws_tx.send(UpstreamMessage::Greeting {
+                device_id: device_id.to_string(),
+                timestamp: ws_protocol::now_ts(),
+            });
+        }
+
+        "timeout_exit" => {
+            let reason = msg.extra.get("reason").and_then(|v| v.as_str()).unwrap_or("exit").to_string();
+            let _ = ws_tx.send(UpstreamMessage::TimeoutExit {
+                device_id: device_id.to_string(),
+                reason,
+                timestamp: ws_protocol::now_ts(),
+            });
+        }
+
+        "user_speech_end" => {
+            tracing::info!(trace_id = %trace_id, "Device user_speech_end → backend");
+            let _ = ws_tx.send(UpstreamMessage::UserSpeechEnd {
+                trace_id,
+                device_id: device_id.to_string(),
+                timestamp: ws_protocol::now_ts(),
+            });
+        }
+
+        "barge_in" => {
+            tracing::info!(trace_id = %trace_id, "Device barge_in → backend (cancel response)");
+            let _ = ws_tx.send(UpstreamMessage::BargeIn {
+                trace_id,
+                device_id: device_id.to_string(),
+                timestamp: ws_protocol::now_ts(),
+            });
         }
 
         "ping" => {

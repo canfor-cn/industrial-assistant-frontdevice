@@ -206,11 +206,15 @@ def network_sender():
             log_counter = getattr(network_sender, "log_counter", 0) + 1
             if log_counter % 5 == 0 and not is_streaming:
                 print(f"🎙️ [校准用] 当前环境底噪 RMS: {rms_energy:.1f}      ", end='\r')
+            # 推流时也打印 RMS（每 5 帧≈1s），辅助诊断 realtime 模式下为何 Qwen 听不到
+            if log_counter % 5 == 0 and is_streaming:
+                print(f"🎙️ [推流] RMS: {rms_energy:.1f}")
             network_sender.log_counter = log_counter
-            
+
             # RMS 物理能量门限：低于此值直接判静默（跳过 Silero VAD 推理节省 CPU）
             # XVF3800 WASAPI 16kHz AEC 通道底噪通常 200-800，说话时 1000-5000+
-            RMS_THRESHOLD = 300.0
+            # Realtime 模式下略放宽到 150，让更弱的声音也能送到 Qwen 服务端 VAD 判断
+            RMS_THRESHOLD = 150.0
 
             if rms_energy < RMS_THRESHOLD:
                 vad_active = False

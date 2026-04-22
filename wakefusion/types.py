@@ -265,6 +265,17 @@ class AudioThresholdConfig(BaseModel):
     change_timeout_ms: int = 100  # 阈值修改指令超时（毫秒）
 
 
+class AudioFilterConfig(BaseModel):
+    """realtime 模式下的前置噪音门控（四层过滤）"""
+    enabled: bool = True  # 主开关，False 时所有门控失效（退回原逻辑）
+    rms_threshold: float = 316.0  # RMS 下限（int16 尺度），~50dB；低于此值判定为安静不推流
+    max_distance_m: float = 3.0   # 最大距离：人脸距离摄像头超过此值不推流
+    require_face: bool = True     # 是否要求画面有人脸才推流
+    require_frontal: bool = True  # 是否要求人脸正向（在画面中心区）
+    frontal_tolerance_pct: float = 30.0  # 人脸中心偏离画面中心 ≤ 此百分比算正向（0-50）
+    log_interval_sec: float = 1.0 # 门控丢帧统计的日志打印周期（秒）
+
+
 class ConversationConfig(BaseModel):
     """持续对话配置"""
     vad_silence_timeout_default_sec: float = 5.0  # 宏观超时（秒）：纯语音唤醒模式下，5秒无语音则结束对话
@@ -333,6 +344,7 @@ class LLMAgentConfig(BaseModel):
     use_ssl: bool = False  # 是否使用SSL（true for wss://, false for ws://）
     reconnect_interval_sec: float = 5.0  # 断线重连间隔（秒）
     ping_interval_sec: float = 30.0  # 保活ping间隔（秒）
+    realtime_mode: bool = False  # 启用 Qwen-Omni-Realtime 流式协议（audio_stream_*），跳过本地 VAD 分段
     
     # 火山引擎API配置（可选，如果使用火山引擎LLM Agent）
     volcano_api_url: Optional[str] = None  # 火山引擎API地址
@@ -365,6 +377,7 @@ class AppConfig(BaseModel):
     zmq: ZMQConfig = Field(default_factory=ZMQConfig)
     vision_wake: VisionWakeConfig = Field(default_factory=VisionWakeConfig)
     audio_threshold: AudioThresholdConfig = Field(default_factory=AudioThresholdConfig)
+    audio_filter: AudioFilterConfig = Field(default_factory=AudioFilterConfig)
     conversation: ConversationConfig = Field(default_factory=ConversationConfig)
     asr: ASRConfig = Field(default_factory=ASRConfig)
     tts: TTSConfig = Field(default_factory=TTSConfig)

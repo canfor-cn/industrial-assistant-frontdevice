@@ -38,6 +38,8 @@ import { isPlayableMedia as isPlayableMediaCheck } from "./media/types";
 import type { MediaRef as MediaRefType } from "./media/types";
 import { useSyncedSubtitle } from "./useSyncedSubtitle";
 import { useUnityBridge } from "./useUnityBridge";
+import { PCMStreamPlayer } from "./pcmStreamPlayer";
+import { WebRTCClient } from "./webrtcClient";
 
 interface MediaRef {
   assetId: string;
@@ -127,10 +129,10 @@ declare global {
 export default function App() {
   const relayUrl = (import.meta.env.VITE_WAKEFUSION_RELAY_URL as string | undefined) ?? "";
   const directWsUrlDefault = (() => {
-    if (typeof window === "undefined") return "ws://127.0.0.1:7788/api/voice/ws";
+    if (typeof window === "undefined") return "ws://127.0.0.1:7790/api/voice/ws";
     const { protocol, hostname } = window.location;
     const wsProtocol = protocol === "https:" ? "wss:" : "ws:";
-    return `${wsProtocol}//${hostname || "127.0.0.1"}:7788/api/voice/ws`;
+    return `${wsProtocol}//${hostname || "127.0.0.1"}:7790/api/voice/ws`;
   })();
 
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -252,6 +254,35 @@ export default function App() {
   const phoneCallNodeRef = useRef<ScriptProcessorNode | null>(null);
   const phoneCallTraceIdRef = useRef<string>("");
   const phoneCallSeqRef = useRef<number>(0);
+  // AEC 模式：浏览器（非 Tauri）环境启用 MediaStream 输出 + <audio> 播放，让浏览器 AEC 识别自播放做回声消除
+  // 临时关闭（通过 localStorage 开关 wakefusion.enableWebAec=1 恢复）——排查 AEC 导致麦克风收到静音的副作用
+  const pcmPlayerRef = useRef<PCMStreamPlayer>(new PCMStreamPlayer({
+    aecMode: !isTauriEnv() && typeof localStorage !== "undefined" && localStorage.getItem("wakefusion.enableWebAec") === "1",
+  }));
+  const aecAudioRef = useRef<HTMLAudioElement>(null);
+  const aecBoundRef = useRef(false);
+  // Web 电话半双工：TTS 播放期间上行改发静音 PCM，防止扬声器回声触发 Qwen server_vad
+  const ttsPlayingRef = useRef(false);
+  const ttsTailUntilRef = useRef(0);
+  // WebRTC loopback 测试（PR 1）：验证浏览器 AEC 真的工作
+  const webrtcClientRef = useRef<WebRTCClient | null>(null);
+  const webrtcAudioRef = useRef<HTMLAudioElement>(null);
+  const [isWebrtcTest, setIsWebrtcTest] = useState(false);
+  // WebRTC 全双工对话（PR 2）：接入 Qwen
+  const [isWebrtcCall, setIsWebrtcCall] = useState(false);
+  const webrtcCtrlWsRef = useRef<WebSocket | null>(null);
+
+  // 确保 pcmPlayer 的 MediaStream 已经绑到隐藏 <audio> 元素（浏览器 AEC 路径所需）
+  function ensureAecBound(sampleRate: number) {
+    if (isTauriEnv() || aecBoundRef.current) return;
+    pcmPlayerRef.current.begin(sampleRate);
+    const out = pcmPlayerRef.current.getOutputStream();
+    if (out && aecAudioRef.current) {
+      aecAudioRef.current.srcObject = out;
+      void aecAudioRef.current.play().catch(() => { /* 需要用户手势，稍后再试 */ });
+      aecBoundRef.current = true;
+    }
+  }
   const currentTraceRef = useRef<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const subtitleScrollRef = useRef<HTMLDivElement>(null);
@@ -416,6 +447,26 @@ export default function App() {
       },
       onSentencePackDone: () => {
         if (!cancelled) syncSub.signalPacksDone();
+      },
+      onTtsAudioBegin: (_mimeType, codec, sampleRate) => {
+        if (cancelled) return;
+        if (codec === "pcm_s16le" && sampleRate > 0) {
+          ensureAecBound(sampleRate);
+          pcmPlayerRef.current.begin(sampleRate);
+        }
+      },
+      onTtsAudioChunk: (data, _mimeType, codec, sampleRate) => {
+        if (cancelled) return;
+        if (codec === "pcm_s16le" && sampleRate > 0) {
+          const bytes = decodeBase64ToBytes(data);
+          pcmPlayerRef.current.push(
+            bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+            sampleRate,
+          );
+        }
+      },
+      onTtsAudioEnd: () => {
+        // Realtime 流式无需关闭（下一段 begin 会重置）；cascade 模式下播放队列自然结束
       },
       onMediaControl: (action, _message) => {
         if (!cancelled) applyMediaControl(action);
@@ -727,7 +778,7 @@ export default function App() {
     if (action === "replay_last") {
       return replayLastMedia() ? "好的，我已经为您重新播放刚刚的媒体内容。" : "当前没有可重播的媒体。";
     }
-    if (action === "return_avatar") {
+    if (action === "return_avatar" || action === "stop" || action === "pause") {
       returnToAvatar("stopped");
       return "好的，已经切回数字人讲解。";
     }
@@ -848,17 +899,28 @@ export default function App() {
           return;
         }
         if (data.type === "audio_begin") {
-          // audio_begin: no action needed, audio chunks go to sync hook
+          if (data.codec === "pcm_s16le" && typeof data.sampleRate === "number") {
+            ensureAecBound(data.sampleRate);
+            pcmPlayerRef.current.begin(data.sampleRate);
+          }
+          ttsPlayingRef.current = true;
           return;
         }
         if (data.type === "audio_chunk" && typeof data.data === "string") {
           const chunk = decodeBase64ToBytes(data.data);
-          const sentenceIndex = typeof data.sentenceIndex === "number" ? data.sentenceIndex : 0;
-          syncSub.pushAudioChunk(sentenceIndex, chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength));
+          const buf = chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength);
+          if (data.codec === "pcm_s16le" && typeof data.sampleRate === "number") {
+            pcmPlayerRef.current.push(buf, data.sampleRate);
+          } else {
+            const sentenceIndex = typeof data.sentenceIndex === "number" ? data.sentenceIndex : 0;
+            syncSub.pushAudioChunk(sentenceIndex, buf);
+          }
           return;
         }
         if (data.type === "audio_end") {
           syncSub.signalAudioEnd();
+          ttsPlayingRef.current = false;
+          ttsTailUntilRef.current = Date.now() + 500; // TTS 尾音保护 500ms，防扬声器衰减声被捕获
           return;
         }
         if (data.type === "sentence_boundary" && data.text) {
@@ -908,6 +970,7 @@ export default function App() {
         if (data.type === "stop_tts") {
           unityBridge.interrupt();
           syncSub.reset();
+          pcmPlayerRef.current.interrupt();
           setConnectionStatus("播放已打断");
           return;
         }
@@ -1129,9 +1192,21 @@ export default function App() {
     try {
       const socket = await ensureAssistantSocket();
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true },
+        audio: {
+          sampleRate: 16000,
+          channelCount: 1,
+          // AEC 开关默认关（会导致麦克风采集变静音）；开 Web AEC 时通过 localStorage wakefusion.enableWebAec=1
+          echoCancellation: localStorage.getItem("wakefusion.enableWebAec") === "1",
+          noiseSuppression: true,
+          autoGainControl: false,
+        },
       });
       phoneCallStreamRef.current = stream;
+
+      // AEC 准备：让 pcmPlayer 的 MediaStream 输出绑到 <audio> 元素，
+      // 浏览器 AEC 才能把"我方 TTS 输出"从麦克风输入里扣除回声
+      // 电话按钮点击本身就是用户手势，audio.play() 此时一定成功
+      ensureAecBound(24000);
 
       // Create AudioContext at target sample rate if possible; otherwise use default and resample.
       const ctx = new AudioContext({ sampleRate: 16000 });
@@ -1148,6 +1223,7 @@ export default function App() {
       phoneCallSeqRef.current = 0;
 
       // Send stream_start
+      console.log("[phone] AudioContext sampleRate =", ctx.sampleRate);
       socket.send(JSON.stringify({
         type: "audio_stream_start",
         traceId,
@@ -1162,12 +1238,25 @@ export default function App() {
       processor.onaudioprocess = (ev) => {
         if (!phoneCallNodeRef.current) return;
         const float32 = ev.inputBuffer.getChannelData(0);
-        // Float32 → Int16 PCM
-        const pcm = new Int16Array(float32.length);
-        for (let i = 0; i < float32.length; i++) {
-          const s = Math.max(-1, Math.min(1, float32[i]));
-          pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        // Diagnostic: compute RMS every ~20 chunks (~2.5s)
+        if (phoneCallSeqRef.current % 20 === 0) {
+          let sum = 0;
+          for (let i = 0; i < float32.length; i++) sum += float32[i] * float32[i];
+          const rms = Math.sqrt(sum / float32.length);
+          console.log(`[phone] seq=${phoneCallSeqRef.current} rms=${rms.toFixed(4)} len=${float32.length}`);
         }
+        // 🔇 半双工：TTS 播放期间 + 尾音 500ms 内，上行改发静音 PCM
+        // 防止扬声器回声被 Qwen server_vad 误当成用户说话触发 barge-in 循环
+        const mute = ttsPlayingRef.current || Date.now() < ttsTailUntilRef.current;
+        // Float32 → Int16 PCM（mute 时直接零）
+        const pcm = new Int16Array(float32.length);
+        if (!mute) {
+          for (let i = 0; i < float32.length; i++) {
+            const s = Math.max(-1, Math.min(1, float32[i]));
+            pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+          }
+        }
+        // mute=true 时 pcm 保持全 0（Int16Array 默认 0）
         // Int16Array → base64
         const bytes = new Uint8Array(pcm.buffer);
         let binary = "";
@@ -1213,6 +1302,7 @@ export default function App() {
     try { phoneCallNodeRef.current?.disconnect(); } catch { /* ignore */ }
     try { phoneCallCtxRef.current?.close(); } catch { /* ignore */ }
     try { phoneCallStreamRef.current?.getTracks().forEach((t) => t.stop()); } catch { /* ignore */ }
+    pcmPlayerRef.current.interrupt();
     phoneCallNodeRef.current = null;
     phoneCallCtxRef.current = null;
     phoneCallStreamRef.current = null;
@@ -1220,6 +1310,117 @@ export default function App() {
     phoneCallSeqRef.current = 0;
     setIsPhoneCall(false);
     setConnectionStatus("电话已挂断");
+  }
+
+  // ── WebRTC Loopback 测试（PR 1）────────────────────────────────────
+  async function startWebrtcTest(): Promise<void> {
+    if (isWebrtcTest) return;
+    if (isTauriEnv()) {
+      setConnectionStatus("Tauri 模式不支持 WebRTC 测试");
+      return;
+    }
+    try {
+      // 后端 HTTP base：去掉 /api/voice/ws 这种 ws 路径，只要 origin
+      const wsUrl = directWsBaseUrl;
+      const httpBase = wsUrl.replace(/^ws:/, "http:").replace(/^wss:/, "https:").replace(/\/api\/voice\/ws.*$/, "");
+      const client = new WebRTCClient({
+        backendHttpUrl: httpBase,
+        onConnected: () => setConnectionStatus("WebRTC 已连接（loopback）"),
+        onClosed: (r) => setConnectionStatus(`WebRTC 已断开：${r}`),
+        onError: (e) => setConnectionStatus(`WebRTC 错误：${e.message}`),
+        onRemoteStream: (stream) => {
+          if (webrtcAudioRef.current) {
+            webrtcAudioRef.current.srcObject = stream;
+            void webrtcAudioRef.current.play().catch(() => {});
+          }
+        },
+      });
+      webrtcClientRef.current = client;
+      await client.start();
+      setIsWebrtcTest(true);
+      setConnectionStatus("WebRTC 协商完成，说话测试自己听");
+    } catch (err) {
+      setConnectionStatus(err instanceof Error ? err.message : "WebRTC 启动失败");
+      webrtcClientRef.current?.stop();
+      webrtcClientRef.current = null;
+    }
+  }
+
+  function stopWebrtcTest(): void {
+    webrtcClientRef.current?.stop();
+    webrtcClientRef.current = null;
+    if (webrtcAudioRef.current) webrtcAudioRef.current.srcObject = null;
+    setIsWebrtcTest(false);
+    setConnectionStatus("WebRTC 测试已停止");
+  }
+
+  // ── WebRTC 全双工对话（PR 2）：接入 Qwen ────────────────────────────
+  async function startWebrtcCall(): Promise<void> {
+    if (isWebrtcCall) return;
+    if (isTauriEnv()) { setConnectionStatus("Tauri 模式不支持 WebRTC 对话"); return; }
+    try {
+      const wsUrl = directWsBaseUrl;
+      const httpBase = wsUrl.replace(/^ws:/, "http:").replace(/^wss:/, "https:").replace(/\/api\/voice\/ws.*$/, "");
+      const deviceId = directDeviceId.trim() || `browser-${Math.random().toString(36).slice(2, 10)}`;
+
+      // 先建控制 WS，收 media_ref / media_control / media_duck 等下行
+      const ctrlWsUrl = wsUrl.replace(/\/api\/voice\/ws.*$/, `/api/voice/webrtc/control/ws?deviceId=${encodeURIComponent(deviceId)}`);
+      const ctrlWs = new WebSocket(ctrlWsUrl);
+      webrtcCtrlWsRef.current = ctrlWs;
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("control ws connect timeout")), 5000);
+        ctrlWs.onopen = () => { clearTimeout(timer); resolve(); };
+        ctrlWs.onerror = () => { clearTimeout(timer); reject(new Error("control ws connect failed")); };
+      });
+      ctrlWs.onmessage = (ev) => {
+        try {
+          const data = JSON.parse(ev.data);
+          if (data.type === "media_ref") {
+            const ref = normalizeMediaRef(data);
+            if (isPlayableMediaCheck(ref.assetType)) {
+              mediaQueueRef.current.push(ref as MediaRefType, data.traceId || deviceId);
+            }
+          } else if (data.type === "media_control") {
+            applyMediaControl(typeof data.action === "string" ? data.action : undefined);
+          } else if (data.type === "media_duck") {
+            if (data.action === "duck") setStageMediaVolume(typeof data.level === "number" ? data.level : 0.1);
+            else if (data.action === "restore") setStageMediaVolume(typeof data.level === "number" ? data.level : 1);
+          }
+        } catch { /* ignore */ }
+      };
+
+      const client = new WebRTCClient({
+        backendHttpUrl: httpBase,
+        endpoint: "/api/voice/webrtc/offer",
+        deviceId,
+        onConnected: () => setConnectionStatus("WebRTC 对话已接通（和 Qwen 说话）"),
+        onClosed: (r) => setConnectionStatus(`WebRTC 已断开：${r}`),
+        onError: (e) => setConnectionStatus(`WebRTC 错误：${e.message}`),
+        onRemoteStream: (stream) => {
+          if (webrtcAudioRef.current) {
+            webrtcAudioRef.current.srcObject = stream;
+            void webrtcAudioRef.current.play().catch(() => {});
+          }
+        },
+      });
+      webrtcClientRef.current = client;
+      await client.start();
+      setIsWebrtcCall(true);
+    } catch (err) {
+      setConnectionStatus(err instanceof Error ? err.message : "WebRTC 对话启动失败");
+      webrtcClientRef.current?.stop();
+      webrtcClientRef.current = null;
+    }
+  }
+
+  function stopWebrtcCall(): void {
+    webrtcClientRef.current?.stop();
+    webrtcClientRef.current = null;
+    try { webrtcCtrlWsRef.current?.close(); } catch { /* ignore */ }
+    webrtcCtrlWsRef.current = null;
+    if (webrtcAudioRef.current) webrtcAudioRef.current.srcObject = null;
+    setIsWebrtcCall(false);
+    setConnectionStatus("WebRTC 对话已结束");
   }
 
   function decodeBase64ToBytes(data: string) {
@@ -1485,6 +1686,10 @@ export default function App() {
 
   return (
     <div className="app-shell" ref={appShellRef}>
+      {/* AEC 辅助：隐藏的 <audio> 播放 pcmPlayer 的 MediaStream 输出，让浏览器 AEC 识别 */}
+      <audio ref={aecAudioRef} autoPlay playsInline style={{ display: "none" }} />
+      {/* WebRTC 测试：隐藏 <audio> 播放 RTCPeerConnection 的 remote stream（浏览器 AEC 自动生效） */}
+      <audio ref={webrtcAudioRef} autoPlay playsInline style={{ display: "none" }} />
       {/* Setup progress overlay */}
       {setupProgress && !setupProgress.done && (
         <div className="setup-overlay">
@@ -1662,6 +1867,26 @@ export default function App() {
               </button>
               <button type="button" className="keyboard-toggle" onClick={() => setShowTextInput(true)} title="文字输入">
                 <Keyboard className="h-5 w-5" />
+              </button>
+              <button
+                type="button"
+                className={`phone-button ${isWebrtcTest ? "is-active" : ""}`}
+                onClick={() => void (isWebrtcTest ? stopWebrtcTest() : startWebrtcTest())}
+                disabled={isRecording || isPhoneCall || isWebrtcCall}
+                title={isWebrtcTest ? "结束 WebRTC 测试" : "WebRTC Loopback 测试（PR1）"}
+                style={{ background: isWebrtcTest ? "#8b5cf6" : undefined }}
+              >
+                <span>{isWebrtcTest ? "RTC停止" : "RTC测试"}</span>
+              </button>
+              <button
+                type="button"
+                className={`phone-button ${isWebrtcCall ? "is-active" : ""}`}
+                onClick={() => void (isWebrtcCall ? stopWebrtcCall() : startWebrtcCall())}
+                disabled={isRecording || isPhoneCall || isWebrtcTest}
+                title={isWebrtcCall ? "结束 WebRTC 对话" : "WebRTC 全双工对话（PR2，Qwen）"}
+                style={{ background: isWebrtcCall ? "#10b981" : undefined }}
+              >
+                <span>{isWebrtcCall ? "RTC挂断" : "RTC对话"}</span>
               </button>
             </>
           )}

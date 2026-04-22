@@ -56,6 +56,7 @@ class CoreServer:
         self.zmq_config = self.config.zmq
         self.vision_wake_config = self.config.vision_wake
         self.audio_threshold_config = self.config.audio_threshold
+        self.audio_filter_config = self.config.audio_filter
         self.conversation_config = self.config.conversation
         self.llm_agent_config = self.config.llm_agent
         self.audio_playback_config = self.config.audio_playback
@@ -588,7 +589,7 @@ class CoreServer:
             # Rust 前端正在播放 TTS — 保持交互模式，刷新活动时间
             self.is_playing_tts = True
             self._last_speech_time = time.time()
-            logger.debug("🔊 [持续对话] TTS 播放中，保持交互模式")
+            logger.info("🔊 [持续对话] TTS 播放中，保持交互模式")
         elif msg_type == "tts_idle":
             # Rust 前端 TTS 播完 — 开始等待用户下一句话
             self.is_playing_tts = False
@@ -973,13 +974,18 @@ class CoreServer:
             
             # 如果正在交互，需要发送结束标记并停止音频推流
             if self.is_interactive_mode:
+                realtime_mode = getattr(self.llm_agent_config, "realtime_mode", False)
                 if use_abort:
                     # 发送interrupt消息给服务端
                     if self._current_trace_id:
                         self._send_interrupt(reason="abort")
+                    if realtime_mode and self._current_trace_id:
+                        self._send_audio_stream_stop(self._current_trace_id, "abort")
                 else:
-                    # 发送audio_end消息
-                    if self._current_trace_id:
+                    if realtime_mode and self._current_trace_id:
+                        self._send_audio_stream_stop(self._current_trace_id, "session_exit")
+                    elif self._current_trace_id:
+                        # Cascade: 发送 audio_segment_end
                         self._send_audio_segment_end(self._current_trace_id, "vad_timeout")
                 
             # 重置对话上下文
@@ -1057,6 +1063,18 @@ class CoreServer:
             # 如果是进入免唤醒持续对话或视觉直接触发，必须主动通知音频底层拉起流模式
             if wake_path in ("持续对话", "视觉直接触发"):
                 self._send_start_streaming_command()
+
+            # 🌟 Realtime 流式协议：进入交互立即开 stream（不等 VAD 触发）
+            if getattr(self.llm_agent_config, "realtime_mode", False):
+                self._current_trace_id = str(uuid.uuid4())
+                logger.info(f"🎙️ [Realtime] 进入交互立即开流 traceId={self._current_trace_id}")
+                self._send_audio_stream_start(self._current_trace_id, 16000)
+                # 重置状态机：首轮 LISTENING 等用户开口
+                self._rt_state = "LISTENING"
+                self._rt_vad_false_since = None
+                self._rt_vad_true_since = None
+                self._rt_last_tts_playing = False
+                self._rt_thinking_since = None
 
             # 🌟 视觉直接触发：主动问候 "你好，我是小慧"（带 60 秒冷却防止重复）
             if wake_path == "视觉直接触发":
@@ -1144,6 +1162,62 @@ class CoreServer:
             "reason": reason,
             "timestamp": time.time()
         })
+
+    # ===== Qwen-Omni-Realtime 流式协议（realtime_mode=True 时使用）=====
+    def _send_audio_stream_start(self, trace_id: str, sample_rate: int = 16000):
+        self._current_audio_seq = 0
+        self._send_websocket_message({
+            "type": "audio_stream_start",
+            "traceId": trace_id,
+            "deviceId": self.llm_agent_config.device_id,
+            "mimeType": "audio/pcm",
+            "codec": "pcm_s16le",
+            "sampleRate": sample_rate,
+            "channels": 1,
+            "language": "zh",
+            "timestamp": time.time()
+        })
+
+    def _send_audio_stream_chunk(self, trace_id: str, audio_data: bytes):
+        """发送 audio_stream_chunk 到后端（仅在状态机 LISTENING 状态调用）"""
+        self._send_websocket_message({
+            "type": "audio_stream_chunk",
+            "traceId": trace_id,
+            "deviceId": self.llm_agent_config.device_id,
+            "seq": self._current_audio_seq,
+            "data": base64.b64encode(audio_data).decode("ascii"),
+            "timestamp": time.time()
+        })
+        self._current_audio_seq += 1
+        # 历史的诊断双发（audio_segment 做 ASR 打 log）已移除：
+        # Qwen3.5-Omni-Plus 通过 function calling 调 RAG，不需要本地 ASR 验证
+
+    def _send_user_speech_end(self, trace_id: str):
+        """设备侧 Silero 判定用户说完，通知后端 commit + response.create"""
+        self._send_websocket_message({
+            "type": "user_speech_end",
+            "traceId": trace_id,
+            "deviceId": self.llm_agent_config.device_id,
+            "timestamp": time.time()
+        })
+
+    def _send_barge_in(self, trace_id: str):
+        """设备侧 Silero 判定用户打断 TTS，通知后端 cancel + clear buffer"""
+        self._send_websocket_message({
+            "type": "barge_in",
+            "traceId": trace_id,
+            "deviceId": self.llm_agent_config.device_id,
+            "timestamp": time.time()
+        })
+
+    def _send_audio_stream_stop(self, trace_id: str, reason: str):
+        self._send_websocket_message({
+            "type": "audio_stream_stop",
+            "traceId": trace_id,
+            "deviceId": self.llm_agent_config.device_id,
+            "reason": reason,
+            "timestamp": time.time()
+        })
     
     @staticmethod
     def _pcm_to_wav(pcm_data: bytes, sample_rate: int = 16000, channels: int = 1, bits_per_sample: int = 16) -> bytes:
@@ -1166,6 +1240,9 @@ class CoreServer:
     
     def _handle_vad_end(self):
         """处理VAD结束（句子截断，不退出交互模式）"""
+        # Realtime 模式：Qwen 服务端 VAD 接管分段，本地 VAD 静默不做任何事
+        if getattr(self.llm_agent_config, "realtime_mode", False):
+            return
         # 🌟 核心修复：VAD截断只是划分句子，只发送audio_end并清空trace_id
         # 禁止切断推流和重置冷却期
         if self._current_trace_id:
@@ -1438,6 +1515,55 @@ class CoreServer:
         self._vision_wake_diag_logged = False
         return False
     
+    def _audio_filter_check(self, metadata: dict, audio_binary: bytes) -> str | None:
+        """4 层噪音门控：返回丢弃原因（字符串）或 None（通过）"""
+        import numpy as np
+        cfg = self.audio_filter_config
+
+        # 层 1：RMS 响度门控
+        try:
+            pcm_i16 = np.frombuffer(audio_binary, dtype=np.int16)
+            if len(pcm_i16) > 0:
+                rms = float(np.sqrt(np.mean(pcm_i16.astype(np.float32) ** 2)))
+                if rms < cfg.rms_threshold:
+                    return f"rms_low({rms:.0f}<{cfg.rms_threshold:.0f})"
+        except Exception:
+            pass  # RMS 计算失败不阻断
+
+        # 层 2：距离门控
+        dist = getattr(self, '_last_vision_distance', None)
+        if dist is not None and dist > cfg.max_distance_m:
+            return f"too_far({dist:.2f}m>{cfg.max_distance_m:.1f}m)"
+
+        # 层 3：人脸在位
+        faces = getattr(self, '_last_vision_faces', 0)
+        if cfg.require_face and faces == 0:
+            return "no_face"
+
+        # 层 4：正向判定（人脸中心在画面中心 ±tolerance%）
+        if cfg.require_frontal and faces > 0:
+            center_x_pct = getattr(self, '_last_face_center_x_pct', None)
+            if center_x_pct is not None:
+                deviation = abs(center_x_pct - 50.0)  # 画面中心是 50%
+                if deviation > cfg.frontal_tolerance_pct:
+                    return f"off_center({deviation:.0f}%>{cfg.frontal_tolerance_pct:.0f}%)"
+
+        return None  # 通过
+
+    def _audio_filter_log_drop(self, reason: str):
+        """门控丢帧统计日志：每 log_interval_sec 打印一次聚合日志"""
+        now = time.time()
+        if not hasattr(self, '_filter_drop_counts'):
+            self._filter_drop_counts = {}
+            self._filter_last_log_ts = 0.0
+        self._filter_drop_counts[reason] = self._filter_drop_counts.get(reason, 0) + 1
+        interval = getattr(self.audio_filter_config, 'log_interval_sec', 1.0)
+        if now - self._filter_last_log_ts >= interval:
+            summary = ", ".join(f"{k}={v}" for k, v in self._filter_drop_counts.items())
+            logger.debug(f"🔇 [噪音门控] 最近{interval:.1f}s丢帧: {summary}")
+            self._filter_drop_counts = {}
+            self._filter_last_log_ts = now
+
     def _process_vision_data(self, vision_data: dict):
         """处理视觉数据（纯传感器数据，业务逻辑在core_server中处理）"""
         faces = vision_data.get("faces", [])
@@ -1447,6 +1573,18 @@ class CoreServer:
         # 缓存最新视觉状态（供 _report_device_state 使用）
         self._last_vision_faces = len(faces)
         self._last_vision_distance = distance_m
+
+        # 🔒 Audio filter 用：提取最近人脸的中心水平位置 + 正向度
+        # bbox 是归一化坐标 (x,y,w,h) 0-1，face_center_x_pct = (x + w/2) * 100
+        self._last_face_center_x_pct = None  # 0-100；None 表示无人脸
+        self._last_face_frontal_pct = None   # 0-100；None 表示无人脸
+        if faces:
+            # 取最大的一张脸（离得最近）
+            largest = max(faces, key=lambda f: f.get("w", 0) * f.get("h", 0))
+            bx = float(largest.get("x", 0.0))
+            bw = float(largest.get("w", 0.0))
+            self._last_face_center_x_pct = (bx + bw / 2.0) * 100.0
+            self._last_face_frontal_pct = float(largest.get("frontal_percent", 0.0))
         
         # 🌟 增加视觉流实时诊断日志，让用户看清摄像头每秒的真实判定
         if not hasattr(self, '_diag_last_lip') or self._diag_last_lip != is_talking:
@@ -1618,7 +1756,7 @@ class CoreServer:
     def _process_audio_data(self, metadata: dict, audio_binary: bytes):
         """处理音频数据"""
         current_time = time.time()
-        
+
         # 🛡️ 护盾拦截：如果在无敌时间内，直接丢弃 VAD 和 打断 信号！
         if current_time < getattr(self, '_ignore_audio_until', 0.0):
             # 🌟 核心修复：护盾期间同步刷新所有静音计时器，防止刚出护盾就瞬间超时！
@@ -1667,7 +1805,9 @@ class CoreServer:
             # 不 return，继续往下走正常 VAD → audio forwarding 流程
             # 依赖：后端 likelyEcho 过滤 TTS 回声，LLM DECISION:ignore 过滤噪音
             vad_now = metadata.get("vad", False)
-            if vad_now and not self._user_has_spoken:
+            # 🔒 realtime_mode：跳过此处的软打断逻辑，barge-in 由状态机统一处理（_realtime_step 的 SPEAKING 态）
+            # 否则会和 realtime 状态机打架，cancel 掉 Qwen 刚开始的 response
+            if vad_now and not self._user_has_spoken and not getattr(self.llm_agent_config, "realtime_mode", False):
                 logger.info("🗣️ [持续对话] TTS 播放中检测到用户说话，触发软打断，交由后端判定")
                 self._stop_tts_playback()
                 self._send_interrupt(reason="continuous_barge_in")
@@ -1925,7 +2065,98 @@ class CoreServer:
         
         # 当前句子在统一 WS 中以 JSON 文本帧持续上传。
         if self.is_interactive_mode and self._current_trace_id:
-            self._send_audio_segment_chunk(self._current_trace_id, audio_binary)
+            if getattr(self.llm_agent_config, "realtime_mode", False):
+                # Realtime 模式：Silero 独裁状态机
+                self._realtime_step(metadata, audio_binary, current_time)
+            else:
+                self._send_audio_segment_chunk(self._current_trace_id, audio_binary)
+
+    def _realtime_step(self, metadata: dict, audio_binary: bytes, now: float):
+        """
+        Realtime manual 模式状态机（Silero 独裁）：
+        LISTENING → THINKING → SPEAKING → (tts_idle / barge-in) LISTENING
+        """
+        if not hasattr(self, '_rt_state'):
+            self._rt_state = "LISTENING"
+            self._rt_vad_false_since = None  # LISTENING 态下进入静默的时刻
+            self._rt_vad_true_since = None   # SPEAKING 态下检测到用户语音的时刻
+            self._rt_last_tts_playing = False
+            self._rt_thinking_since = None   # THINKING 态开始时刻（fallback 超时用）
+
+        vad = bool(metadata.get("vad", False))
+        tts_playing = self.is_playing_tts
+
+        # —— TTS 状态边沿：tts_playing=True 进 SPEAKING，tts_playing=False 出到 LISTENING
+        if tts_playing and not self._rt_last_tts_playing:
+            self._rt_state = "SPEAKING"
+            self._rt_vad_true_since = None
+            self._rt_thinking_since = None
+            logger.info("🎯 [RT] → SPEAKING (TTS 开始)")
+        elif not tts_playing and self._rt_last_tts_playing:
+            # TTS 结束：进入 LISTENING 等下一句
+            self._rt_state = "LISTENING"
+            self._rt_vad_false_since = None
+            self._rt_vad_true_since = None
+            self._rt_thinking_since = None
+            logger.info("🎯 [RT] → LISTENING (TTS 结束)")
+        self._rt_last_tts_playing = tts_playing
+
+        # —— THINKING 超时 fallback：Qwen 10s 没有开始 TTS 就强制回 LISTENING
+        # 防止状态机卡死（比如 Qwen 内部 function_call + 补充 response 过程中 tts_playing 消息漏掉）
+        if self._rt_state == "THINKING":
+            if self._rt_thinking_since is None:
+                self._rt_thinking_since = now
+            elif now - self._rt_thinking_since > 10.0:
+                logger.warning("🎯 [RT] ⚠️ THINKING 超时 10s，强制 → LISTENING")
+                self._rt_state = "LISTENING"
+                self._rt_vad_false_since = None
+                self._rt_thinking_since = None
+
+        # —— 按状态处理
+        state = self._rt_state
+
+        # 🔒 4 层噪音门控：只在 LISTENING 态生效
+        # SPEAKING 需要 barge-in 检测；THINKING 等 Qwen 响应无需推流
+        if state == "LISTENING" and getattr(self.audio_filter_config, "enabled", False):
+            drop = self._audio_filter_check(metadata, audio_binary)
+            if drop:
+                self._audio_filter_log_drop(drop)
+                return
+
+        if state == "LISTENING":
+            # 持续推音频给 Qwen；VAD 静默持续 800ms → commit+create
+            self._send_audio_stream_chunk(self._current_trace_id, audio_binary)
+            if vad:
+                self._rt_vad_false_since = None
+            else:
+                if self._rt_vad_false_since is None:
+                    self._rt_vad_false_since = now
+                elif now - self._rt_vad_false_since >= 0.8:
+                    self._rt_state = "THINKING"
+                    self._rt_vad_false_since = None
+                    self._rt_thinking_since = now
+                    logger.info("🎯 [RT] → THINKING (静默 800ms，提交 Qwen)")
+                    self._send_user_speech_end(self._current_trace_id)
+
+        elif state == "THINKING":
+            # 等 Qwen 返回 TTS（由 tts_playing 边沿切 SPEAKING，或 10s 超时回 LISTENING）
+            pass
+
+        elif state == "SPEAKING":
+            # TTS 播放中，监听用户 barge-in
+            if vad:
+                if self._rt_vad_true_since is None:
+                    self._rt_vad_true_since = now
+                elif now - self._rt_vad_true_since >= 0.3:
+                    logger.info("🎯 [RT] ⚡ BARGE-IN! (用户在 TTS 期间说话 >300ms)")
+                    self._send_barge_in(self._current_trace_id)
+                    self._rt_state = "LISTENING"
+                    self._rt_vad_true_since = None
+                    self._rt_vad_false_since = None
+                    # barge-in 之后立即推当前帧给 Qwen，不丢字
+                    self._send_audio_stream_chunk(self._current_trace_id, audio_binary)
+            else:
+                self._rt_vad_true_since = None
     
     def _handle_control_command(self, request: dict) -> dict:
         """

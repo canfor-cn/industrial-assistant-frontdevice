@@ -73,6 +73,72 @@ pub enum UpstreamMessage {
         device_id: String,
         timestamp: f64,
     },
+    // Qwen-Omni-Realtime 流式协议（设备侧 realtime_mode=true 时使用）
+    #[serde(rename = "audio_stream_start")]
+    AudioStreamStart {
+        #[serde(rename = "traceId")]
+        trace_id: String,
+        #[serde(rename = "deviceId")]
+        device_id: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+        codec: String,
+        #[serde(rename = "sampleRate")]
+        sample_rate: u32,
+        channels: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
+        timestamp: f64,
+    },
+    #[serde(rename = "audio_stream_chunk")]
+    AudioStreamChunk {
+        #[serde(rename = "traceId")]
+        trace_id: String,
+        #[serde(rename = "deviceId")]
+        device_id: String,
+        seq: u32,
+        data: String,
+        timestamp: f64,
+    },
+    #[serde(rename = "audio_stream_stop")]
+    AudioStreamStop {
+        #[serde(rename = "traceId")]
+        trace_id: String,
+        #[serde(rename = "deviceId")]
+        device_id: String,
+        reason: String,
+        timestamp: f64,
+    },
+    #[serde(rename = "greeting")]
+    Greeting {
+        #[serde(rename = "deviceId")]
+        device_id: String,
+        timestamp: f64,
+    },
+    #[serde(rename = "timeout_exit")]
+    TimeoutExit {
+        #[serde(rename = "deviceId")]
+        device_id: String,
+        reason: String,
+        timestamp: f64,
+    },
+    // Qwen Realtime manual 模式控制事件（设备侧 Silero 独裁时使用）
+    #[serde(rename = "user_speech_end")]
+    UserSpeechEnd {
+        #[serde(rename = "traceId")]
+        trace_id: String,
+        #[serde(rename = "deviceId")]
+        device_id: String,
+        timestamp: f64,
+    },
+    #[serde(rename = "barge_in")]
+    BargeIn {
+        #[serde(rename = "traceId")]
+        trace_id: String,
+        #[serde(rename = "deviceId")]
+        device_id: String,
+        timestamp: f64,
+    },
 }
 
 /// Messages received from backend WS (parsed from JSON)

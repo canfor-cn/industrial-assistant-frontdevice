@@ -168,8 +168,13 @@ pub async fn run_message_router(
                 let _ = app.emit("tts_audio_begin", serde_json::json!({
                     "traceId": trace_id,
                     "mimeType": msg.mime_type.as_deref().unwrap_or("audio/wav"),
+                    "codec": msg.codec.as_deref().unwrap_or(""),
                     "sampleRate": msg.sample_rate.unwrap_or(22050),
                 }));
+                // Notify device: TTS is playing（realtime 路径也要通知，让设备侧 mute 上行防回声）
+                crate::device_ws_server::send_to_device(
+                    &serde_json::json!({"type": "tts_playing", "traceId": trace_id}).to_string()
+                );
             }
 
             "audio_chunk" => {
@@ -181,6 +186,8 @@ pub async fn run_message_router(
                         "data": data_b64,
                         "seq": msg.seq.unwrap_or(0),
                         "mimeType": msg.mime_type.as_deref().unwrap_or("audio/wav"),
+                        "codec": msg.codec.as_deref().unwrap_or(""),
+                        "sampleRate": msg.sample_rate.unwrap_or(0),
                     });
                     if let Some(si) = sentence_index {
                         payload["sentenceIndex"] = serde_json::json!(si);
@@ -194,6 +201,10 @@ pub async fn run_message_router(
                 let _ = app.emit("tts_audio_end", serde_json::json!({
                     "traceId": trace_id,
                 }));
+                // Notify device: TTS ended（realtime 路径）
+                crate::device_ws_server::send_to_device(
+                    &serde_json::json!({"type": "tts_idle", "traceId": trace_id}).to_string()
+                );
             }
 
             // --- Control messages: always process ---
