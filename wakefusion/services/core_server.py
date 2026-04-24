@@ -2214,13 +2214,13 @@ class CoreServer:
                 rms = 0.0
             filter_cfg = getattr(self, "audio_filter_config", None)
             base_rms = getattr(filter_cfg, "rms_threshold", 316.0) if filter_cfg else 316.0
-            speaking_rms_min = base_rms * 1.8
+            speaking_rms_min = base_rms * 1.3  # P2: 1.8 → 1.3，SPEAKING 态 AEC 后用户声可能弱化，放宽门限
 
             if vad and rms > speaking_rms_min:
                 if self._rt_vad_true_since is None:
                     self._rt_vad_true_since = now
-                elif now - self._rt_vad_true_since >= 0.3:
-                    logger.info(f"🎯 [RT] ⚡ BARGE-IN! (VAD=True, RMS={rms:.0f}>{speaking_rms_min:.0f}, 持续>300ms)")
+                elif now - self._rt_vad_true_since >= 0.15:  # P1: 300ms → 150ms，打断响应更灵敏
+                    logger.info(f"🎯 [RT] ⚡ BARGE-IN! (VAD=True, RMS={rms:.0f}>{speaking_rms_min:.0f}, 持续>150ms)")
                     self._send_barge_in(self._current_trace_id)
                     self._rt_state = "LISTENING"
                     self._rt_vad_true_since = None
