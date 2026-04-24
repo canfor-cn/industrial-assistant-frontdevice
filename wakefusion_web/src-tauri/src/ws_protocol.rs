@@ -139,6 +139,16 @@ pub enum UpstreamMessage {
         device_id: String,
         timestamp: f64,
     },
+    // Auto media duck 请求：LISTENING 态首次真人声时设备侧上行
+    #[serde(rename = "media_duck_request")]
+    MediaDuckRequest {
+        #[serde(rename = "traceId")]
+        trace_id: String,
+        #[serde(rename = "deviceId")]
+        device_id: String,
+        reason: String,
+        timestamp: f64,
+    },
 }
 
 /// Messages received from backend WS (parsed from JSON)

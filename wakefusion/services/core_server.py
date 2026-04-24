@@ -157,6 +157,11 @@ class CoreServer:
         self._vad_silence_start: Optional[float] = None  # VAD静音开始时间
         self._lip_silence_start: Optional[float] = None  # 唇动静音开始时间
         self._interactive_start_time: Optional[float] = None  # 进入交互模式的时间戳
+
+        # Realtime 状态机兜底初始化（真正的重置在 _enter_interactive_mode / _realtime_step 里）
+        self._rt_user_has_spoken: bool = False
+        # 本轮 LISTENING 是否已经发过 auto-duck 请求（防止刷屏；每轮真人声第一次出现时发一次）
+        self._rt_media_duck_pending: bool = False
         
         # PROCESSING超时管理
         self._processing_start_time: float = 0.0
@@ -1075,6 +1080,8 @@ class CoreServer:
                 self._rt_vad_true_since = None
                 self._rt_last_tts_playing = False
                 self._rt_thinking_since = None
+                self._rt_user_has_spoken = False
+                self._rt_media_duck_pending = False
 
             # 🌟 视觉直接触发：主动问候 "你好，我是小慧"（带 60 秒冷却防止重复）
             if wake_path == "视觉直接触发":
@@ -1216,6 +1223,20 @@ class CoreServer:
             "traceId": trace_id,
             "deviceId": self.llm_agent_config.device_id,
             "reason": reason,
+            "timestamp": time.time()
+        })
+
+    def _send_media_duck_request(self):
+        """上行：请求后端通知前端降低正在播放的媒体音量（auto-duck）
+        触发：LISTENING 态首次检测到真人声；本轮只发一次。
+        后端收到后转发 media_duck{action:"duck"} 给前端。不自动恢复，等 Qwen control_media(unduck)。
+        """
+        trace_id = getattr(self, "_current_trace_id", "") or ""
+        self._send_websocket_message({
+            "type": "media_duck_request",
+            "traceId": trace_id,
+            "deviceId": self.llm_agent_config.device_id,
+            "reason": "user_speech_detected",
             "timestamp": time.time()
         })
     
@@ -2082,6 +2103,8 @@ class CoreServer:
             self._rt_vad_true_since = None   # SPEAKING 态下检测到用户语音的时刻
             self._rt_last_tts_playing = False
             self._rt_thinking_since = None   # THINKING 态开始时刻（fallback 超时用）
+            self._rt_user_has_spoken = False # 本轮 LISTENING 内用户是否真开口过（防止空 commit 自回答）
+            self._rt_media_duck_pending = False  # 本轮 LISTENING 是否已发过 media duck 请求
 
         vad = bool(metadata.get("vad", False))
         tts_playing = self.is_playing_tts
@@ -2098,6 +2121,8 @@ class CoreServer:
             self._rt_vad_false_since = None
             self._rt_vad_true_since = None
             self._rt_thinking_since = None
+            self._rt_user_has_spoken = False  # 新一轮 LISTENING：重置开口标记
+            self._rt_media_duck_pending = False  # 新一轮 LISTENING：允许再发一次 duck
             logger.info("🎯 [RT] → LISTENING (TTS 结束)")
         self._rt_last_tts_playing = tts_playing
 
@@ -2111,6 +2136,8 @@ class CoreServer:
                 self._rt_state = "LISTENING"
                 self._rt_vad_false_since = None
                 self._rt_thinking_since = None
+                self._rt_user_has_spoken = False  # 超时回退也算新一轮
+                self._rt_media_duck_pending = False
 
         # —— 按状态处理
         state = self._rt_state
@@ -2124,19 +2151,51 @@ class CoreServer:
                 return
 
         if state == "LISTENING":
-            # 持续推音频给 Qwen；VAD 静默持续 800ms → commit+create
-            self._send_audio_stream_chunk(self._current_trace_id, audio_binary)
-            if vad:
+            # 🔒 补丁 E：LISTENING 态真人声双校验（VAD + RMS）+ user_has_spoken 门槛
+            # 问题背景：TTS 播完后回声/底噪 RMS~1000-1500 会让 Silero 误判 VAD=True/False 抖动，
+            # 原逻辑 "vad=False 持续 800ms 就 commit" 会在沉默期不断触发空 commit，
+            # Qwen 收到空 buffer 凑一句糊弄话 → TTS 回声又触发下一轮 → 自言自语循环。
+            # 解决：真人声 RMS 远高于回声（>5000 vs ~1000），用双校验；并要求本轮"真开口过一次"才允许 silence commit。
+            import numpy as np
+            try:
+                pcm_i16 = np.frombuffer(audio_binary, dtype=np.int16)
+                rms = float(np.sqrt(np.mean(pcm_i16.astype(np.float32) ** 2))) if len(pcm_i16) > 0 else 0.0
+            except Exception:
+                rms = 0.0
+            filter_cfg = getattr(self, "audio_filter_config", None)
+            base_rms = getattr(filter_cfg, "rms_threshold", 316.0) if filter_cfg else 316.0
+            listening_rms_min = base_rms * 5.0   # ~1580, 真人声通常 >5000，回声/底噪 ~1000-1500
+            real_voice = vad and rms >= listening_rms_min
+
+            # 推流策略：真人声帧必推；回声/误判帧不推（避免 Qwen buffer 被污染）
+            # 真静默帧（非 VAD）：如果用户已开口，继续推（让 Qwen 能接到尾巴）；否则不推
+            if real_voice or (self._rt_user_has_spoken and not vad):
+                self._send_audio_stream_chunk(self._current_trace_id, audio_binary)
+
+            if real_voice:
+                if not self._rt_user_has_spoken:
+                    logger.info(f"🎯 [RT] 🗣️ 真人声开始 (VAD=True, RMS={rms:.0f}>={listening_rms_min:.0f})")
+                    # 🔒 Auto media duck：本轮首次检测到真人声 → 通知前端降低媒体音量到 10%
+                    # 让正在播放的视频/音乐给用户让路；之后不会自动恢复（等 Qwen control_media(unduck)）
+                    if not self._rt_media_duck_pending:
+                        logger.info("🔇 [RT] 发送 media_duck_request（用户开口，媒体自动降音）")
+                        self._send_media_duck_request()
+                        self._rt_media_duck_pending = True
+                self._rt_user_has_spoken = True
                 self._rt_vad_false_since = None
             else:
-                if self._rt_vad_false_since is None:
-                    self._rt_vad_false_since = now
-                elif now - self._rt_vad_false_since >= 0.8:
-                    self._rt_state = "THINKING"
-                    self._rt_vad_false_since = None
-                    self._rt_thinking_since = now
-                    logger.info("🎯 [RT] → THINKING (静默 800ms，提交 Qwen)")
-                    self._send_user_speech_end(self._current_trace_id)
+                # 只有在用户已真开口过的前提下，才累积静默触发 commit
+                # 用户没开口时，Silero 抖动不会触发空 commit
+                if self._rt_user_has_spoken:
+                    if self._rt_vad_false_since is None:
+                        self._rt_vad_false_since = now
+                    elif now - self._rt_vad_false_since >= 0.8:
+                        self._rt_state = "THINKING"
+                        self._rt_vad_false_since = None
+                        self._rt_thinking_since = now
+                        self._rt_user_has_spoken = False  # 进入下一轮
+                        logger.info("🎯 [RT] → THINKING (真人声后静默 800ms，提交 Qwen)")
+                        self._send_user_speech_end(self._current_trace_id)
 
         elif state == "THINKING":
             # 等 Qwen 返回 TTS（由 tts_playing 边沿切 SPEAKING，或 10s 超时回 LISTENING）
@@ -2144,17 +2203,32 @@ class CoreServer:
 
         elif state == "SPEAKING":
             # TTS 播放中，监听用户 barge-in
-            if vad:
+            # 🔒 补丁 A：SPEAKING 态 RMS gate，防止 XVF3800 AEC 残留回声触发 barge-in
+            # LISTENING 态的 4 层门控不在 SPEAKING 态生效（因为 SPEAKING 不能拒绝所有帧 —— 要保留 barge-in 机会）
+            # 这里只加 RMS 一道：真人声通常 RMS > listening 阈值 * 1.8，AEC 残留能量更低
+            import numpy as np
+            try:
+                pcm_i16 = np.frombuffer(audio_binary, dtype=np.int16)
+                rms = float(np.sqrt(np.mean(pcm_i16.astype(np.float32) ** 2))) if len(pcm_i16) > 0 else 0.0
+            except Exception:
+                rms = 0.0
+            filter_cfg = getattr(self, "audio_filter_config", None)
+            base_rms = getattr(filter_cfg, "rms_threshold", 316.0) if filter_cfg else 316.0
+            speaking_rms_min = base_rms * 1.8
+
+            if vad and rms > speaking_rms_min:
                 if self._rt_vad_true_since is None:
                     self._rt_vad_true_since = now
                 elif now - self._rt_vad_true_since >= 0.3:
-                    logger.info("🎯 [RT] ⚡ BARGE-IN! (用户在 TTS 期间说话 >300ms)")
+                    logger.info(f"🎯 [RT] ⚡ BARGE-IN! (VAD=True, RMS={rms:.0f}>{speaking_rms_min:.0f}, 持续>300ms)")
                     self._send_barge_in(self._current_trace_id)
                     self._rt_state = "LISTENING"
                     self._rt_vad_true_since = None
                     self._rt_vad_false_since = None
-                    # barge-in 之后立即推当前帧给 Qwen，不丢字
-                    self._send_audio_stream_chunk(self._current_trace_id, audio_binary)
+                    self._rt_user_has_spoken = True  # barge-in 本身已经证明用户在说话
+                    # 🔒 补丁 C：不再立即推当前帧给 Qwen
+                    # 原注释说"不丢字"，但 AEC 残留信号会被直接送给 Qwen 引发自回答（用户观察到 replyLen=7/9 的短回复）
+                    # 丢一帧（~20-40ms）换不自回答，权衡更好
             else:
                 self._rt_vad_true_since = None
     

@@ -967,6 +967,16 @@ export default function App() {
           setConnectionStatus("媒体控制已执行");
           return;
         }
+        if (data.type === "media_duck") {
+          if (data.action === "duck") {
+            setStageMediaVolume(typeof data.level === "number" ? data.level : 0.1);
+            setConnectionStatus("媒体降音");
+          } else if (data.action === "restore") {
+            setStageMediaVolume(typeof data.level === "number" ? data.level : 1);
+            setConnectionStatus("媒体恢复");
+          }
+          return;
+        }
         if (data.type === "stop_tts") {
           unityBridge.interrupt();
           syncSub.reset();
