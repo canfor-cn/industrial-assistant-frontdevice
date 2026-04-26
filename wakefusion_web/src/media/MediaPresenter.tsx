@@ -3,6 +3,7 @@ import { useInactivityTimeout } from "./useInactivityTimeout";
 import { VideoPlayer } from "./VideoPlayer";
 import { ImageCarousel } from "./ImageCarousel";
 import { DocumentViewer } from "./DocumentViewer";
+import { MarkdownTouchViewer } from "./MarkdownTouchViewer";
 
 const INACTIVITY_TIMEOUT_MS = 60_000;
 
@@ -19,10 +20,10 @@ interface MediaPresenterProps {
 export function MediaPresenter({ machine, volume }: MediaPresenterProps) {
   const { state, currentRefs, currentIndex, mediaKind } = machine;
 
-  // Inactivity timeout only for image / document while playing
+  // Inactivity timeout for image / document / wiki while playing.
   const needsTimeout =
     state === "playing" &&
-    (mediaKind === "image" || mediaKind === "document");
+    (mediaKind === "image" || mediaKind === "document" || mediaKind === "wiki");
 
   const { resetTimer } = useInactivityTimeout(
     needsTimeout,
@@ -72,6 +73,12 @@ export function MediaPresenter({ machine, volume }: MediaPresenterProps) {
         />
       ) : mediaKind === "document" ? (
         <DocumentViewer
+          mediaRef={currentRefs[0]}
+          onReady={machine.ready}
+          onInteraction={handleInteraction}
+        />
+      ) : mediaKind === "wiki" ? (
+        <MarkdownTouchViewer
           mediaRef={currentRefs[0]}
           onReady={machine.ready}
           onInteraction={handleInteraction}

@@ -2,7 +2,7 @@
 
 export interface MediaRef {
   assetId: string;
-  assetType: "image" | "video" | "audio" | "document" | string;
+  assetType: "image" | "video" | "audio" | "document" | "wiki" | string;
   url: string;
   label: string;
   frameUrl?: string;
@@ -11,7 +11,7 @@ export interface MediaRef {
   traceId?: string;
 }
 
-export type MediaKind = "video" | "image" | "document" | "audio" | null;
+export type MediaKind = "video" | "image" | "document" | "audio" | "wiki" | null;
 
 export type MediaMachineState = "idle" | "loading" | "playing" | "exiting";
 
@@ -32,6 +32,7 @@ export function resolveMediaKind(refs: MediaRef[]): MediaKind {
   if (t === "audio") return "audio";
   if (t === "image") return "image";
   if (t === "document") return "document";
+  if (t === "wiki") return "wiki";
   return null;
 }
 
@@ -41,7 +42,8 @@ export function isPlayableMedia(assetType: string): boolean {
     assetType === "image" ||
     assetType === "video" ||
     assetType === "audio" ||
-    assetType === "document"
+    assetType === "document" ||
+    assetType === "wiki"
   );
 }
 

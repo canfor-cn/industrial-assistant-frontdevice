@@ -408,6 +408,219 @@ button {
   border: none;
 }
 
+/* ─── Markdown Touch Viewer (wiki entries) ─── */
+.stage-md-viewer {
+  width: 100%;
+  height: 100%;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  background: #0a1f3a;
+  color: #f5f0e5;
+  font-family: "Source Han Sans CN", "Noto Sans SC", system-ui, sans-serif;
+  line-height: 1.8;
+}
+
+.stage-md-header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 18px 28px 14px;
+  background: linear-gradient(180deg, #0a1f3a 70%, rgba(10, 31, 58, 0));
+  border-bottom: 1px solid #c9a96e;
+}
+
+.stage-md-title {
+  font-size: 22px;
+  font-weight: 600;
+  color: #c9a96e;
+  letter-spacing: 0.5px;
+}
+
+.stage-md-layout {
+  display: grid;
+  grid-template-columns: minmax(180px, 220px) 1fr;
+  gap: 24px;
+  padding: 18px 28px 60px;
+}
+
+@media (max-aspect-ratio: 1/1) {
+  .stage-md-layout {
+    grid-template-columns: 1fr;
+  }
+  .stage-md-toc {
+    display: none;
+  }
+}
+
+.stage-md-toc {
+  position: sticky;
+  top: 70px;
+  align-self: start;
+  max-height: calc(100vh - 100px);
+  overflow-y: auto;
+  border-right: 1px solid rgba(201, 169, 110, 0.25);
+  padding-right: 14px;
+}
+
+.stage-md-toc-title {
+  font-size: 14px;
+  color: #c9a96e;
+  margin-bottom: 8px;
+  letter-spacing: 1px;
+}
+
+.stage-md-toc ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.stage-md-toc li {
+  margin: 6px 0;
+}
+
+.stage-md-toc button {
+  background: transparent;
+  border: none;
+  color: #f5f0e5;
+  font-size: 15px;
+  text-align: left;
+  cursor: pointer;
+  padding: 6px 8px;
+  border-radius: 4px;
+  width: 100%;
+}
+
+.stage-md-toc button:hover,
+.stage-md-toc button:focus {
+  background: rgba(201, 169, 110, 0.15);
+  color: #c9a96e;
+}
+
+.stage-md-article {
+  font-size: 17px;
+  max-width: 920px;
+}
+
+.stage-md-article p {
+  margin: 0 0 1em;
+}
+
+.stage-md-article h1,
+.stage-md-article h2,
+.stage-md-article h3 {
+  color: #c9a96e;
+  margin-top: 1.4em;
+  margin-bottom: 0.5em;
+}
+
+.stage-md-article .markdown-h2 {
+  font-size: 20px;
+  border-bottom: 1px solid rgba(201, 169, 110, 0.4);
+  padding-bottom: 6px;
+}
+
+.stage-md-article ul,
+.stage-md-article ol {
+  padding-left: 1.6em;
+  margin: 0 0 1em;
+}
+
+.stage-md-article table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1em 0;
+  font-size: 15px;
+}
+
+.stage-md-article th,
+.stage-md-article td {
+  border: 1px solid rgba(201, 169, 110, 0.4);
+  padding: 8px 12px;
+  text-align: left;
+}
+
+.stage-md-article th {
+  background: rgba(201, 169, 110, 0.12);
+  color: #c9a96e;
+}
+
+.stage-md-article code {
+  background: rgba(201, 169, 110, 0.1);
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 0.92em;
+}
+
+.stage-md-article pre {
+  background: rgba(0, 0, 0, 0.3);
+  padding: 12px 14px;
+  border-radius: 6px;
+  overflow-x: auto;
+}
+
+.stage-md-loading,
+.stage-md-error {
+  padding: 32px;
+  font-size: 16px;
+  color: rgba(245, 240, 229, 0.65);
+}
+
+.stage-md-error-url {
+  margin-top: 8px;
+  font-size: 12px;
+  color: rgba(245, 240, 229, 0.45);
+}
+
+.markdown-mermaid-block {
+  margin: 16px 0;
+  display: flex;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid rgba(201, 169, 110, 0.25);
+  border-radius: 8px;
+  padding: 16px;
+  overflow-x: auto;
+}
+
+.markdown-mermaid-block svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.markdown-mermaid-error,
+.markdown-chart-error {
+  background: rgba(150, 50, 50, 0.15);
+  border-left: 3px solid #c0392b;
+  padding: 10px 14px;
+  margin: 12px 0;
+  border-radius: 4px;
+  color: rgba(245, 240, 229, 0.85);
+  font-size: 14px;
+}
+
+.markdown-mermaid-error-title,
+.markdown-chart-error-title {
+  font-weight: 600;
+  margin-bottom: 6px;
+  color: #e88;
+}
+
+.markdown-chart-block {
+  margin: 16px 0;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid rgba(201, 169, 110, 0.25);
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.markdown-chart-title {
+  text-align: center;
+  font-size: 15px;
+  color: #c9a96e;
+  margin-bottom: 8px;
+}
+
 /* ─── UI Overlay (Layer 2-3) ─── */
 .ui-overlay {
   position: absolute;
