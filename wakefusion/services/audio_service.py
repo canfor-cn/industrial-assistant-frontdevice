@@ -32,6 +32,9 @@ import torch
 import queue
 import time
 import zmq
+import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from wakefusion.config import get_config
 from wakefusion.services.vad_engine import SileroVADEngine
@@ -76,6 +79,72 @@ opened_channels = 1  # 默认值，将在main()中根据实际打开的设备设
 
 # VAD引擎（使用组合模式，完全解耦）
 vad_engine = None  # 将在main()中根据配置初始化
+
+# ── Phase 4: voice embedding (visitor recognition) ──
+# Initialized in main() once we know the model path is reachable. When the
+# ONNX file is missing or onnxruntime fails to load, voice_embedder stays
+# None and the rest of the pipeline silently no-ops.
+voice_embedder = None
+voice_emb_pub_socket = None
+voice_emb_pub_lock = threading.Lock()
+voice_emb_buffer: list = []
+voice_emb_buffer_lock = threading.Lock()
+voice_emb_last_emit_at: float = 0.0
+VOICE_EMB_TARGET_SAMPLES = int(3.0 * SAMPLE_RATE)  # 3 s of speech
+VOICE_EMB_COOLDOWN_S = 60.0                        # one emb per minute / interaction
+_voice_emb_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="voice-emb")
+
+
+def _run_voice_emb_inference(snapshot_int16):
+    """Background ONNX inference + ZMQ publish for one voice sample."""
+    if voice_embedder is None or not voice_embedder.is_available():
+        return
+    if voice_emb_pub_socket is None:
+        return
+    try:
+        emb = voice_embedder.embed(snapshot_int16)
+        if emb is None:
+            return
+        payload = {
+            "type": "voice_embedding",
+            "dim": int(emb.shape[0]),
+            "embedding": emb.astype(np.float32).tolist(),
+            "captured_at": time.time(),
+            "sample_seconds": float(snapshot_int16.size) / SAMPLE_RATE,
+        }
+        with voice_emb_pub_lock:
+            voice_emb_pub_socket.send_string(json.dumps(payload), flags=zmq.NOBLOCK)
+        print(f"🧬 voice_embedding emitted: dim={int(emb.shape[0])}, samples={snapshot_int16.size}")
+    except Exception as exc:
+        print(f"voice_emb inference failed: {exc}")
+
+
+def _accumulate_for_voice_emb(chunk_int16, vad_active: bool):
+    """Append a chunk to the voice-emb buffer when VAD is active.
+
+    When the buffer reaches `VOICE_EMB_TARGET_SAMPLES`, kick off background
+    inference and start the cooldown immediately so we don't fire twice.
+    Silence chunks are dropped on the floor.
+    """
+    global voice_emb_last_emit_at
+    if voice_embedder is None or not voice_embedder.is_available():
+        return
+    if not vad_active:
+        return
+    now = time.time()
+    if (now - voice_emb_last_emit_at) < VOICE_EMB_COOLDOWN_S:
+        return
+
+    with voice_emb_buffer_lock:
+        voice_emb_buffer.append(chunk_int16.astype(np.int16, copy=True))
+        total = sum(c.size for c in voice_emb_buffer)
+
+    if total >= VOICE_EMB_TARGET_SAMPLES:
+        with voice_emb_buffer_lock:
+            snapshot = np.concatenate(voice_emb_buffer)[:VOICE_EMB_TARGET_SAMPLES]
+            voice_emb_buffer.clear()
+        voice_emb_last_emit_at = now  # debounce — even if inference fails
+        _voice_emb_executor.submit(_run_voice_emb_inference, snapshot)
 
 # ZMQ Context和Sockets
 zmq_context = None
@@ -224,6 +293,12 @@ def network_sender():
                 else:
                     vad_active = True
             # ---------------------------------
+
+            # ── Phase 4: feed the voice-embedding accumulator ──
+            try:
+                _accumulate_for_voice_emb(chunk_int16, vad_active)
+            except Exception as _exc:
+                pass
             
             # 第一帧：JSON元数据
             metadata = {
@@ -396,6 +471,27 @@ def main():
     zmq_rep_socket.bind(f"tcp://127.0.0.1:{audio_ctrl_port}")
     zmq_rep_socket.setsockopt(zmq.RCVTIMEO, zmq_config.req_rep_timeout_ms)
     print(f"✅ ZMQ REP Socket bound to tcp://127.0.0.1:{audio_ctrl_port}")
+
+    # ── Phase 4: voice-embedding PUB socket + embedder ──
+    global voice_embedder, voice_emb_pub_socket
+    try:
+        from wakefusion.services.voice_embedder import VoiceEmbedder
+        voice_emb_path = _os.path.join(
+            _os.path.dirname(__file__), "..", "..", "..",
+            "runtime", "models", "voice_embedding", "voxceleb_resnet34_LM.onnx",
+        )
+        voice_embedder = VoiceEmbedder(_os.path.abspath(voice_emb_path))
+        if voice_embedder.is_available():
+            voice_emb_pub_socket = zmq_context.socket(zmq.PUB)
+            voice_emb_pub_socket.setsockopt(zmq.SNDHWM, 8)
+            voice_emb_pub_socket.bind(f"tcp://127.0.0.1:{zmq_config.voice_emb_pub_port}")
+            print(f"✅ VoiceEmbedder loaded; voice_emb PUB on tcp://127.0.0.1:{zmq_config.voice_emb_pub_port}")
+        else:
+            voice_embedder = None
+            print("ℹ️ VoiceEmbedder unavailable (model file missing); skipping voice embedding")
+    except Exception as exc:
+        print(f"ℹ️ VoiceEmbedder init failed: {exc}; skipping voice embedding")
+        voice_embedder = None
     
     # 启动控制监听线程
     ctrl_thread = threading.Thread(target=control_listener_zmq, daemon=True)

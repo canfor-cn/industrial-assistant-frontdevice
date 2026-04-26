@@ -282,7 +282,31 @@ class VisionService:
         self._last_faces: List[Dict[str, Any]] = []
         # 🌟 任务3：EMA滤波存储 - 存储每个face的上一帧frontal_percent（key: face_id）
         self._face_frontal_history: Dict[int, float] = {}
-        
+
+        # ── Phase 4: face embedding (visitor recognition) ──
+        # Lazily loaded; if the ONNX file is missing or onnxruntime fails to
+        # init, FaceEmbedder.is_available() stays False and no extra work runs.
+        try:
+            from wakefusion.services.face_embedder import FaceEmbedder
+            face_emb_path = os.path.join(
+                os.path.dirname(__file__), "..", "..", "..",
+                "runtime", "models", "face_recognition", "w600k_mbf.onnx",
+            )
+            self._face_embedder = FaceEmbedder(os.path.abspath(face_emb_path))
+            if self._face_embedder.is_available():
+                vision_logger.info(f"FaceEmbedder loaded: {os.path.abspath(face_emb_path)}")
+            else:
+                vision_logger.info("FaceEmbedder unavailable; visitor recognition will be skipped")
+        except Exception as exc:
+            vision_logger.warning(f"FaceEmbedder init failed: {exc}")
+            self._face_embedder = None
+        # Throttle: at most one inference per second to keep detection latency low.
+        self._face_emb_min_interval_s = 1.0
+        self._last_face_emb_at: float = 0.0
+        # Latest computed embedding (numpy float32, L2-normed). Cleared by send_frame_data.
+        self._latest_face_emb = None
+        self._latest_face_emb_at: float = 0.0
+
         # 初始化唇动检测器
         self.lip_detector = LipSyncDetector()
         
@@ -882,7 +906,13 @@ class VisionService:
 
         # 记录最近一帧的人脸结果，供跳帧插值时复用
         self._last_faces = faces
-        
+
+        # ── Phase 4: maybe extract face embedding (rate-limited) ──
+        try:
+            self._maybe_extract_face_emb(rgb_frame, face_results, faces)
+        except Exception as exc:
+            vision_logger.warning(f"face emb extract threw: {exc}")
+
         # 🌟 任务3：清理消失的人脸的历史记录（防止内存泄漏）
         current_face_ids = {face.get("id") for face in faces}
         disappeared_ids = set(self._face_frontal_history.keys()) - current_face_ids
@@ -946,7 +976,64 @@ class VisionService:
         # 添加唇动检测结果
         result["is_talking"] = is_talking
         return result
-    
+
+    # ── Phase 4: face embedding helpers ───────────────────────────────────────
+
+    def _maybe_extract_face_emb(self, bgr_frame, face_results, faces):
+        """Run face embedding inference at most once per ``_face_emb_min_interval_s``.
+
+        We pick the largest detected face (closest to camera) and feed its
+        landmarks plus the raw frame to the embedder. Result is stashed on
+        ``self._latest_face_emb`` so the next ``send_frame_data`` call can
+        ship it through the output queue.
+        """
+        if not self._face_embedder or not self._face_embedder.is_available():
+            return
+        if not face_results or not face_results.detections:
+            return
+        now = time.time()
+        if (now - self._last_face_emb_at) < self._face_emb_min_interval_s:
+            return
+
+        # Pick the detection with the largest bbox height (proxy for closest).
+        best_idx = -1
+        best_h = 0.0
+        for i, det in enumerate(face_results.detections):
+            bb = det.location_data.relative_bounding_box
+            if bb.height > best_h:
+                best_h = bb.height
+                best_idx = i
+        if best_idx < 0:
+            return
+
+        det = face_results.detections[best_idx]
+        keypoints = det.location_data.relative_keypoints
+        if len(keypoints) < 5:
+            return
+
+        h, w = bgr_frame.shape[:2]
+        kp_xy = [(float(kp.x) * w, float(kp.y) * h) for kp in keypoints[:5]]
+
+        emb = self._face_embedder.embed(bgr_frame, kp_xy)
+        if emb is None:
+            return
+
+        self._latest_face_emb = emb
+        self._latest_face_emb_at = now
+        self._last_face_emb_at = now
+
+    def _drain_face_emb_for_send(self):
+        """Pop the latest embedding so ``send_frame_data`` ships it once.
+
+        Embedding is consumed by the queue payload; subsequent frames must
+        re-run extraction (rate-limited) before another emb is sent.
+        """
+        if self._latest_face_emb is None:
+            return None
+        emb = self._latest_face_emb
+        self._latest_face_emb = None
+        return emb
+
     def send_result(self, result: Dict[str, Any]):
         """
         通过内存队列发送检测结果（纯传感器数据，不包含业务逻辑）
@@ -969,6 +1056,12 @@ class VisionService:
                 "is_talking": is_talking,
                 "timestamp": time.time()
             }
+            # ── Phase 4: 附加 face embedding（如有），core_server 累积 + 上送后端 ──
+            emb = self._drain_face_emb_for_send()
+            if emb is not None:
+                data["face_embedding"] = emb.tolist()
+                data["face_embedding_dim"] = int(emb.shape[0])
+
             # 通过内存队列发送（满则丢弃旧帧）
             if self._output_queue is not None:
                 if self._output_queue.full():

@@ -125,6 +125,28 @@ class CoreServer:
         # Poller用于同时监听多个socket
         self.poller = zmq.Poller()
         self.poller.register(self.audio_sub_socket, zmq.POLLIN)
+
+        # ── Phase 4: voice embedding SUB（接 audio_service 的 voice_emb PUB）──
+        try:
+            self.voice_emb_sub_socket = self.zmq_context.socket(zmq.SUB)
+            self.voice_emb_sub_socket.setsockopt(zmq.RCVHWM, 8)
+            self.voice_emb_sub_socket.connect(
+                f"tcp://127.0.0.1:{self.zmq_config.voice_emb_pub_port}"
+            )
+            self.voice_emb_sub_socket.setsockopt_string(zmq.SUBSCRIBE, "")
+            self.poller.register(self.voice_emb_sub_socket, zmq.POLLIN)
+            logger.info(
+                f"  Voice Emb SUB: tcp://127.0.0.1:{self.zmq_config.voice_emb_pub_port}"
+            )
+        except Exception as exc:
+            self.voice_emb_sub_socket = None
+            logger.warning(f"voice emb SUB init failed: {exc}")
+
+        # Visitor recognition state — reset on each _enter_interactive_mode.
+        self._face_emb_buffer: list = []
+        self._face_emb_emitted: bool = False
+        self._voice_emb_emitted: bool = False
+        self._face_emb_target_count: int = 3
         
         # 状态管理（使用布尔标志位替代SystemState枚举）
         self.is_interactive_mode: bool = False  # 是否处于持续对话交互期
@@ -675,6 +697,79 @@ class CoreServer:
     
     # ASR结果接收和处理方法已删除（ASR已迁移到服务器端，结果通过WebSocket接收）
     
+    # ── Phase 4: visitor recognition (face/voice embedding forwarding) ─────
+
+    def _handle_incoming_face_emb(self, emb_list):
+        """Accumulate face embeddings during interactive mode and emit once."""
+        if self._face_emb_emitted:
+            return
+        if not self.is_interactive_mode:
+            return
+        try:
+            arr = np.asarray(emb_list, dtype=np.float32).reshape(-1)
+        except Exception as exc:
+            logger.warning(f"face emb shape invalid: {exc}")
+            return
+        if arr.size == 0:
+            return
+
+        self._face_emb_buffer.append(arr)
+        if len(self._face_emb_buffer) < self._face_emb_target_count:
+            return
+
+        try:
+            stacked = np.stack(self._face_emb_buffer, axis=0)
+            mean = stacked.mean(axis=0)
+            norm = float(np.linalg.norm(mean))
+            if norm <= 0.0:
+                self._face_emb_buffer.clear()
+                return
+            normed = mean / norm
+        except Exception as exc:
+            logger.warning(f"face emb mean failed: {exc}")
+            self._face_emb_buffer.clear()
+            return
+
+        self._send_websocket_message({
+            "type": "face_embedding",
+            "deviceId": self.llm_agent_config.device_id,
+            "dim": int(normed.shape[0]),
+            "embedding": normed.astype(np.float32).tolist(),
+            "capturedAt": time.time(),
+        })
+        logger.info(
+            f"🧬 face_embedding emitted to backend: dim={int(normed.shape[0])}, "
+            f"samples={len(self._face_emb_buffer)}"
+        )
+        self._face_emb_emitted = True
+        self._face_emb_buffer.clear()
+
+    def _handle_incoming_voice_emb(self, payload: dict):
+        """Forward a voice embedding from audio_service to the backend."""
+        if self._voice_emb_emitted:
+            return
+        if not self.is_interactive_mode:
+            return
+        emb = payload.get("embedding")
+        if not emb:
+            return
+
+        message = {
+            "type": "voice_embedding",
+            "deviceId": self.llm_agent_config.device_id,
+            "dim": int(payload.get("dim") or len(emb)),
+            "embedding": emb,
+            "capturedAt": payload.get("captured_at", time.time()),
+        }
+        if "sample_seconds" in payload:
+            message["sampleSeconds"] = float(payload["sample_seconds"])
+
+        self._send_websocket_message(message)
+        logger.info(
+            f"🧬 voice_embedding forwarded to backend: dim={message['dim']}"
+        )
+        self._voice_emb_emitted = True
+
     def _send_websocket_message(self, message: dict):
         """通过WebSocket发送消息给LLM Agent（线程安全）"""
         if not self._ws_connected or not self._ws_client or not self._ws_loop:
@@ -1045,10 +1140,15 @@ class CoreServer:
         with self._state_lock:
             prev_interactive = self.is_interactive_mode
             logger.info(f"状态转换: 进入交互模式 (路径: {wake_path})")
-            
+
             # 记录唤醒路径
             self._current_wake_path = wake_path
-            
+
+            # ── Phase 4: 重置访客识别累积器 ──
+            self._face_emb_buffer = []
+            self._face_emb_emitted = False
+            self._voice_emb_emitted = False
+
             # 🌟 核心修复：重置所有交互计时器，避免"时间穿越"引发的瞬间挂断
             self._last_speech_time = time.time()
             self._vad_silence_start = None
@@ -1461,6 +1561,23 @@ class CoreServer:
                     except Exception as e:
                         logger.error(f"处理音频数据异常: {e}")
                 
+                # ── Phase 4: voice embedding 上行（来自 audio_service 的 PUB）──
+                voice_emb_socket = getattr(self, "voice_emb_sub_socket", None)
+                if voice_emb_socket is not None and voice_emb_socket in socks:
+                    try:
+                        while True:
+                            raw = voice_emb_socket.recv_string(zmq.NOBLOCK)
+                            try:
+                                payload = json.loads(raw)
+                            except Exception as exc:
+                                logger.warning(f"voice emb json parse failed: {exc}")
+                                continue
+                            self._handle_incoming_voice_emb(payload)
+                    except zmq.Again:
+                        pass
+                    except Exception as exc:
+                        logger.warning(f"处理 voice emb 异常: {exc}")
+
                 # 处理控制指令（LLM下行控制）
                 if getattr(self, '_control_rep_socket', None) and self._control_rep_socket in socks:
                     try:
@@ -1590,6 +1707,14 @@ class CoreServer:
         faces = vision_data.get("faces", [])
         distance_m = vision_data.get("distance_m")
         is_talking = vision_data.get("is_talking", False)
+
+        # ── Phase 4: face embedding accumulator ─────────────────────────
+        face_emb = vision_data.get("face_embedding")
+        if face_emb is not None:
+            try:
+                self._handle_incoming_face_emb(face_emb)
+            except Exception as exc:
+                logger.warning(f"face emb accumulator threw: {exc}")
 
         # 缓存最新视觉状态（供 _report_device_state 使用）
         self._last_vision_faces = len(faces)

@@ -243,6 +243,7 @@ class ZMQConfig(BaseModel):
     tts_stop_pub_port: int = 5560     # TTS停止信号PUB端口（Core Server发布，TTS订阅）
     core_control_rep_port: int = 5561  # Core Server控制端口（REP，接收LLM指令）
     vision_ctrl_pub_port: int = 5564   # 视觉控制PUB端口（Core Server发布控制消息给Vision Service）
+    voice_emb_pub_port: int = 5565     # 声纹 embedding PUB端口（Audio Service发布，Core Server订阅）
 
 
 class VisionWakeConfig(BaseModel):
