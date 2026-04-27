@@ -286,17 +286,25 @@ class VisionService:
         # ── Phase 4: face embedding (visitor recognition) ──
         # Lazily loaded; if the ONNX file is missing or onnxruntime fails to
         # init, FaceEmbedder.is_available() stays False and no extra work runs.
+        # Search order:
+        #   1) wakefusion/models/face_recognition/w600k_mbf.onnx  (dist deploy)
+        #   2) ../models/face_recognition/w600k_mbf.onnx          (relative to services/)
+        #   3) runtime/models/face_recognition/w600k_mbf.onnx     (dev tree)
         try:
             from wakefusion.services.face_embedder import FaceEmbedder
-            face_emb_path = os.path.join(
-                os.path.dirname(__file__), "..", "..", "..",
-                "runtime", "models", "face_recognition", "w600k_mbf.onnx",
-            )
-            self._face_embedder = FaceEmbedder(os.path.abspath(face_emb_path))
+            here = os.path.dirname(os.path.abspath(__file__))
+            face_emb_candidates = [
+                "wakefusion/models/face_recognition/w600k_mbf.onnx",
+                os.path.join(here, "..", "models", "face_recognition", "w600k_mbf.onnx"),
+                os.path.join(here, "..", "..", "..", "runtime", "models", "face_recognition", "w600k_mbf.onnx"),
+            ]
+            face_emb_path = next((os.path.abspath(p) for p in face_emb_candidates if os.path.isfile(p)),
+                                 os.path.abspath(face_emb_candidates[0]))
+            self._face_embedder = FaceEmbedder(face_emb_path)
             if self._face_embedder.is_available():
-                vision_logger.info(f"FaceEmbedder loaded: {os.path.abspath(face_emb_path)}")
+                vision_logger.info(f"FaceEmbedder loaded: {face_emb_path}")
             else:
-                vision_logger.info("FaceEmbedder unavailable; visitor recognition will be skipped")
+                vision_logger.info(f"FaceEmbedder unavailable (looked in {face_emb_candidates}); visitor recognition will be skipped")
         except Exception as exc:
             vision_logger.warning(f"FaceEmbedder init failed: {exc}")
             self._face_embedder = None

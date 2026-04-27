@@ -473,22 +473,27 @@ def main():
     print(f"✅ ZMQ REP Socket bound to tcp://127.0.0.1:{audio_ctrl_port}")
 
     # ── Phase 4: voice-embedding PUB socket + embedder ──
+    # Search order matches vision_service: dist deploy → services-relative → dev tree.
     global voice_embedder, voice_emb_pub_socket
     try:
         from wakefusion.services.voice_embedder import VoiceEmbedder
-        voice_emb_path = _os.path.join(
-            _os.path.dirname(__file__), "..", "..", "..",
-            "runtime", "models", "voice_embedding", "voxceleb_resnet34_LM.onnx",
-        )
-        voice_embedder = VoiceEmbedder(_os.path.abspath(voice_emb_path))
+        here = _os.path.dirname(_os.path.abspath(__file__))
+        voice_emb_candidates = [
+            "wakefusion/models/voice_embedding/voxceleb_resnet34_LM.onnx",
+            _os.path.join(here, "..", "models", "voice_embedding", "voxceleb_resnet34_LM.onnx"),
+            _os.path.join(here, "..", "..", "..", "runtime", "models", "voice_embedding", "voxceleb_resnet34_LM.onnx"),
+        ]
+        voice_emb_path = next((_os.path.abspath(p) for p in voice_emb_candidates if _os.path.isfile(p)),
+                              _os.path.abspath(voice_emb_candidates[0]))
+        voice_embedder = VoiceEmbedder(voice_emb_path)
         if voice_embedder.is_available():
             voice_emb_pub_socket = zmq_context.socket(zmq.PUB)
             voice_emb_pub_socket.setsockopt(zmq.SNDHWM, 8)
             voice_emb_pub_socket.bind(f"tcp://127.0.0.1:{zmq_config.voice_emb_pub_port}")
-            print(f"✅ VoiceEmbedder loaded; voice_emb PUB on tcp://127.0.0.1:{zmq_config.voice_emb_pub_port}")
+            print(f"✅ VoiceEmbedder loaded ({voice_emb_path}); voice_emb PUB on tcp://127.0.0.1:{zmq_config.voice_emb_pub_port}")
         else:
             voice_embedder = None
-            print("ℹ️ VoiceEmbedder unavailable (model file missing); skipping voice embedding")
+            print(f"ℹ️ VoiceEmbedder unavailable (looked in {voice_emb_candidates}); skipping voice embedding")
     except Exception as exc:
         print(f"ℹ️ VoiceEmbedder init failed: {exc}; skipping voice embedding")
         voice_embedder = None

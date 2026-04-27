@@ -17,8 +17,11 @@ torchaudio>=2.0.0
 onnxruntime>=1.16.0
 openwakeword>=0.6.0
 
-# vision: face detection + Orbbec depth camera
+# vision: face detection + Orbbec depth camera + ArcFace recognition
 # NOTE: Use pyorbbecsdk2 (new official package); old pyorbbecsdk 1.3.2 on PyPI is broken.
 # pyorbbecsdk2 installs as module name "pyorbbecsdk" (fully compatible with existing code).
 mediapipe>=0.10.14
 pyorbbecsdk2>=2.0.0
+# face_embedder uses cv2.estimateAffinePartial2D / cv2.warpAffine for ArcFace alignment.
+# vision_service.py also relies on cv2.FaceDetectorYN as a MediaPipe fallback.
+opencv-python>=4.8.0
