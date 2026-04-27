@@ -44,6 +44,25 @@ vision:
   target_fps: 15  # 降低帧率以减少CPU负载
   distance_m_max: 4.0
   face_conf_min: 0.55
+  # ── 相机后端 ──
+  # backend: orbbec | usb | rtsp
+  #   orbbec: Femto Bolt / Gemini 335（需要 pyorbbecsdk2）
+  #   usb:    普通 UVC USB 摄像头（cv2.VideoCapture(usb_index)）
+  #   rtsp:   网口/IP 摄像头（cv2.VideoCapture(rtsp_url)）
+  camera:
+    backend: "orbbec"
+    color_width: 1280
+    color_height: 720
+    target_fps: 15
+    # USB
+    usb_index: 0
+    # RTSP（仅 backend=rtsp 时使用，例如 "rtsp://admin:pass@192.168.1.10:554/Streaming/Channels/1"）
+    rtsp_url: null
+    rtsp_transport: "tcp"
+    # 距离估算标定
+    face_width_cm: 15.0
+    focal_length_factor: 0.55  # focal_length_px = color_width * factor
+    focal_length_px: null      # 优先级最高；非空时覆盖 factor
 
 # 融合策略配置
 fusion:

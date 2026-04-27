@@ -3,7 +3,7 @@
 定义所有事件、帧、配置的数据结构
 """
 
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Literal
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -205,6 +205,33 @@ class VADConfig(BaseModel):
     speech_end_ms: Optional[int] = 500  # 语音结束阈值（毫秒）- 已废弃
 
 
+class CameraConfig(BaseModel):
+    """相机后端配置 — 支持 Orbbec 深度相机 / 普通 USB / 网络 RTSP."""
+    # backend 决定走哪条采集路径
+    #   orbbec: pyorbbecsdk2（Femto Bolt / Gemini 335 等，非 UVC）
+    #   usb:    cv2.VideoCapture(usb_index)，即插即用 USB 摄像头
+    #   rtsp:   cv2.VideoCapture(rtsp_url)，网口 IP camera / RTSP 流
+    backend: Literal["orbbec", "usb", "rtsp"] = "orbbec"
+
+    # 通用
+    color_width: int = 1280            # 分辨率（USB/RTSP 用作 VideoCapture set；Orbbec 用作距离估算焦距推断）
+    color_height: int = 720
+    target_fps: int = 15               # 目标采集帧率
+
+    # USB-only
+    usb_index: int = 0                 # cv2.VideoCapture 的设备索引
+
+    # RTSP-only
+    rtsp_url: Optional[str] = None     # 例如 "rtsp://admin:pass@192.168.1.10:554/Streaming/Channels/1"
+    rtsp_transport: Literal["tcp", "udp"] = "tcp"  # 走 TCP 更稳；UDP 可能丢包但延迟低
+
+    # 距离估算标定（人脸物理宽度 + 焦距）
+    face_width_cm: float = 15.0
+    # focal_length_px 优先；否则按 color_width * focal_length_factor 估算
+    focal_length_px: Optional[float] = None
+    focal_length_factor: float = 0.55  # 经验值，对常见 60-75° FOV 摄像头大致成立
+
+
 class VisionConfig(BaseModel):
     """视觉配置"""
     enabled: bool = False              # Phase 1暂不启用
@@ -212,6 +239,7 @@ class VisionConfig(BaseModel):
     cache_ms: int = 600                # 缓存时长（毫秒）
     distance_m_max: float = 4.0        # 最大检测距离（米）
     face_conf_min: float = 0.55        # 最小人脸置信度
+    camera: CameraConfig = Field(default_factory=CameraConfig)
 
 
 class FusionConfig(BaseModel):

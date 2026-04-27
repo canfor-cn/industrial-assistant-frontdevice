@@ -1146,19 +1146,30 @@ class VisionService:
         median_mm = float(np.median(roi[valid]))
         return median_mm / 1000.0
     
-    def run(self, camera_index: int = 0):
-        """
-        运行视觉服务（主循环）— 使用 OpenCV VideoCapture 采集 RGB
+    # ── camera backend dispatch (orbbec / usb / rtsp) ─────────────────
 
-        Args:
-            camera_index: 相机索引
-        """
-        print(f"启动相机（pyorbbecsdk, RGB + 人脸距离估算）...", flush=True)
+    def _init_distance_calibration(self, color_width: int):
+        """Compute face_width_cm + focal_length_px from camera config (or defaults)."""
+        cam = getattr(self.config.vision, "camera", None)
+        self._color_width = color_width
+        if cam is not None:
+            self._face_width_cm = cam.face_width_cm
+            if cam.focal_length_px and cam.focal_length_px > 0:
+                self._focal_length_px = float(cam.focal_length_px)
+            else:
+                self._focal_length_px = color_width * float(cam.focal_length_factor)
+        else:
+            # Backward compat — old configs without `camera:` block.
+            self._face_width_cm = 15.0
+            self._focal_length_px = color_width * 0.55
+        print(
+            f"[vision] calibration: face_width_cm={self._face_width_cm}, "
+            f"focal_length_px={self._focal_length_px:.1f}, color_width={color_width}",
+            flush=True,
+        )
 
-        # 使用 pyorbbecsdk 采集 RGB（Orbbec 不支持标准 UVC/DirectShow）
-        # Import strategy:
-        # 1. Try importing pip-installed pyorbbecsdk directly (uses its bundled DLLs)
-        # 2. If that fails, fallback to project's lib/orbbec DLLs (for bundled scenarios)
+    def _open_orbbec(self):
+        """Open Orbbec via pyorbbecsdk; returns (pipeline, color_width) or None."""
         import os as _os
         ob = None
         try:
@@ -1177,43 +1188,143 @@ class VisionService:
                         _os.sys.path.insert(0, _dll_candidate)
                     print(f"[INFO] Added Orbbec DLL path: {_dll_candidate}", flush=True)
                     break
-
             try:
                 import pyorbbecsdk as ob
                 print("[INFO] pyorbbecsdk imported with project DLL fallback", flush=True)
             except Exception as e:
                 print(f"[ERROR] pyorbbecsdk import failed: {e}", flush=True)
-                return
+                return None
 
         pipeline = ob.Pipeline()
         config = ob.Config()
         color_pl = pipeline.get_stream_profile_list(ob.OBSensorType.COLOR_SENSOR).get_default_video_stream_profile()
         config.enable_stream(color_pl)
-        self._color_width = color_pl.get_width()
-        self._face_width_cm = 15.0
-        self._focal_length_px = self._color_width * 0.55
+        color_width = color_pl.get_width()
         print(f"[INFO] Color: {color_pl.get_width()}x{color_pl.get_height()} @ {color_pl.get_fps()}fps", flush=True)
         pipeline.start(config)
         time.sleep(1)
+        return pipeline, color_width
 
-        print(f"VisionService started (pyorbbecsdk), camera_index={camera_index}", flush=True)
+    def _iterate_orbbec(self, pipeline):
+        """Yield BGR frames from an Orbbec pipeline (or None to skip)."""
+        no_frame_count = 0
+        while True:
+            frameset = pipeline.wait_for_frames(1000)
+            if not frameset or not frameset.get_color_frame():
+                no_frame_count += 1
+                if no_frame_count <= 3 or no_frame_count % 30 == 0:
+                    print(f"[vision] No frame #{no_frame_count}", flush=True)
+                time.sleep(0.005)
+                yield None
+                continue
+            cf = frameset.get_color_frame()
+            raw = np.frombuffer(cf.get_data(), dtype=np.uint8)
+            bgr = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+            yield bgr  # may be None if decode failed; main loop handles it
+
+    def _open_videocapture(self, source, width: int, height: int, fps: int, label: str):
+        """Open a cv2.VideoCapture with desired resolution/fps. Source can be int (USB index) or str (RTSP url)."""
+        cap = cv2.VideoCapture(source)
+        if not cap.isOpened():
+            print(f"[ERROR] {label} VideoCapture failed to open: {source!r}", flush=True)
+            return None, 0
+        # Best-effort resolution / FPS hints; some cameras ignore them.
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        if fps > 0:
+            cap.set(cv2.CAP_PROP_FPS, fps)
+        # Drain a couple of frames so the capture buffer is ready.
+        for _ in range(3):
+            cap.read()
+        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or width)
+        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or height)
+        actual_fps = cap.get(cv2.CAP_PROP_FPS) or fps
+        print(
+            f"[INFO] {label} opened: {actual_w}x{actual_h} @ {actual_fps:.1f}fps (source={source!r})",
+            flush=True,
+        )
+        return cap, actual_w
+
+    def _iterate_videocapture(self, cap):
+        """Yield BGR frames from a cv2.VideoCapture (USB or RTSP)."""
+        no_frame_count = 0
+        while True:
+            ok, bgr = cap.read()
+            if not ok or bgr is None:
+                no_frame_count += 1
+                if no_frame_count <= 3 or no_frame_count % 30 == 0:
+                    print(f"[vision] No frame #{no_frame_count}", flush=True)
+                time.sleep(0.02)
+                yield None
+                continue
+            yield bgr
+
+    def run(self, camera_index: int = 0):
+        """
+        运行视觉服务主循环。Backend 由 config.vision.camera.backend 决定：
+          - orbbec：pyorbbecsdk2，Femto Bolt / Gemini 335 等深度相机
+          - usb：cv2.VideoCapture(usb_index)，普通即插即用 USB 摄像头
+          - rtsp：cv2.VideoCapture(rtsp_url)，IP / 网络摄像头
+
+        camera_index 仅用于 USB 兼容；优先使用 config.vision.camera.usb_index。
+        """
+        cam = getattr(self.config.vision, "camera", None)
+        backend = cam.backend if cam is not None else "orbbec"
+        print(f"启动视觉服务（backend={backend}）...", flush=True)
+
+        cap_handle = None  # 保存到 finally 用于 cleanup
+        pipeline = None
+
+        if backend == "orbbec":
+            opened = self._open_orbbec()
+            if opened is None:
+                return
+            pipeline, color_width = opened
+            self._init_distance_calibration(color_width)
+            frame_iter = self._iterate_orbbec(pipeline)
+        elif backend == "usb":
+            usb_index = (cam.usb_index if cam is not None else camera_index)
+            req_w = (cam.color_width if cam else 1280)
+            req_h = (cam.color_height if cam else 720)
+            req_fps = (cam.target_fps if cam else self.target_fps)
+            cap, color_width = self._open_videocapture(usb_index, req_w, req_h, req_fps, "USB")
+            if cap is None:
+                return
+            cap_handle = cap
+            self._init_distance_calibration(color_width or req_w)
+            frame_iter = self._iterate_videocapture(cap)
+        elif backend == "rtsp":
+            url = cam.rtsp_url if cam else None
+            if not url:
+                print("[ERROR] backend=rtsp but rtsp_url is empty", flush=True)
+                return
+            transport = (cam.rtsp_transport if cam else "tcp").lower()
+            # OpenCV reads OPENCV_FFMPEG_CAPTURE_OPTIONS for FFmpeg backend; force TCP / UDP per config.
+            import os as _os
+            _os.environ.setdefault(
+                "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+                f"rtsp_transport;{transport}",
+            )
+            req_w = (cam.color_width if cam else 1280)
+            req_h = (cam.color_height if cam else 720)
+            req_fps = (cam.target_fps if cam else self.target_fps)
+            cap, color_width = self._open_videocapture(url, req_w, req_h, req_fps, "RTSP")
+            if cap is None:
+                return
+            cap_handle = cap
+            self._init_distance_calibration(color_width or req_w)
+            frame_iter = self._iterate_videocapture(cap)
+        else:
+            print(f"[ERROR] unknown camera backend: {backend!r} (expected orbbec/usb/rtsp)", flush=True)
+            return
+
+        print(f"VisionService started (backend={backend})", flush=True)
 
         last_time = time.time()
         frame_count = 0
-        no_frame_count = 0
 
         try:
-            while True:
-                frameset = pipeline.wait_for_frames(1000)
-                if not frameset or not frameset.get_color_frame():
-                    no_frame_count += 1
-                    if no_frame_count <= 3 or no_frame_count % 30 == 0:
-                        print(f"[vision] No frame #{no_frame_count}", flush=True)
-                    time.sleep(0.005)
-                    continue
-                cf = frameset.get_color_frame()
-                raw = np.frombuffer(cf.get_data(), dtype=np.uint8)
-                bgr = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+            for bgr in frame_iter:
                 if bgr is None:
                     continue
                 frame_count += 1
@@ -1282,10 +1393,16 @@ class VisionService:
             import traceback
             traceback.print_exc()
         finally:
-            try:
-                pipeline.stop()
-            except Exception:
-                pass
+            if pipeline is not None:
+                try:
+                    pipeline.stop()
+                except Exception:
+                    pass
+            if cap_handle is not None:
+                try:
+                    cap_handle.release()
+                except Exception:
+                    pass
             try:
                 self._img_thread_stop.set()
                 self.udp_image_socket.close()
