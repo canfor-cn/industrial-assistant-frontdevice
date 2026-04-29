@@ -100,17 +100,38 @@ export async function tauriGetHostStatus(): Promise<TauriHostStatus | null> {
   }
 }
 
-/** Get the backend host address from Rust config (e.g. "192.168.0.97:7788") */
+export type BackendWsStatusSnapshot = {
+  connected: boolean;
+  host: string;
+  reason?: string;
+};
+
+/**
+ * Pull the current backend WS link status from Rust. The Rust ws_client typically
+ * connects before React mounts, so the live `backend_ws_status` event is often
+ * fired before any subscriber exists. Call this on mount to recover the state.
+ */
+export async function tauriGetBackendWsStatus(): Promise<BackendWsStatusSnapshot | null> {
+  if (!isTauriEnv()) return null;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return await invoke<BackendWsStatusSnapshot>("get_backend_ws_status");
+  } catch {
+    return null;
+  }
+}
+
+/** Get the backend host address from Rust config (e.g. "192.168.0.97:7790") */
 let _cachedBackendHost: string | null = null;
 export async function tauriGetBackendHost(): Promise<string> {
   if (_cachedBackendHost) return _cachedBackendHost;
-  if (!isTauriEnv()) return "127.0.0.1:7788";
+  if (!isTauriEnv()) return "127.0.0.1:7790";
   try {
     const status = await tauriGetHostStatus();
-    _cachedBackendHost = status?.backendHost || "127.0.0.1:7788";
+    _cachedBackendHost = status?.backendHost || "127.0.0.1:7790";
     return _cachedBackendHost;
   } catch {
-    return "127.0.0.1:7788";
+    return "127.0.0.1:7790";
   }
 }
 
@@ -133,6 +154,8 @@ export async function subscribeTauriEvents(handlers: {
   onMediaRef?: (data: any) => void;
   onRoute?: (traceId: string, route: string) => void;
   onConnectionStatus?: (connected: boolean, message: string) => void;
+  /** Tauri host ↔ backend WS link status (the real connection, not "WebView ↔ host") */
+  onBackendWsStatus?: (connected: boolean, host: string, reason?: string) => void;
   onVoiceMessage?: (msg: VoiceMessage) => void;
   onUserVoiceStart?: (audioId: string) => void;
   onUserVoiceText?: (audioId: string | undefined, traceId: string, text: string) => void;
@@ -200,6 +223,16 @@ export async function subscribeTauriEvents(handlers: {
     unlisteners.push(
       await tauriListen<{ connected: boolean; message: string }>("connection_status", (p) =>
         h(p.connected, p.message)
+      )
+    );
+  }
+
+  if (handlers.onBackendWsStatus) {
+    const h = handlers.onBackendWsStatus;
+    unlisteners.push(
+      await tauriListen<{ connected: boolean; host: string; reason?: string }>(
+        "backend_ws_status",
+        (p) => h(p.connected, p.host, p.reason),
       )
     );
   }

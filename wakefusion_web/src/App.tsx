@@ -1,15 +1,10 @@
 import React, { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { isTauriEnv, tauriSendText, tauriSendAudio, tauriGetCachedAudio, tauriGetBackendHost, tauriGetHostStatus, subscribeTauriEvents, type VoiceMessage, type DeviceStatePayload } from "./useTauriBackend";
-import { ParticleBackground } from "./ParticleBackground";
+import { isTauriEnv, tauriSendText, tauriSendAudio, tauriGetCachedAudio, tauriGetBackendHost, tauriGetHostStatus, tauriGetBackendWsStatus, subscribeTauriEvents, type VoiceMessage, type DeviceStatePayload } from "./useTauriBackend";
+import { EditorialBackdrop } from "./background/EditorialBackdrop";
 import {
   Mic,
-  MicOff,
-  Phone,
-  PhoneOff,
-  SendHorizontal,
-  Keyboard,
   Image as ImageIcon,
   PlayCircle,
   Volume2,
@@ -21,7 +16,6 @@ import {
   Network,
   Radio,
   X,
-  ChevronDown,
   Maximize,
   Minimize,
   Camera,
@@ -30,6 +24,7 @@ import {
   User,
   Ruler,
   Activity,
+  Settings,
 } from "lucide-react";
 import { useMediaStateMachine } from "./media/useMediaStateMachine";
 import { createMediaQueue } from "./media/mediaQueue";
@@ -40,6 +35,13 @@ import { useSyncedSubtitle } from "./useSyncedSubtitle";
 import { useUnityBridge } from "./useUnityBridge";
 import { PCMStreamPlayer } from "./pcmStreamPlayer";
 import { WebRTCClient } from "./webrtcClient";
+import { startWebrtcLipSync, type LipSyncSession } from "./webrtcLipSync";
+import { useAvatarLayout } from "./avatar/useAvatarLayout";
+import { DraggableAvatarFrame } from "./avatar/DraggableAvatarFrame";
+import { AvatarSettingsPanel } from "./avatar/AvatarSettingsPanel";
+import { RightDock } from "./dock/RightDock";
+import { KeyboardComposer } from "./dock/KeyboardComposer";
+import { MagazineSubtitle } from "./subtitle/MagazineSubtitle";
 
 interface MediaRef {
   assetId: string;
@@ -140,8 +142,6 @@ export default function App() {
   const [isUnityLoaded, setIsUnityLoaded] = useState(false);
   const [loadingProgress, setLoadingProgress] = useState(0);
   const [connectionStatus, setConnectionStatus] = useState("未连接");
-  const [isRecording, setIsRecording] = useState(false);
-  const [isPhoneCall, setIsPhoneCall] = useState(false);
   const [ragOpen, setRagOpen] = useState(false);
   const [personaOpen, setPersonaOpen] = useState(false);
   const [personaData, setPersonaData] = useState<Record<string, string>>({});
@@ -218,7 +218,9 @@ export default function App() {
     });
   }, [mediaMachine.activate]);
   const [pendingUploads, setPendingUploads] = useState<PendingUploadItem[]>([]);
-  const [showTextInput, setShowTextInput] = useState(false);
+  const [keyboardOpen, setKeyboardOpen] = useState(false);
+  const [avatarPanelOpen, setAvatarPanelOpen] = useState(false);
+  const avatarController = useAvatarLayout();
 
   // Live subtitle panel: sentence-level audio-text sync
   const unityBridge = useUnityBridge();
@@ -246,14 +248,6 @@ export default function App() {
   const relaySocketRef = useRef<WebSocket | null>(null);
   const directSocketRef = useRef<WebSocket | null>(null);
   const directSocketKeyRef = useRef("");
-  const recorderRef = useRef<MediaRecorder | null>(null);
-  const recorderChunksRef = useRef<Blob[]>([]);
-  // Phone-call (continuous streaming) mode refs
-  const phoneCallStreamRef = useRef<MediaStream | null>(null);
-  const phoneCallCtxRef = useRef<AudioContext | null>(null);
-  const phoneCallNodeRef = useRef<ScriptProcessorNode | null>(null);
-  const phoneCallTraceIdRef = useRef<string>("");
-  const phoneCallSeqRef = useRef<number>(0);
   // AEC 模式：浏览器（非 Tauri）环境启用 MediaStream 输出 + <audio> 播放，让浏览器 AEC 识别自播放做回声消除
   // 临时关闭（通过 localStorage 开关 wakefusion.enableWebAec=1 恢复）——排查 AEC 导致麦克风收到静音的副作用
   const pcmPlayerRef = useRef<PCMStreamPlayer>(new PCMStreamPlayer({
@@ -267,10 +261,11 @@ export default function App() {
   // WebRTC loopback 测试（PR 1）：验证浏览器 AEC 真的工作
   const webrtcClientRef = useRef<WebRTCClient | null>(null);
   const webrtcAudioRef = useRef<HTMLAudioElement>(null);
-  const [isWebrtcTest, setIsWebrtcTest] = useState(false);
   // WebRTC 全双工对话（PR 2）：接入 Qwen
   const [isWebrtcCall, setIsWebrtcCall] = useState(false);
   const webrtcCtrlWsRef = useRef<WebSocket | null>(null);
+  const webrtcLipSyncRef = useRef<LipSyncSession | null>(null);
+  const webrtcDialogueIdRef = useRef<string>("");
 
   // 确保 pcmPlayer 的 MediaStream 已经绑到隐藏 <audio> 元素（浏览器 AEC 路径所需）
   function ensureAecBound(sampleRate: number) {
@@ -290,9 +285,9 @@ export default function App() {
   const subtitleEndRef = useRef<HTMLDivElement>(null);
 
   const connectionLabel = useMemo(() => {
-    if (isRecording) return "录音中";
+    if (isWebrtcCall) return "通话中";
     return connectionStatus;
-  }, [connectionStatus, isRecording]);
+  }, [connectionStatus, isWebrtcCall]);
 
   const recentUniqueMedia = useMemo(() => {
     const seen = new Set<string>();
@@ -401,10 +396,30 @@ export default function App() {
   // Tauri IPC event subscription (replaces WS when running inside Tauri host)
   useEffect(() => {
     if (!isTauriEnv()) return;
-    setConnectionStatus("Tauri host 已连接");
+    // 不要在这里写 setConnectionStatus("已连接") —— 那只代表 WebView ↔ Tauri host
+    // 真实的"后端是否可达"由 Rust 端 ws_client 通过 backend_ws_status 事件告知。
+    setConnectionStatus("等待后端…");
+    // Rust 端 ws connect 通常在 React 挂载之前就完成，初次 emit 的事件会丢。
+    // 主动 pull 一次当前状态恢复初始 UI。
+    tauriGetBackendWsStatus().then((snap) => {
+      if (!snap) return;
+      if (snap.connected) {
+        setConnectionStatus(`已连接 (${snap.host})`);
+      } else if (snap.reason && snap.reason !== "not initialized") {
+        setConnectionStatus(`后端未连接：${snap.reason}`);
+      }
+    });
     let cancelled = false;
     let cleanup: (() => void) | undefined;
     subscribeTauriEvents({
+      onBackendWsStatus: (connected, host, reason) => {
+        if (cancelled) return;
+        if (connected) {
+          setConnectionStatus(`已连接 (${host})`);
+        } else {
+          setConnectionStatus(reason ? `后端未连接：${reason}` : `后端未连接 (${host})`);
+        }
+      },
       onToken: (_traceId, text) => {
         if (!cancelled) syncSub.pushToken(text);
       },
@@ -450,19 +465,29 @@ export default function App() {
       },
       onTtsAudioBegin: (_mimeType, codec, sampleRate) => {
         if (cancelled) return;
+        // 只 Unity WebGL 播音频。浏览器 pcmPlayer 不用了（避免双声）。
+        // XVF3800 硬件 AEC 兜底（reference signal 是 USB audio output 总线，
+        // Unity 通过 emscripten WebAudio 输出也走这条总线 → 硬件能扣 echo）。
+        // 如果 Unity 项目的 OnPlayAudio 没真出声（之前测试发现的 case），
+        // 会完全静音 —— 那时需要 Unity 端工程师确认 GameObject "WebCommunication"
+        // 的 OnPlayAudio 接收 base64 wav 并触发 AudioSource.Play()。
+        const dialogueId = `realtime-${Date.now()}`;
+        try { unityBridge.startDialogue(dialogueId); } catch { /* Unity 没准备好 */ }
+        // 仍保留 pcmPlayer 初始化作为 *诊断用* —— 数据不再 push 进去
         if (codec === "pcm_s16le" && sampleRate > 0) {
           ensureAecBound(sampleRate);
-          pcmPlayerRef.current.begin(sampleRate);
         }
       },
       onTtsAudioChunk: (data, _mimeType, codec, sampleRate) => {
         if (cancelled) return;
         if (codec === "pcm_s16le" && sampleRate > 0) {
-          const bytes = decodeBase64ToBytes(data);
-          pcmPlayerRef.current.push(
-            bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
-            sampleRate,
-          );
+          // 只喂 Unity（包 WAV header）；浏览器 pcmPlayer 不再 push
+          try {
+            const wavBase64 = wrapPcmAsWavBase64(data, sampleRate, 1);
+            unityBridge.playAudio(wavBase64, "wav", sampleRate, 1);
+          } catch (err) {
+            console.error("[audio] unity playAudio failed:", err);
+          }
         }
       },
       onTtsAudioEnd: () => {
@@ -682,7 +707,6 @@ export default function App() {
     document.addEventListener("fullscreenchange", onFullscreenChange);
     return () => {
       document.removeEventListener("fullscreenchange", onFullscreenChange);
-      recorderRef.current?.stream.getTracks().forEach((track) => track.stop());
       if (!isTauriEnv()) {
         directSocketRef.current?.close();
       }
@@ -1031,339 +1055,6 @@ export default function App() {
     }
   }
 
-  async function stopRecording() {
-    const recorder = recorderRef.current;
-    if (!recorder) return;
-    recorder.stop();
-    recorder.stream.getTracks().forEach((track) => track.stop());
-    recorderRef.current = null;
-    setIsRecording(false);
-    setConnectionStatus("录音结束，正在上传");
-  }
-
-  async function startRecording() {
-    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
-      setConnectionStatus("当前浏览器不支持录音");
-      return;
-    }
-
-    try {
-      if (!isTauriEnv()) {
-        await ensureAssistantSocket();
-      }
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mimeType = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"].find((candidate) => MediaRecorder.isTypeSupported(candidate));
-      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
-      recorderChunksRef.current = [];
-      const traceId = `browser-audio-${Date.now()}`;
-      if (!isTauriEnv()) {
-        ensureVoiceUserMessage(traceId); // Browser mode: show immediately
-      }
-      recorderRef.current = recorder;
-      setIsRecording(true);
-      setConnectionStatus("录音中");
-
-      recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          recorderChunksRef.current.push(event.data);
-        }
-      };
-
-      recorder.onerror = () => {
-        setIsRecording(false);
-        setConnectionStatus("录音器出错");
-      };
-
-      recorder.onstop = async () => {
-        const blob = new Blob(recorderChunksRef.current, { type: recorder.mimeType || "audio/webm" });
-
-        // Transcode browser audio (webm/opus) → 16kHz mono WAV to match device format
-        let wavBase64: string;
-        try {
-          const arrayBuf = await blob.arrayBuffer();
-          const audioCtx = new AudioContext();
-          const decoded = await audioCtx.decodeAudioData(arrayBuf);
-          audioCtx.close().catch(() => {});
-
-          // Resample to 16kHz mono via OfflineAudioContext
-          const targetRate = 16000;
-          const offlineLen = Math.round(decoded.duration * targetRate);
-          const offline = new OfflineAudioContext(1, offlineLen, targetRate);
-          const src = offline.createBufferSource();
-          src.buffer = decoded;
-          src.connect(offline.destination);
-          src.start();
-          const rendered = await offline.startRendering();
-          const float32 = rendered.getChannelData(0);
-
-          // Float32 → Int16 PCM + WAV header
-          const pcmLen = float32.length * 2;
-          const wavLen = 44 + pcmLen;
-          const wavBuf = new ArrayBuffer(wavLen);
-          const view = new DataView(wavBuf);
-          // RIFF header
-          const writeStr = (off: number, s: string) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
-          writeStr(0, "RIFF");
-          view.setUint32(4, wavLen - 8, true);
-          writeStr(8, "WAVE");
-          writeStr(12, "fmt ");
-          view.setUint32(16, 16, true);        // fmt chunk size
-          view.setUint16(20, 1, true);          // PCM
-          view.setUint16(22, 1, true);          // mono
-          view.setUint32(24, targetRate, true);  // sample rate
-          view.setUint32(28, targetRate * 2, true); // byte rate
-          view.setUint16(32, 2, true);          // block align
-          view.setUint16(34, 16, true);         // bits per sample
-          writeStr(36, "data");
-          view.setUint32(40, pcmLen, true);
-          // PCM samples
-          for (let i = 0; i < float32.length; i++) {
-            const s = Math.max(-1, Math.min(1, float32[i]));
-            view.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-          }
-
-          // ArrayBuffer → base64
-          const wavBytes = new Uint8Array(wavBuf);
-          let binary = "";
-          const chunk = 0x8000;
-          for (let i = 0; i < wavBytes.length; i += chunk) {
-            binary += String.fromCharCode.apply(null, Array.from(wavBytes.subarray(i, i + chunk)));
-          }
-          wavBase64 = btoa(binary);
-        } catch (err) {
-          console.error("[Recording] Transcode to WAV failed, falling back to raw:", err);
-          // Fallback: send original blob as-is
-          const rawBuf = await blob.arrayBuffer();
-          const rawBytes = new Uint8Array(rawBuf);
-          let binary = "";
-          for (const byte of rawBytes) binary += String.fromCharCode(byte);
-          wavBase64 = btoa(binary);
-        }
-
-        const wavMime = "audio/wav";
-        try {
-          if (isTauriEnv()) {
-            // Tauri: send to Rust host — it will emit voice_message back to display
-            await tauriSendAudio(traceId, wavBase64, wavMime, "zh");
-          } else {
-          // Browser: display locally + send via WS
-          ensureVoiceUserMessage(traceId, "语音识别中…", URL.createObjectURL(blob));
-          const socket = await ensureAssistantSocket();
-          socket.send(JSON.stringify({
-            type: "audio_segment_begin",
-            traceId,
-            deviceId: directDeviceId.trim(),
-            mimeType: wavMime,
-            codec: "pcm_s16le",
-            language: "zh",
-            context: buildMediaContext(),
-          }));
-          socket.send(JSON.stringify({
-            type: "audio_segment_chunk",
-            traceId,
-            deviceId: directDeviceId.trim(),
-            seq: 0,
-            data: wavBase64,
-          }));
-          socket.send(JSON.stringify({
-            type: "audio_segment_end",
-            traceId,
-            deviceId: directDeviceId.trim(),
-            reason: "browser_recording_complete",
-          }));
-          } // end else (non-Tauri)
-        } catch (error) {
-          setConnectionStatus(error instanceof Error ? error.message : "录音上传失败");
-        }
-      };
-
-      recorder.start();
-    } catch (error) {
-      setIsRecording(false);
-      setConnectionStatus(error instanceof Error ? error.message : "无法开始录音");
-    }
-  }
-
-  // ── Phone-call mode (continuous streaming to backend realtime) ──────
-  // Uses Web Audio API to capture 16kHz mono PCM in small chunks (~100ms each),
-  // base64-encoded and sent as audio_stream_chunk. Server-side VAD (Qwen) handles
-  // utterance boundaries; client does NOT VAD.
-
-  async function startPhoneCall(): Promise<void> {
-    if (isPhoneCall) return;
-    if (isTauriEnv()) {
-      setConnectionStatus("Tauri 模式暂不支持电话模式");
-      return;
-    }
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setConnectionStatus("浏览器不支持录音");
-      return;
-    }
-    try {
-      const socket = await ensureAssistantSocket();
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          sampleRate: 16000,
-          channelCount: 1,
-          // AEC 开关默认关（会导致麦克风采集变静音）；开 Web AEC 时通过 localStorage wakefusion.enableWebAec=1
-          echoCancellation: localStorage.getItem("wakefusion.enableWebAec") === "1",
-          noiseSuppression: true,
-          autoGainControl: false,
-        },
-      });
-      phoneCallStreamRef.current = stream;
-
-      // AEC 准备：让 pcmPlayer 的 MediaStream 输出绑到 <audio> 元素，
-      // 浏览器 AEC 才能把"我方 TTS 输出"从麦克风输入里扣除回声
-      // 电话按钮点击本身就是用户手势，audio.play() 此时一定成功
-      ensureAecBound(24000);
-
-      // Create AudioContext at target sample rate if possible; otherwise use default and resample.
-      const ctx = new AudioContext({ sampleRate: 16000 });
-      phoneCallCtxRef.current = ctx;
-      const source = ctx.createMediaStreamSource(stream);
-
-      // ScriptProcessorNode is deprecated but universally supported.
-      // Buffer size 2048 @ 16kHz ≈ 128ms per chunk.
-      const processor = ctx.createScriptProcessor(2048, 1, 1);
-      phoneCallNodeRef.current = processor;
-
-      const traceId = `phone-${Date.now()}`;
-      phoneCallTraceIdRef.current = traceId;
-      phoneCallSeqRef.current = 0;
-
-      // Send stream_start
-      console.log("[phone] AudioContext sampleRate =", ctx.sampleRate);
-      socket.send(JSON.stringify({
-        type: "audio_stream_start",
-        traceId,
-        deviceId: directDeviceId.trim(),
-        mimeType: "audio/pcm",
-        codec: "pcm_s16le",
-        sampleRate: ctx.sampleRate,
-        channels: 1,
-        language: "zh",
-      }));
-
-      processor.onaudioprocess = (ev) => {
-        if (!phoneCallNodeRef.current) return;
-        const float32 = ev.inputBuffer.getChannelData(0);
-        // Diagnostic: compute RMS every ~20 chunks (~2.5s)
-        if (phoneCallSeqRef.current % 20 === 0) {
-          let sum = 0;
-          for (let i = 0; i < float32.length; i++) sum += float32[i] * float32[i];
-          const rms = Math.sqrt(sum / float32.length);
-          console.log(`[phone] seq=${phoneCallSeqRef.current} rms=${rms.toFixed(4)} len=${float32.length}`);
-        }
-        // 🔇 半双工：TTS 播放期间 + 尾音 500ms 内，上行改发静音 PCM
-        // 防止扬声器回声被 Qwen server_vad 误当成用户说话触发 barge-in 循环
-        const mute = ttsPlayingRef.current || Date.now() < ttsTailUntilRef.current;
-        // Float32 → Int16 PCM（mute 时直接零）
-        const pcm = new Int16Array(float32.length);
-        if (!mute) {
-          for (let i = 0; i < float32.length; i++) {
-            const s = Math.max(-1, Math.min(1, float32[i]));
-            pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-          }
-        }
-        // mute=true 时 pcm 保持全 0（Int16Array 默认 0）
-        // Int16Array → base64
-        const bytes = new Uint8Array(pcm.buffer);
-        let binary = "";
-        const chunkSize = 0x8000;
-        for (let i = 0; i < bytes.length; i += chunkSize) {
-          binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunkSize)));
-        }
-        const b64 = btoa(binary);
-        socket.send(JSON.stringify({
-          type: "audio_stream_chunk",
-          traceId,
-          deviceId: directDeviceId.trim(),
-          seq: phoneCallSeqRef.current++,
-          data: b64,
-        }));
-      };
-
-      source.connect(processor);
-      processor.connect(ctx.destination);
-
-      setIsPhoneCall(true);
-      setConnectionStatus("电话模式已接通");
-    } catch (err) {
-      setConnectionStatus(err instanceof Error ? err.message : "无法启动电话模式");
-      stopPhoneCall();
-    }
-  }
-
-  function stopPhoneCall(): void {
-    const traceId = phoneCallTraceIdRef.current;
-    try {
-      // Send stream_stop over existing socket (best-effort)
-      const socket = directSocketRef.current;
-      if (socket && socket.readyState === WebSocket.OPEN && traceId) {
-        socket.send(JSON.stringify({
-          type: "audio_stream_stop",
-          traceId,
-          deviceId: directDeviceId.trim(),
-          reason: "user_ended",
-        }));
-      }
-    } catch { /* ignore */ }
-    try { phoneCallNodeRef.current?.disconnect(); } catch { /* ignore */ }
-    try { phoneCallCtxRef.current?.close(); } catch { /* ignore */ }
-    try { phoneCallStreamRef.current?.getTracks().forEach((t) => t.stop()); } catch { /* ignore */ }
-    pcmPlayerRef.current.interrupt();
-    phoneCallNodeRef.current = null;
-    phoneCallCtxRef.current = null;
-    phoneCallStreamRef.current = null;
-    phoneCallTraceIdRef.current = "";
-    phoneCallSeqRef.current = 0;
-    setIsPhoneCall(false);
-    setConnectionStatus("电话已挂断");
-  }
-
-  // ── WebRTC Loopback 测试（PR 1）────────────────────────────────────
-  async function startWebrtcTest(): Promise<void> {
-    if (isWebrtcTest) return;
-    if (isTauriEnv()) {
-      setConnectionStatus("Tauri 模式不支持 WebRTC 测试");
-      return;
-    }
-    try {
-      // 后端 HTTP base：去掉 /api/voice/ws 这种 ws 路径，只要 origin
-      const wsUrl = directWsBaseUrl;
-      const httpBase = wsUrl.replace(/^ws:/, "http:").replace(/^wss:/, "https:").replace(/\/api\/voice\/ws.*$/, "");
-      const client = new WebRTCClient({
-        backendHttpUrl: httpBase,
-        onConnected: () => setConnectionStatus("WebRTC 已连接（loopback）"),
-        onClosed: (r) => setConnectionStatus(`WebRTC 已断开：${r}`),
-        onError: (e) => setConnectionStatus(`WebRTC 错误：${e.message}`),
-        onRemoteStream: (stream) => {
-          if (webrtcAudioRef.current) {
-            webrtcAudioRef.current.srcObject = stream;
-            void webrtcAudioRef.current.play().catch(() => {});
-          }
-        },
-      });
-      webrtcClientRef.current = client;
-      await client.start();
-      setIsWebrtcTest(true);
-      setConnectionStatus("WebRTC 协商完成，说话测试自己听");
-    } catch (err) {
-      setConnectionStatus(err instanceof Error ? err.message : "WebRTC 启动失败");
-      webrtcClientRef.current?.stop();
-      webrtcClientRef.current = null;
-    }
-  }
-
-  function stopWebrtcTest(): void {
-    webrtcClientRef.current?.stop();
-    webrtcClientRef.current = null;
-    if (webrtcAudioRef.current) webrtcAudioRef.current.srcObject = null;
-    setIsWebrtcTest(false);
-    setConnectionStatus("WebRTC 测试已停止");
-  }
-
   // ── WebRTC 全双工对话（PR 2）：接入 Qwen ────────────────────────────
   async function startWebrtcCall(): Promise<void> {
     if (isWebrtcCall) return;
@@ -1399,6 +1090,11 @@ export default function App() {
         } catch { /* ignore */ }
       };
 
+      // 通知 Unity：新对话开始（让数字人切换到说话状态机）
+      const dialogueId = `webrtc-${Date.now()}`;
+      webrtcDialogueIdRef.current = dialogueId;
+      unityBridge.startDialogue(dialogueId);
+
       const client = new WebRTCClient({
         backendHttpUrl: httpBase,
         endpoint: "/api/voice/webrtc/offer",
@@ -1407,8 +1103,16 @@ export default function App() {
         onClosed: (r) => setConnectionStatus(`WebRTC 已断开：${r}`),
         onError: (e) => setConnectionStatus(`WebRTC 错误：${e.message}`),
         onRemoteStream: (stream) => {
+          // ⚠️ 浏览器 <audio> 必须出声、不能 muted。
+          // 浏览器 RTC AEC 把 <audio> 输出当作 echo reference signal —
+          // muted=true 会让 AEC 失效，Unity 的扬声器输出被麦克风采集回去触发
+          // server VAD 死循环，Qwen 永远说不完一句话就被打断。
+          //
+          // 所以：浏览器独占出声 + AEC 正常。Unity 嘴型同步暂时关掉，
+          // 等找到 Unity 端"只接收 envelope 不出声"的接口后再做。
           if (webrtcAudioRef.current) {
             webrtcAudioRef.current.srcObject = stream;
+            webrtcAudioRef.current.muted = false;
             void webrtcAudioRef.current.play().catch(() => {});
           }
         },
@@ -1428,6 +1132,10 @@ export default function App() {
     webrtcClientRef.current = null;
     try { webrtcCtrlWsRef.current?.close(); } catch { /* ignore */ }
     webrtcCtrlWsRef.current = null;
+    try { webrtcLipSyncRef.current?.stop(); } catch { /* ignore */ }
+    webrtcLipSyncRef.current = null;
+    try { unityBridge.interrupt(); } catch { /* ignore */ }
+    webrtcDialogueIdRef.current = "";
     if (webrtcAudioRef.current) webrtcAudioRef.current.srcObject = null;
     setIsWebrtcCall(false);
     setConnectionStatus("WebRTC 对话已结束");
@@ -1442,23 +1150,46 @@ export default function App() {
     return bytes;
   }
 
+  /**
+   * 把 base64 编码的 raw PCM (s16le) 包成 base64 编码的 WAV，
+   * 让 Unity OnPlayAudio (期望 wav 格式) 能直接吃。
+   * 每个 audio_chunk 独立打 header，Unity 内部排队播放。
+   */
+  function wrapPcmAsWavBase64(pcmBase64: string, sampleRate: number, channels: number): string {
+    const pcm = decodeBase64ToBytes(pcmBase64);
+    const byteRate = sampleRate * channels * 2;
+    const blockAlign = channels * 2;
+    const wavLen = 44 + pcm.byteLength;
+    const buf = new ArrayBuffer(wavLen);
+    const view = new DataView(buf);
+    const writeStr = (off: number, s: string) => {
+      for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i));
+    };
+    writeStr(0, "RIFF");
+    view.setUint32(4, wavLen - 8, true);
+    writeStr(8, "WAVE");
+    writeStr(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);                  // PCM
+    view.setUint16(22, channels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, byteRate, true);
+    view.setUint16(32, blockAlign, true);
+    view.setUint16(34, 16, true);                 // bits per sample
+    writeStr(36, "data");
+    view.setUint32(40, pcm.byteLength, true);
+    new Uint8Array(buf, 44).set(pcm);
+    // base64 编码
+    const all = new Uint8Array(buf);
+    let binary = "";
+    const step = 0x8000;
+    for (let i = 0; i < all.length; i += step) {
+      binary += String.fromCharCode.apply(null, Array.from(all.subarray(i, i + step)));
+    }
+    return btoa(binary);
+  }
+
   // (Old TTS playback functions removed — audio playback now handled by useSyncedSubtitle)
-
-  function isolateComposerKeyboard(event: React.KeyboardEvent<HTMLTextAreaElement>) {
-    event.stopPropagation();
-    if (event.key === "Backspace" || event.key === "Delete") {
-      const nativeEvent = event.nativeEvent as KeyboardEvent;
-      nativeEvent.stopImmediatePropagation?.();
-    }
-  }
-
-  function handleComposerKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
-    isolateComposerKeyboard(event);
-    if (event.key === "Enter" && !event.shiftKey) {
-      event.preventDefault();
-      void sendText();
-    }
-  }
 
   async function ragFetch(path: string, init?: RequestInit) {
     const requestUrl = `${ragApiBaseUrl}${path}`;
@@ -1694,8 +1425,10 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [ragOpen, ragTenantId]);
 
+  const anyDrawerOpen = devicePanelOpen || ragOpen || personaOpen;
+
   return (
-    <div className="app-shell" ref={appShellRef}>
+    <div className={`app-shell ${anyDrawerOpen ? "is-drawer-open" : ""}`} ref={appShellRef}>
       {/* AEC 辅助：隐藏的 <audio> 播放 pcmPlayer 的 MediaStream 输出，让浏览器 AEC 识别 */}
       <audio ref={aecAudioRef} autoPlay playsInline style={{ display: "none" }} />
       {/* WebRTC 测试：隐藏 <audio> 播放 RTCPeerConnection 的 remote stream（浏览器 AEC 自动生效） */}
@@ -1727,10 +1460,12 @@ export default function App() {
             <div>{loadingProgress}%</div>
           </div>
         )}
-        <ParticleBackground dimmed={stageMode === "media" || stageMode === "loading"} />
-        <div className={`stage-avatar-shell ${stageMode === "media" || stageMode === "loading" ? "is-dimmed" : ""}`}>
-          <canvas ref={canvasRef} className="unity-canvas" />
-        </div>
+        <EditorialBackdrop dimmed={stageMode === "media" || stageMode === "loading"} />
+        <DraggableAvatarFrame controller={avatarController}>
+          <div className={`stage-avatar-shell ${stageMode === "media" || stageMode === "loading" ? "is-dimmed" : ""}`}>
+            <canvas ref={canvasRef} className="unity-canvas" />
+          </div>
+        </DraggableAvatarFrame>
         <MediaPresenter machine={mediaMachine} volume={stageMediaVolume} />
       </div>
 
@@ -1742,18 +1477,12 @@ export default function App() {
           onDoubleClick={() => setUiVisible((v) => !v)}
         />
 
-        {/* Top-left: branding */}
-        {uiVisible && (
-          <div className="overlay-branding">
-            <span className="brand-name-cn">成都曜曜慧道科技有限公司</span>
-            <span className="brand-name-en">Chengdu YaoYao Huidao Exhibition Co., Ltd.</span>
-          </div>
-        )}
+        {/* 顶左品牌 lockup 已移除：品牌渲染只保留在 EditorialBackdrop 顶部刊头，避免重复 */}
 
         {/* Top-right: status + fullscreen + management */}
         {uiVisible && (
           <header className="overlay-header">
-            <div className={`overlay-status ${isRecording ? "is-recording" : ""}`}>{connectionLabel}</div>
+            <div className={`overlay-status ${isWebrtcCall ? "is-recording" : ""}`}>{connectionLabel}</div>
             <button
               type="button"
               className="overlay-btn"
@@ -1761,6 +1490,18 @@ export default function App() {
               aria-label={isStageFullscreen ? "退出全屏" : "全屏"}
             >
               {isStageFullscreen ? <Minimize className="h-4 w-4" /> : <Maximize className="h-4 w-4" />}
+            </button>
+            <button
+              type="button"
+              className={`overlay-btn ${avatarController.editMode ? "is-active" : ""}`}
+              onClick={() => {
+                avatarController.toggleEdit();
+                setAvatarPanelOpen((v) => !v);
+              }}
+              aria-label="调整数字人位置/大小"
+              title="调整数字人"
+            >
+              <Settings className="h-4 w-4" />
             </button>
             <button
               type="button"
@@ -1778,6 +1519,17 @@ export default function App() {
             </button>
           </header>
         )}
+
+        {/* Avatar settings floating window (Vogue editorial) */}
+        {avatarPanelOpen ? (
+          <AvatarSettingsPanel
+            controller={avatarController}
+            onClose={() => {
+              avatarController.setEditMode(false);
+              setAvatarPanelOpen(false);
+            }}
+          />
+        ) : null}
 
         {/* Left-bottom: media history (max 3, text cards) */}
         {uiVisible && recentUniqueMedia.length > 0 ? (
@@ -1797,110 +1549,41 @@ export default function App() {
 
         {/* Idle hint */}
         {uiVisible && currentTurnMessages.length === 0 && stageMode === "avatar" ? (
-          <div className="stage-idle-hint">点击下方麦克风开始对话</div>
+          <div className="stage-idle-hint">tap call · 开始对话</div>
         ) : null}
 
-        {/* Live subtitle panel — always visible, not controlled by uiVisible */}
-        {(syncSub.userPhase !== "hidden" || syncSub.assistantPhase !== "hidden") ? (
-          <div className="live-subtitle-panel">
-            {/* Line 1: User voice + text */}
-            {syncSub.userPhase !== "hidden" && syncSub.userVoice ? (
-              <div className={`live-subtitle-line live-subtitle-user ${syncSub.userPhase === "fading" ? "is-fading" : ""}`}>
-                {!syncSub.userVoice.audioId.startsWith("text-") && (
-                  <Volume2 className="live-subtitle-voice-icon" />
-                )}
-                <span className="live-subtitle-text">
-                  {syncSub.userVoice.text || "语音识别中…"}
-                </span>
-              </div>
-            ) : null}
-            {/* Line 2: Assistant text (synced with TTS audio) */}
-            {syncSub.assistantPhase !== "hidden" && syncSub.assistantText ? (
-              <div className={`live-subtitle-line live-subtitle-assistant ${syncSub.assistantPhase === "fading" ? "is-fading" : ""}`}>
-                <span className="live-subtitle-text">{syncSub.assistantText}</span>
-              </div>
-            ) : null}
-          </div>
+        {/* Live subtitle (Vogue editorial) — always visible, not controlled by uiVisible */}
+        <MagazineSubtitle
+          userText={syncSub.userVoice?.text ?? ""}
+          userPhase={syncSub.userPhase}
+          assistantText={syncSub.assistantText}
+          assistantPhase={syncSub.assistantPhase}
+        />
+
+        {/* Right dock: Call (RTC) + Type (keyboard) */}
+        {uiVisible ? (
+          <RightDock
+            isCallActive={isWebrtcCall}
+            callDisabled={isTauriEnv()}
+            callDisabledReason={isTauriEnv() ? "请在浏览器中使用" : undefined}
+            onToggleCall={() => void (isWebrtcCall ? stopWebrtcCall() : startWebrtcCall())}
+            onOpenKeyboard={() => setKeyboardOpen((v) => !v)}
+            isKeyboardOpen={keyboardOpen}
+          />
         ) : null}
 
-        {/* Action bar */}
-        {uiVisible && <div className="action-bar">
-          {showTextInput ? (
-            <div className="action-text-input">
-              <textarea
-                ref={textareaRef}
-                value={input}
-                onChange={(event) => setInput(event.target.value)}
-                onFocus={() => { canvasRef.current?.blur(); }}
-                onKeyDownCapture={isolateComposerKeyboard}
-                onKeyUpCapture={isolateComposerKeyboard}
-                onKeyDown={handleComposerKeyDown}
-                placeholder="输入问题，Enter 发送"
-                rows={1}
-                lang="zh-CN"
-                autoCapitalize="off"
-                autoCorrect="off"
-                spellCheck={false}
-              />
-              <div className="action-text-btns">
-                <button type="button" className={`action-icon-btn ${isRecording ? "is-recording" : ""}`} onClick={() => void (isRecording ? stopRecording() : startRecording())}>
-                  {isRecording ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
-                </button>
-                <button type="button" className="action-send-btn" onClick={() => void sendText()}>
-                  <SendHorizontal className="h-4 w-4" />
-                </button>
-                <button type="button" className="action-close-btn" onClick={() => setShowTextInput(false)}>
-                  <ChevronDown className="h-4 w-4" />
-                </button>
-              </div>
-            </div>
-          ) : (
-            <>
-              <button
-                type="button"
-                className={`mic-button ${isRecording ? "is-recording" : ""}`}
-                onClick={() => void (isRecording ? stopRecording() : startRecording())}
-                disabled={isPhoneCall}
-              >
-                {isRecording ? <MicOff className="h-5 w-5" /> : <Mic className="h-5 w-5" />}
-                <span>{isRecording ? "点击结束录音" : "点击开始对话"}</span>
-              </button>
-              <button
-                type="button"
-                className={`phone-button ${isPhoneCall ? "is-active" : ""}`}
-                onClick={() => void (isPhoneCall ? stopPhoneCall() : startPhoneCall())}
-                disabled={isRecording}
-                title={isPhoneCall ? "挂断电话" : "电话模式（连续对话）"}
-              >
-                {isPhoneCall ? <PhoneOff className="h-5 w-5" /> : <Phone className="h-5 w-5" />}
-                <span>{isPhoneCall ? "挂断" : "电话模式"}</span>
-              </button>
-              <button type="button" className="keyboard-toggle" onClick={() => setShowTextInput(true)} title="文字输入">
-                <Keyboard className="h-5 w-5" />
-              </button>
-              <button
-                type="button"
-                className={`phone-button ${isWebrtcTest ? "is-active" : ""}`}
-                onClick={() => void (isWebrtcTest ? stopWebrtcTest() : startWebrtcTest())}
-                disabled={isRecording || isPhoneCall || isWebrtcCall}
-                title={isWebrtcTest ? "结束 WebRTC 测试" : "WebRTC Loopback 测试（PR1）"}
-                style={{ background: isWebrtcTest ? "#8b5cf6" : undefined }}
-              >
-                <span>{isWebrtcTest ? "RTC停止" : "RTC测试"}</span>
-              </button>
-              <button
-                type="button"
-                className={`phone-button ${isWebrtcCall ? "is-active" : ""}`}
-                onClick={() => void (isWebrtcCall ? stopWebrtcCall() : startWebrtcCall())}
-                disabled={isRecording || isPhoneCall || isWebrtcTest}
-                title={isWebrtcCall ? "结束 WebRTC 对话" : "WebRTC 全双工对话（PR2，Qwen）"}
-                style={{ background: isWebrtcCall ? "#10b981" : undefined }}
-              >
-                <span>{isWebrtcCall ? "RTC挂断" : "RTC对话"}</span>
-              </button>
-            </>
-          )}
-        </div>}
+        {/* Keyboard composer (Vogue inline input) */}
+        {uiVisible && keyboardOpen ? (
+          <KeyboardComposer
+            value={input}
+            onChange={setInput}
+            onSend={() => {
+              void sendText();
+              setKeyboardOpen(false);
+            }}
+            onClose={() => setKeyboardOpen(false)}
+          />
+        ) : null}
       </div>
 
       {/* Device status panel */}

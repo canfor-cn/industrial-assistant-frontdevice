@@ -9,7 +9,7 @@
     {
       "id": "industrial-assistant",
       "label": "Industrial Assistant",
-      "healthUrl": "http://127.0.0.1:7788/api/health"
+      "healthUrl": "http://127.0.0.1:7790/api/health"
     },
     {
       "id": "wakefusion-vision",

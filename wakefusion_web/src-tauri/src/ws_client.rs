@@ -1,11 +1,52 @@
 use crate::config::LlmAgentConfig;
 use crate::ws_protocol::{self, DownstreamMessage, UpstreamMessage};
-use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
+use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
-use tungstenite::{connect, Message};
+use tungstenite::Message;
+
+/// Status of the Tauri host ↔ backend WS link.
+/// Emitted to the WebView so the UI can show real connection state
+/// (instead of mistaking "Tauri host running" for "backend reachable").
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BackendWsStatus {
+    pub connected: bool,
+    pub host: String,
+    pub reason: Option<String>,
+}
+
+/// Last-known status — read by `get_backend_ws_status` Tauri command so the
+/// WebView can pull the current value on mount (avoids the emit-vs-subscribe race
+/// where the Rust connect happens before React useEffect runs).
+static LAST_STATUS: OnceLock<Mutex<BackendWsStatus>> = OnceLock::new();
+
+pub fn current_status() -> BackendWsStatus {
+    LAST_STATUS
+        .get()
+        .and_then(|m| m.lock().ok().map(|g| g.clone()))
+        .unwrap_or(BackendWsStatus {
+            connected: false,
+            host: String::new(),
+            reason: Some("not initialized".into()),
+        })
+}
+
+fn emit_status(app: &AppHandle, host: &str, connected: bool, reason: Option<String>) {
+    let evt = BackendWsStatus {
+        connected,
+        host: host.to_string(),
+        reason,
+    };
+    let cell = LAST_STATUS.get_or_init(|| Mutex::new(evt.clone()));
+    if let Ok(mut g) = cell.lock() { *g = evt.clone(); }
+    if let Err(e) = app.emit("backend_ws_status", &evt) {
+        tracing::warn!("failed to emit backend_ws_status: {e}");
+    }
+}
 
 /// Runs the WS client loop on a dedicated OS thread. Reconnects on disconnect.
 pub fn spawn_ws_thread(
+    app: AppHandle,
     config: LlmAgentConfig,
     downstream_tx: mpsc::UnboundedSender<DownstreamMessage>,
     upstream_rx: crossbeam_channel::Receiver<UpstreamMessage>,
@@ -13,12 +54,13 @@ pub fn spawn_ws_thread(
     std::thread::Builder::new()
         .name("ws-client".into())
         .spawn(move || {
-            ws_loop(config, downstream_tx, upstream_rx);
+            ws_loop(app, config, downstream_tx, upstream_rx);
         })
         .expect("failed to spawn ws-client thread");
 }
 
 fn ws_loop(
+    app: AppHandle,
     config: LlmAgentConfig,
     downstream_tx: mpsc::UnboundedSender<DownstreamMessage>,
     upstream_rx: crossbeam_channel::Receiver<UpstreamMessage>,
@@ -41,10 +83,10 @@ fn ws_loop(
             .replace("wss://", "")
             .split('/')
             .next()
-            .unwrap_or("127.0.0.1:7788")
+            .unwrap_or("127.0.0.1:7790")
             .split('?')
             .next()
-            .unwrap_or("127.0.0.1:7788")
+            .unwrap_or("127.0.0.1:7790")
             .to_string();
         let tcp = match addr_str.parse::<std::net::SocketAddr>() {
             Ok(addr) => std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5)),
@@ -62,6 +104,7 @@ fn ws_loop(
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("Backend unreachable: {e}");
+                emit_status(&app, &config.host, false, Some(format!("backend unreachable: {e}")));
                 std::thread::sleep(std::time::Duration::from_millis(reconnect_ms));
                 continue;
             }
@@ -69,6 +112,7 @@ fn ws_loop(
         match tungstenite::client(&url, tcp_stream) {
             Ok((mut socket, _response)) => {
                 tracing::info!("WS connected");
+                emit_status(&app, &config.host, true, None);
 
                 // Send initial device state
                 let init = UpstreamMessage::DeviceState {
@@ -170,9 +214,11 @@ fn ws_loop(
                 }
 
                 let _ = socket.close(None);
+                emit_status(&app, &config.host, false, Some("disconnected".into()));
             }
             Err(e) => {
                 tracing::warn!("WS connection failed: {e}");
+                emit_status(&app, &config.host, false, Some(format!("ws handshake failed: {e}")));
             }
         }
 

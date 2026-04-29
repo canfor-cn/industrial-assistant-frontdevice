@@ -136,7 +136,7 @@ impl Default for ZmqConfig {
     }
 }
 
-fn default_host() -> String { "127.0.0.1:7788".into() }
+fn default_host() -> String { "127.0.0.1:7790".into() }
 fn default_device_id() -> String { "wakefusion-device-01".into() }
 fn default_token() -> String { "test-voice-token".into() }
 fn default_reconnect() -> f64 { 5.0 }

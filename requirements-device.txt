@@ -25,3 +25,8 @@ pyorbbecsdk2>=2.0.0
 # face_embedder uses cv2.estimateAffinePartial2D / cv2.warpAffine for ArcFace alignment.
 # vision_service.py also relies on cv2.FaceDetectorYN as a MediaPipe fallback.
 opencv-python>=4.8.0
+
+# XVF3800 USB control (fixed beam + DOA polling)
+# libusb-package 自带 libusb-1.0.dll（pyusb 默认不带，Windows 会报 "No backend available"）
+pyusb>=1.2.0
+libusb-package>=1.0.26

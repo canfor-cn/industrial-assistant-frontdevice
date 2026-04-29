@@ -102,3 +102,11 @@ pub async fn host_status(
         device_addr,
     })
 }
+
+/// Pull the last-known backend WS status. Used by the WebView at mount time
+/// to recover from missed `backend_ws_status` events (Rust connect typically
+/// happens before React useEffect runs and subscribes).
+#[tauri::command]
+pub async fn get_backend_ws_status() -> Result<crate::ws_client::BackendWsStatus, String> {
+    Ok(crate::ws_client::current_status())
+}

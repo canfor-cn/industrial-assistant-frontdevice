@@ -507,13 +507,39 @@ def main():
     print("=" * 55)
     print("🎙️  WakeFusion Audio Service")
     print("=" * 55)
+    # 🔥 A2 架构：检查 config.kws.enabled
+    # 关闭 KWS 后 infer() 永远返回 "others"，不会发出唤醒事件。
+    # 触发逻辑改成"视觉 + DOA 持续推流"，由 core_server 直接进入 interactive 模式。
+    kws_enabled_in_config = True
+    try:
+        kws_enabled_in_config = bool(get_config().kws.enabled)
+    except Exception:
+        pass
+
     # 🌟 修复：直接默认使用 OpenWakeWord 模型，不再提供选择
     use_oww = True
-    print(f"使用唤醒词模型: OpenWakeWord CNN ({OWW_MODEL_PATH})")
+
+    if not kws_enabled_in_config:
+        print("🛑 KWS 已在 config 中禁用 (kws.enabled=false)，跳过模型加载，唤醒词检测不可用")
+        # dummy infer：永远不会返回 "xiaokang"，KWS 路径相当于完全失效
+        def infer(audio_float32):
+            return "others", 0.0
+        oww_session = None
+        oww_features = None
+        model_tag = "KWS disabled"
+        # 用一个 sentinel 让下面的 `if use_oww:` 分支跳过模型加载
+        use_oww = False
+        # 但也不要走 `else:` NeMo 分支，所以下面用 `_kws_skip_model_load` 标记
+        _kws_skip_model_load = True
+    else:
+        print(f"使用唤醒词模型: OpenWakeWord CNN ({OWW_MODEL_PATH})")
+        _kws_skip_model_load = False
 
     # ── 加载模型，生成统一的 infer(audio_float32) 闭包 ─────────
     # infer() 接受 float32 音频数组，返回 (label_str, confidence_float)
-    if use_oww:
+    if _kws_skip_model_load:
+        pass  # KWS 已禁用，infer 已经被定义成 dummy
+    elif use_oww:
         import onnxruntime as ort
         from openwakeword.utils import AudioFeatures
 

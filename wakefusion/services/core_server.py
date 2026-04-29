@@ -20,6 +20,7 @@ import queue
 import logging
 import uuid
 import asyncio
+import numpy as np
 from enum import Enum
 from typing import Optional
 from wakefusion.config import get_config
@@ -60,6 +61,36 @@ class CoreServer:
         self.conversation_config = self.config.conversation
         self.llm_agent_config = self.config.llm_agent
         self.audio_playback_config = self.config.audio_playback
+
+        # ── XVF3800 DOA 软门控配置（fixed-beam 之外的双保险） ──
+        # 直接读 yaml dict 取 xvf3800.doa_gate.* 字段（避免改 Pydantic 模型）。
+        self._xvf_doa_gate_enabled = False
+        self._xvf_doa_gate_half_deg = 30.0
+        self._xvf_doa_gate_offset_deg = 0.0
+        self._xvf_doa_gate_log_count = 0
+        try:
+            import yaml as _yaml
+            if config_path:
+                with open(config_path, "r", encoding="utf-8") as _f:
+                    _y = _yaml.safe_load(_f) or {}
+                _doa = (_y.get("xvf3800") or {}).get("doa_gate") or {}
+                self._xvf_doa_gate_enabled = bool(_doa.get("enabled", False))
+                self._xvf_doa_gate_half_deg = float(_doa.get("half_angle_deg", 30.0))
+                self._xvf_doa_gate_offset_deg = float(_doa.get("azimuth_offset_deg", 0.0))
+        except Exception:
+            pass
+
+        if self._xvf_doa_gate_enabled:
+            try:
+                from wakefusion.services.xvf3800_control import start_doa_polling
+                start_doa_polling(period_ms=50)  # 20Hz
+                logger.info(
+                    "🎯 [DOA] 软门控启用：声源超出 ±%.1f° 半角则丢弃（offset=%+.1f°）",
+                    self._xvf_doa_gate_half_deg, self._xvf_doa_gate_offset_deg,
+                )
+            except Exception as exc:
+                logger.warning("XVF3800 DOA polling start failed: %s", exc)
+                self._xvf_doa_gate_enabled = False
         
         # 初始化ZMQ Context
         self.zmq_context = zmq.Context()
@@ -621,6 +652,7 @@ class CoreServer:
             # Rust 前端 TTS 播完 — 开始等待用户下一句话
             self.is_playing_tts = False
             self._last_speech_time = time.time()  # 从现在开始计算空闲
+            self._last_tts_end_at = time.time()    # KWS 抑制窗起点（之后 1.5s 内忽略 KWS）
             logger.info("🔇 [持续对话] TTS 播放完毕，等待用户继续对话...")
         elif msg_type == "pong":
             # Ping响应
@@ -1058,8 +1090,13 @@ class CoreServer:
                 return False
         return False
     
-    def _exit_interactive_mode(self, use_abort: bool = False):
-        """退出交互模式（替代原来的_transition_to_idle）"""
+    def _exit_interactive_mode(self, use_abort: bool = False, quiet: bool = False):
+        """退出交互模式（替代原来的_transition_to_idle）
+
+        quiet=True：仅做 device 内部状态清理（trace_id、阈值、标志），
+        不发任何控制消息给后端（不发 interrupt/audio_stream_stop/audio_segment_end）。
+        给"纯传声筒"场景用 —— 后端通过 Qwen Realtime 自己处理 turn 边界。
+        """
         with self._state_lock:
             logger.info(f"状态转换: 退出交互模式")
             if self._media_ducked:
@@ -1072,8 +1109,8 @@ class CoreServer:
             if self._interactive_timeout_thread and self._interactive_timeout_thread.is_alive():
                 self._interactive_timeout_should_exit = True
             
-            # 如果正在交互，需要发送结束标记并停止音频推流
-            if self.is_interactive_mode:
+            # 如果正在交互，需要发送结束标记并停止音频推流（quiet 模式下跳过所有发送）
+            if self.is_interactive_mode and not quiet:
                 realtime_mode = getattr(self.llm_agent_config, "realtime_mode", False)
                 if use_abort:
                     # 发送interrupt消息给服务端
@@ -1102,6 +1139,12 @@ class CoreServer:
                 delattr(self, '_vision_wake_debounce_start')
             if hasattr(self, '_vision_leave_debounce_start'):
                 delattr(self, '_vision_leave_debounce_start')
+            # 方案 X：清掉视觉斩断挂起日志标志
+            if getattr(self, '_pending_exit_logged', False):
+                self._pending_exit_logged = False
+            # 视觉挂起标志清理（避免下次进入交互时残留）
+            if hasattr(self, '_visual_silence_logged'):
+                delattr(self, '_visual_silence_logged')
             
             # 🌟 核心修复：状态重置和日志对齐
             self.is_interactive_mode = False
@@ -1112,15 +1155,17 @@ class CoreServer:
             self._send_stop_streaming_command()
 
             # 🌟 向后端发送 timeout_exit，让后端彻底终止所有进行中的 ASR/LLM/TTS
-            try:
-                self._send_websocket_message({
-                    "type": "timeout_exit",
-                    "deviceId": self.llm_agent_config.device_id,
-                    "reason": "exit_interactive",
-                    "timestamp": time.time(),
-                })
-            except Exception as e:
-                logger.warning(f"⚠️ 发送 timeout_exit 失败: {e}")
+            # quiet 模式跳过此通知，让后端通过 Qwen Realtime semantic_vad 自己处理 turn 边界
+            if not quiet:
+                try:
+                    self._send_websocket_message({
+                        "type": "timeout_exit",
+                        "deviceId": self.llm_agent_config.device_id,
+                        "reason": "exit_interactive",
+                        "timestamp": time.time(),
+                    })
+                except Exception as e:
+                    logger.warning(f"⚠️ 发送 timeout_exit 失败: {e}")
             
             # 休眠时关闭唇动检测，节省 CPU/GPU 算力
             if self._lip_sync_event is not None:
@@ -1391,44 +1436,16 @@ class CoreServer:
         pass
     
     def _interactive_timeout_checker(self):
-        """后台线程：持续对话空闲超时检测
-        TTS 播放中不计时，TTS 播完后开始倒计时"""
-        logger.info("⏱️ [持续对话超时检查线程] 已启动")
-        # 视觉直接触发模式下：只要人还在镜头前就不退出，人离开会通过
-        # _vision_leave_debounce_start 机制触发退出（见 _process_vision_data）
-        IDLE_TIMEOUT_SHORT = 15.0   # 纯语音/视觉降维路径：15 秒空闲退出
-        IDLE_TIMEOUT_LONG = 60.0    # 视觉直接触发：60 秒空闲退出（人可以慢慢想）
-        MAX_TIMEOUT = 180.0         # 极限保底
+        """后台线程：保留生命周期但**完全不做主动退出**。
+        device 一旦进入 interactive 模式就永不主动退出 —— 退出权完全交给后端。
+        线程保留是为了 _interactive_timeout_should_exit 信号能让线程优雅终止（在 _exit_interactive_mode 触发时）。"""
+        logger.info("⏱️ [持续对话超时检查线程] 已启动（device 永不主动超时退出）")
         while True:
             if self._interactive_timeout_should_exit:
                 logger.info("⏱️ [持续对话超时检查线程] 收到退出信号")
                 break
-
             time.sleep(1.0)
-
-            if not self.is_interactive_mode:
-                continue
-
-            if self.is_playing_tts:
-                # TTS 正在播放，用户在听，不计时
-                self._last_speech_time = time.time()
-                continue
-
-            now = time.time()
-            elapsed = now - self._last_speech_time if self._last_speech_time else 0
-
-            # 持续对话模式用长超时；其他模式用短超时
-            wake_path = getattr(self, '_current_wake_path', 'unknown')
-            idle_timeout = IDLE_TIMEOUT_LONG if wake_path == "视觉直接触发" else IDLE_TIMEOUT_SHORT
-
-            # 空闲超时：退出（人离开通常先由视觉防抖触发退出）
-            if elapsed > idle_timeout:
-                logger.warning(f"🛑 [持续对话] 空闲 {elapsed:.0f}秒 (路径={wake_path}，阈值={idle_timeout}s)，退出交互模式")
-                self._exit_interactive_mode()
-            # 极限保底
-            elif elapsed > MAX_TIMEOUT:
-                logger.warning(f"🛑 [持续对话] 极限保底 {MAX_TIMEOUT}秒，强制退出")
-                self._exit_interactive_mode()
+            # 不做任何退出判断 —— device 永不主动退出
     
     def _start_tts_playback(self):
         """开始TTS播放（设置is_playing_tts标志）"""
@@ -1846,54 +1863,34 @@ class CoreServer:
                     logger.info(f"👁️ 视觉降维打击结束，阈值已恢复至{self.audio_threshold_config.default:.2f}，视觉触发模式关闭")
                     self._is_vision_wake_active = False
 
-                    # 2. 无人时强制终止交互模式（无论什么唤醒路径）
-                    if self.is_interactive_mode:
-                        logger.info(f"🛑 视觉检测无人 {leave_debounce_s}s，强制退出交互模式（唤醒路径={wake_path}，距离={distance_m}m）")
-                        self._exit_interactive_mode()
+                    # device 不再主动退出交互模式 —— 全交给后端管理。
+                    # 视觉挂起只决定推真音频还是 silence（见下方"视觉挂起判断"段），不触发退出。
         
         # ========== 视觉区间判断（用于视觉斩断） ==========
         vision_target_present = self._check_vision_target_present(faces)
         
-        # 带防抖的视觉斩断判断
+        # 视觉挂起两段窗口（device 不退出，只决定推真音频/silence）：
+        #   · 0-5s 宽容期：用户可能短暂转头/低头，仍正常推流（latching 规则不变）
+        #   · ≥5s：永久推 silence（直到用户回到镜头），device 永不主动退出交互
+        # 任意时刻人脸回归 → 立即清除 T0 → 推流恢复正常。
+        # 退出权完全交给后端（后端可发 stop 指令让 device 退出，或 ws 断开后 device 重连重建 trace）。
         if not vision_target_present:
             if not hasattr(self, '_vision_leave_debounce_start'):
                 self._vision_leave_debounce_start = time.time()
-            elif time.time() - self._vision_leave_debounce_start >= (self.vision_wake_config.leave_debounce_ms / 1000.0):
-                # 触发视觉斩断
-                with self._state_lock:
-                    self.is_vision_target_present = False
-                    if self.is_interactive_mode:
-                        timed_out_trace_id = self._current_trace_id
-                        # 🌟 修复3：视觉斩断时的断尾处理
-                        # 如果人离开镜头的瞬间，他正好还在说话（_current_trace_id 还不为 None），
-                        # 先发送 audio_end 来正常闭合 ASR 管道，然后再发送 timeout_exit
-                        if self._current_trace_id:
-                            logger.info("🔄 视觉斩断：检测到未完成的对话，先发送 audio_end 闭合 ASR 管道")
-                            self._send_audio_segment_end(self._current_trace_id, "visual_cutoff")
-                            self._current_trace_id = None
-                        
-                        # 停止交互
-                        self._exit_interactive_mode(use_abort=True)
-                        
-                        # 发送timeout_exit通知服务端
-                        if self._ws_connected and self._ws_client and self._ws_loop:
-                            try:
-                                asyncio.run_coroutine_threadsafe(
-                                    self._send_websocket_text({
-                                        "type": "timeout_exit",
-                                        "deviceId": self.llm_agent_config.device_id,
-                                        "traceId": timed_out_trace_id,
-                                        "timestamp": time.time()
-                                    }),
-                                    self._ws_loop
-                                )
-                            except Exception as e:
-                                logger.error(f"发送timeout_exit消息失败: {e}")
-                        logger.info("🚨 视觉斩断：用户离开[0.4m, 4.5m]区间，退出交互模式")
+                logger.info("👁️ 视觉丢失：进入 5 秒宽容期（继续正常推流）")
+            elapsed = time.time() - self._vision_leave_debounce_start
+            if elapsed >= 5.0 and not getattr(self, '_visual_silence_logged', False):
+                self._visual_silence_logged = True
+                logger.info("⏸️ 宽容期结束：永久推 silence（直到用户回到镜头）")
         else:
-            # 有人在区间内，重置防抖
+            # 用户回到镜头 → 立即恢复正常推送态
             if hasattr(self, '_vision_leave_debounce_start'):
+                elapsed = time.time() - self._vision_leave_debounce_start
                 delattr(self, '_vision_leave_debounce_start')
+                if hasattr(self, '_visual_silence_logged'):
+                    delattr(self, '_visual_silence_logged')
+                if elapsed >= 0.5:
+                    logger.info(f"✅ 视觉挂起撤销：用户回到镜头（已挂起 {elapsed:.1f}s，立即恢复正常推流）")
             with self._state_lock:
                 self.is_vision_target_present = True
         
@@ -2146,9 +2143,25 @@ class CoreServer:
         if wake_word.get("detected", False):
             confidence = wake_word.get("confidence", 0.0)
             keyword = wake_word.get("keyword", "unknown")
-            
+
             # 🌟 修复"闹鬼"问题：记录所有收到的唤醒词事件（用于调试）
             logger.info(f"🔔 [CoreServer] 收到唤醒词事件: 关键词={keyword}, 置信度={confidence:.2%}, 交互模式={self.is_interactive_mode}, 播放TTS={self.is_playing_tts}")
+
+            # 🛡️ TTS 抑制窗：TTS 播放中 + 刚结束 1.5s 内忽略 KWS。
+            # Qwen 自己的语音里偶尔会带类似"小慧"的音素，被 KWS 模型误判为唤醒，
+            # 触发 _exit + 新 _enter 流程，把 in-flight 的 Qwen response 切断（特别是 search_web
+            # 这种长工具调用回来的回复会丢）。1.5s 覆盖典型 TTS 尾音回声。
+            now_ts = time.time()
+            tts_just_ended = (
+                hasattr(self, '_last_tts_end_at')
+                and self._last_tts_end_at is not None
+                and (now_ts - self._last_tts_end_at) < 1.5
+            )
+            if self.is_playing_tts or tts_just_ended:
+                logger.info(
+                    f"🛡️ [CoreServer] TTS 期间/尾音抑制 KWS：忽略本次 '{keyword}' (置信度={confidence:.2%})"
+                )
+                return  # 直接 return 不处理唤醒词
             
             # 路径A：视觉降维打击（视觉唤醒激活且不在交互模式）
             if (not self.is_interactive_mode and 
@@ -2251,13 +2264,16 @@ class CoreServer:
             logger.info("🎯 [RT] → LISTENING (TTS 结束)")
         self._rt_last_tts_playing = tts_playing
 
-        # —— THINKING 超时 fallback：Qwen 10s 没有开始 TTS 就强制回 LISTENING
-        # 防止状态机卡死（比如 Qwen 内部 function_call + 补充 response 过程中 tts_playing 消息漏掉）
+        # —— THINKING 超时 fallback：Qwen 30s 没有开始 TTS 就强制回 LISTENING
+        # 防止状态机卡死。30s 覆盖大部分工具调用场景（search_web 2-5s + Qwen 重生成 2-3s
+        # + 网络抖动 + 大模型偶尔慢响应），同时不会让用户等太久。
+        # 之前 10s 太短：search_web 一旦触发，工具结果回来时 device 已退出 interactive，
+        # KWS 容易误唤醒重启 session，导致回复消失。
         if self._rt_state == "THINKING":
             if self._rt_thinking_since is None:
                 self._rt_thinking_since = now
-            elif now - self._rt_thinking_since > 10.0:
-                logger.warning("🎯 [RT] ⚠️ THINKING 超时 10s，强制 → LISTENING")
+            elif now - self._rt_thinking_since > 30.0:
+                logger.warning("🎯 [RT] ⚠️ THINKING 超时 30s，强制 → LISTENING")
                 self._rt_state = "LISTENING"
                 self._rt_vad_false_since = None
                 self._rt_thinking_since = None
@@ -2267,20 +2283,21 @@ class CoreServer:
         # —— 按状态处理
         state = self._rt_state
 
-        # 🔒 4 层噪音门控：只在 LISTENING 态生效
-        # SPEAKING 需要 barge-in 检测；THINKING 等 Qwen 响应无需推流
+        # 🔒 LISTENING 态 audio_filter 4 层门控（RMS / 距离 / 人脸 / 正向）：
+        # 命中任一项就把当前帧标记为"非目标声源"，下面会推 silence 占位（保持流连续）。
+        # ⚠️ 不再 return —— device 必须持续推流，Qwen 才能基于"收到的 audio chunk"推进 silence 计时器。
+        filter_drop_reason: str | None = None
         if state == "LISTENING" and getattr(self.audio_filter_config, "enabled", False):
-            drop = self._audio_filter_check(metadata, audio_binary)
-            if drop:
-                self._audio_filter_log_drop(drop)
-                return
+            filter_drop_reason = self._audio_filter_check(metadata, audio_binary)
+            if filter_drop_reason:
+                self._audio_filter_log_drop(filter_drop_reason)
 
-        if state == "LISTENING":
-            # 🔒 补丁 E：LISTENING 态真人声双校验（VAD + RMS）+ user_has_spoken 门槛
-            # 问题背景：TTS 播完后回声/底噪 RMS~1000-1500 会让 Silero 误判 VAD=True/False 抖动，
-            # 原逻辑 "vad=False 持续 800ms 就 commit" 会在沉默期不断触发空 commit，
-            # Qwen 收到空 buffer 凑一句糊弄话 → TTS 回声又触发下一轮 → 自言自语循环。
-            # 解决：真人声 RMS 远高于回声（>5000 vs ~1000），用双校验；并要求本轮"真开口过一次"才允许 silence commit。
+        if state in ("LISTENING", "SPEAKING"):
+            # ── 设计：device 是「过滤型传声筒」，**LISTENING 和 SPEAKING 都持续推流** ──
+            # · 目标用户人声（vad=True + DOA 在 ±half_deg 内 + audio_filter 通过 + 非视觉挂起）→ 推**原始 PCM**
+            # · 其他情况 → 推**全 0 silence chunk**
+            # 切句、commit、response、barge-in 全部交给 Qwen 服务端 semantic_vad —— device 不再做 RMS/VAD barge-in 判定。
+            # 视觉挂起：标志 `_visual_silence_until` 存在期间强制推 silence（让 Qwen 看到完整的 silence 流再退出）。
             import numpy as np
             try:
                 pcm_i16 = np.frombuffer(audio_binary, dtype=np.int16)
@@ -2289,73 +2306,83 @@ class CoreServer:
                 rms = 0.0
             filter_cfg = getattr(self, "audio_filter_config", None)
             base_rms = getattr(filter_cfg, "rms_threshold", 316.0) if filter_cfg else 316.0
-            listening_rms_min = base_rms * 5.0   # ~1580, 真人声通常 >5000，回声/底噪 ~1000-1500
-            real_voice = vad and rms >= listening_rms_min
+            listening_rms_min = base_rms * 5.0  # 仅用于 media_duck / 日志判定"真人声"，不再用于推流门控
 
-            # 推流策略：真人声帧必推；回声/误判帧不推（避免 Qwen buffer 被污染）
-            # 真静默帧（非 VAD）：如果用户已开口，继续推（让 Qwen 能接到尾巴）；否则不推
-            if real_voice or (self._rt_user_has_spoken and not vad):
-                self._send_audio_stream_chunk(self._current_trace_id, audio_binary)
+            # ── DOA 软门控：判定声源方位是否在用户朝向半角内 ──
+            doa_relative = None
+            doa_in_range = True
+            if self._xvf_doa_gate_enabled:
+                try:
+                    from wakefusion.services.xvf3800_control import get_latest_source_doa_deg
+                    doa_raw = get_latest_source_doa_deg(stale_ms=300)
+                    if doa_raw is not None:
+                        rel = (doa_raw - self._xvf_doa_gate_offset_deg + 180.0) % 360.0 - 180.0
+                        doa_relative = rel
+                        if abs(rel) > self._xvf_doa_gate_half_deg:
+                            doa_in_range = False
+                            if vad and rms >= listening_rms_min:
+                                self._xvf_doa_gate_log_count += 1
+                                if self._xvf_doa_gate_log_count <= 3 or self._xvf_doa_gate_log_count % 50 == 0:
+                                    logger.info(
+                                        f"🎯 [DOA] 侧面声源替换为 silence (raw={doa_raw:+.0f}° "
+                                        f"→ rel={rel:+.0f}° 超出 ±{self._xvf_doa_gate_half_deg:.0f}°)"
+                                    )
+                except Exception:
+                    pass
 
-            if real_voice:
-                if not self._rt_user_has_spoken:
-                    logger.info(f"🎯 [RT] 🗣️ 真人声开始 (VAD=True, RMS={rms:.0f}>={listening_rms_min:.0f})")
-                    # 🔒 Auto media duck：本轮首次检测到真人声 → 通知前端降低媒体音量到 10%
-                    # 让正在播放的视频/音乐给用户让路；之后不会自动恢复（等 Qwen control_media(unduck)）
-                    if not self._rt_media_duck_pending:
-                        logger.info("🔇 [RT] 发送 media_duck_request（用户开口，媒体自动降音）")
-                        self._send_media_duck_request()
-                        self._rt_media_duck_pending = True
-                self._rt_user_has_spoken = True
-                self._rt_vad_false_since = None
+            # ── 视觉挂起 5-10s silence 阶段：强制推 silence ──
+            # 0-5s 宽容期：照常推（latching 规则）；5-10s：推 silence；≥10s：device 已退出，不会到这里。
+            visual_silence_active = False
+            if hasattr(self, '_vision_leave_debounce_start'):
+                _vision_elapsed = now - self._vision_leave_debounce_start
+                if _vision_elapsed >= 5.0:
+                    visual_silence_active = True
+
+            # ── 决定推真实 PCM 还是 silence ──
+            # voice latching 1.0 秒：Silero=True 后 1s 持续推真音频，覆盖句间 50-200ms 静音
+            # 让 Qwen 看到连贯语音段（避免零碎片段累积不够 semantic_vad threshold）。
+            is_target_voice = (
+                bool(vad)
+                and doa_in_range
+                and (filter_drop_reason is None)
+                and not visual_silence_active
+            )
+            if not hasattr(self, '_rt_last_voice_at'):
+                self._rt_last_voice_at = 0.0
+            if is_target_voice:
+                self._rt_last_voice_at = now
+                push_real = True
             else:
-                # 只有在用户已真开口过的前提下，才累积静默触发 commit
-                # 用户没开口时，Silero 抖动不会触发空 commit
-                if self._rt_user_has_spoken:
-                    if self._rt_vad_false_since is None:
-                        self._rt_vad_false_since = now
-                    elif now - self._rt_vad_false_since >= 0.8:
-                        self._rt_state = "THINKING"
-                        self._rt_vad_false_since = None
-                        self._rt_thinking_since = now
-                        self._rt_user_has_spoken = False  # 进入下一轮
-                        logger.info("🎯 [RT] → THINKING (真人声后静默 800ms，提交 Qwen)")
-                        self._send_user_speech_end(self._current_trace_id)
+                push_real = (
+                    doa_in_range
+                    and (filter_drop_reason is None)
+                    and not visual_silence_active
+                    and (now - self._rt_last_voice_at) < 1.0
+                )
+            if self._current_trace_id:
+                if push_real:
+                    self._send_audio_stream_chunk(self._current_trace_id, audio_binary)
+                else:
+                    self._send_audio_stream_chunk(self._current_trace_id, b"\x00" * len(audio_binary))
+
+            # ── 真人声开始的 hook：仅 LISTENING 态触发 media_duck + 日志 ──
+            if state == "LISTENING":
+                real_voice = is_target_voice and rms >= listening_rms_min
+                if real_voice:
+                    if not self._rt_user_has_spoken:
+                        doa_calib_msg = f" 🧭 rel={doa_relative:+.0f}°" if doa_relative is not None else ""
+                        logger.info(f"🎯 [RT] 🗣️ 真人声开始 (VAD=True, RMS={rms:.0f}>={listening_rms_min:.0f}){doa_calib_msg}")
+                        if not self._rt_media_duck_pending:
+                            logger.info("🔇 [RT] 发送 media_duck_request（用户开口，媒体自动降音）")
+                            self._send_media_duck_request()
+                            self._rt_media_duck_pending = True
+                    self._rt_user_has_spoken = True
+            # 不再切 THINKING、不再发 user_speech_end、不再做 device 端 barge-in
+            # —— 全交给 Qwen semantic_vad 自动 commit + create response + cancel response
 
         elif state == "THINKING":
-            # 等 Qwen 返回 TTS（由 tts_playing 边沿切 SPEAKING，或 10s 超时回 LISTENING）
+            # 等 Qwen 返回 TTS（由 tts_playing 边沿切 SPEAKING，或 30s 超时回 LISTENING）
             pass
-
-        elif state == "SPEAKING":
-            # TTS 播放中，监听用户 barge-in
-            # 🔒 补丁 A：SPEAKING 态 RMS gate，防止 XVF3800 AEC 残留回声触发 barge-in
-            # LISTENING 态的 4 层门控不在 SPEAKING 态生效（因为 SPEAKING 不能拒绝所有帧 —— 要保留 barge-in 机会）
-            # 这里只加 RMS 一道：真人声通常 RMS > listening 阈值 * 1.8，AEC 残留能量更低
-            import numpy as np
-            try:
-                pcm_i16 = np.frombuffer(audio_binary, dtype=np.int16)
-                rms = float(np.sqrt(np.mean(pcm_i16.astype(np.float32) ** 2))) if len(pcm_i16) > 0 else 0.0
-            except Exception:
-                rms = 0.0
-            filter_cfg = getattr(self, "audio_filter_config", None)
-            base_rms = getattr(filter_cfg, "rms_threshold", 316.0) if filter_cfg else 316.0
-            speaking_rms_min = base_rms * 1.3  # P2: 1.8 → 1.3，SPEAKING 态 AEC 后用户声可能弱化，放宽门限
-
-            if vad and rms > speaking_rms_min:
-                if self._rt_vad_true_since is None:
-                    self._rt_vad_true_since = now
-                elif now - self._rt_vad_true_since >= 0.15:  # P1: 300ms → 150ms，打断响应更灵敏
-                    logger.info(f"🎯 [RT] ⚡ BARGE-IN! (VAD=True, RMS={rms:.0f}>{speaking_rms_min:.0f}, 持续>150ms)")
-                    self._send_barge_in(self._current_trace_id)
-                    self._rt_state = "LISTENING"
-                    self._rt_vad_true_since = None
-                    self._rt_vad_false_since = None
-                    self._rt_user_has_spoken = True  # barge-in 本身已经证明用户在说话
-                    # 🔒 补丁 C：不再立即推当前帧给 Qwen
-                    # 原注释说"不丢字"，但 AEC 残留信号会被直接送给 Qwen 引发自回答（用户观察到 replyLen=7/9 的短回复）
-                    # 丢一帧（~20-40ms）换不自回答，权衡更好
-            else:
-                self._rt_vad_true_since = None
     
     def _handle_control_command(self, request: dict) -> dict:
         """

@@ -420,7 +420,7 @@ fn handle_device_message(
         }
 
         "media_duck_request" => {
-            let reason = msg.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let reason = msg.extra.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string();
             tracing::info!(trace_id = %trace_id, reason = %reason, "Device media_duck_request → backend (auto duck)");
             let _ = ws_tx.send(UpstreamMessage::MediaDuckRequest {
                 trace_id,

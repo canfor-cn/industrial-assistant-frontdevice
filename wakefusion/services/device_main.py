@@ -79,6 +79,31 @@ def main():
     if config_path:
         print(f"[device_main] Config: {config_path}", flush=True)
 
+    # ── XVF3800 fixed-beam 配置（在 audio_service 抢占设备前先发 control transfer）──
+    # 目的：把麦克风波束锁定到正前方 ±约 30° 范围，过滤侧面声源。
+    # 失败不致命：自动 fallback 到自适应模式（默认行为，跟改造前等价）。
+    try:
+        import yaml as _yaml
+        xvf_cfg = {}
+        if config_path and os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as _f:
+                _all = _yaml.safe_load(_f) or {}
+            xvf_cfg = (_all.get("xvf3800") or {}).get("fixed_beam") or {}
+        # **总是**调一次 configure_at_startup，让 enabled 状态显式同步到 XVF3800：
+        # - enabled=true  → 发 lock 命令把 beam 锁到指定方向
+        # - enabled=false → 发 restore 命令显式关闭 fixed-beam（清掉上次启动的残留）
+        # 不调的话 XVF3800 firmware RAM 里上次启动的 fixed-beam 状态会留着，
+        # 麦克风灵敏度被锁死，4 个 LED 灯永远只亮一个。
+        from wakefusion.services.xvf3800_control import configure_at_startup
+        configure_at_startup(
+            enabled=bool(xvf_cfg.get("enabled", False)),
+            azimuth_deg=float(xvf_cfg.get("azimuth_deg", 0.0)),
+            elevation_deg=float(xvf_cfg.get("elevation_deg", 0.0)),
+            gating=bool(xvf_cfg.get("gating", False)),
+        )
+    except Exception as _e:
+        print(f"[device_main] XVF3800 fixed-beam configure failed (non-fatal): {_e}", flush=True)
+
     # Shared communication objects (vision <-> core_server)
     vision_queue = queue.Queue(maxsize=2)
     lip_sync_event = threading.Event()

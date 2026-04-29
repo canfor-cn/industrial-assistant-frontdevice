@@ -138,9 +138,6 @@ pub fn run() {
         });
     }
 
-    // Backend WS client thread
-    ws_client::spawn_ws_thread(llm_config.clone(), downstream_tx.clone(), upstream_rx);
-
     let upstream_tx_for_commands = upstream_tx.clone();
     let device_id = Arc::new(llm_config.device_id.clone());
 
@@ -150,6 +147,14 @@ pub fn run() {
         .manage(commands::BackendHost(llm_config.host.clone()))
         .setup(move |app| {
             let app_handle = app.handle().clone();
+
+            // Backend WS client thread (emits backend_ws_status events to WebView)
+            ws_client::spawn_ws_thread(
+                app_handle.clone(),
+                llm_config.clone(),
+                downstream_tx.clone(),
+                upstream_rx,
+            );
 
             // Message router (backend WS -> WebView events)
             let router_audio_tx = audio_tx.clone();
@@ -389,6 +394,7 @@ pub fn run() {
             commands::send_audio,
             commands::get_cached_audio,
             commands::host_status,
+            commands::get_backend_ws_status,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
