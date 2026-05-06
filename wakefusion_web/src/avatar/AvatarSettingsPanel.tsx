@@ -1,6 +1,11 @@
 import React from "react";
-import type { AvatarLayoutController } from "./useAvatarLayout";
+import type { AvatarCharacter, AvatarLayoutController } from "./useAvatarLayout";
 import { SCALE_MAX, SCALE_MIN } from "./useAvatarLayout";
+
+const CHARACTER_OPTIONS: { value: AvatarCharacter; label: string }[] = [
+  { value: "A", label: "角色 A" },
+  { value: "B", label: "角色 B" },
+];
 
 /**
  * Vogue editorial settings window — small floating panel (not a drawer).
@@ -13,13 +18,35 @@ export function AvatarSettingsPanel({
   controller: AvatarLayoutController;
   onClose: () => void;
 }) {
-  const { layout, setX, setY, setScale, setOpacity, reset } = controller;
+  const { layout, setX, setY, setScale, setOpacity, reset, character, setCharacter } = controller;
 
   return (
     <aside className="avatar-settings-window" aria-label="数字人布局调整">
       <div className="avatar-settings-eyebrow">01 / 01</div>
       <h3 className="avatar-settings-title">Avatar</h3>
       <div className="avatar-settings-rule" />
+
+      <div className="avatar-settings-row">
+        <span className="avatar-settings-row-label">Character</span>
+        <div
+          className="avatar-settings-segmented"
+          role="radiogroup"
+          aria-label="切换角色"
+        >
+          {CHARACTER_OPTIONS.map((opt) => (
+            <button
+              key={opt.value}
+              type="button"
+              role="radio"
+              aria-checked={character === opt.value}
+              className={`avatar-settings-segmented-btn ${character === opt.value ? "is-active" : ""}`}
+              onClick={() => setCharacter(opt.value)}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+      </div>
 
       <Row
         label="Position X"

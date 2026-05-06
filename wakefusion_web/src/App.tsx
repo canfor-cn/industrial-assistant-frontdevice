@@ -33,6 +33,7 @@ import { isPlayableMedia as isPlayableMediaCheck } from "./media/types";
 import type { MediaRef as MediaRefType } from "./media/types";
 import { useSyncedSubtitle } from "./useSyncedSubtitle";
 import { useUnityBridge } from "./useUnityBridge";
+import { startUnityWsShim, stopUnityWsShim } from "./unityWsShim";
 import { PCMStreamPlayer } from "./pcmStreamPlayer";
 import { WebRTCClient } from "./webrtcClient";
 import { startWebrtcLipSync, type LipSyncSession } from "./webrtcLipSync";
@@ -225,8 +226,9 @@ export default function App() {
   // Live subtitle panel: sentence-level audio-text sync
   const unityBridge = useUnityBridge();
   const syncSub = useSyncedSubtitle({
-    onPlayAudio: (audioBase64, _mimeType) => {
-      unityBridge.playAudio(audioBase64);
+    onPlayAudio: (_audioBase64, _mimeType) => {
+      // 数字人音频已解耦到 ws://127.0.0.1:9876（Tauri unity_ws_server 广播）
+      // React 这层不再做音频中继；这个 onPlayAudio 回调保留以便兼容 useSyncedSubtitle 接口
     },
   });
   const [preferredSinkId, setPreferredSinkId] = useState<string | null>(null);
@@ -465,33 +467,20 @@ export default function App() {
       },
       onTtsAudioBegin: (_mimeType, codec, sampleRate) => {
         if (cancelled) return;
-        // 只 Unity WebGL 播音频。浏览器 pcmPlayer 不用了（避免双声）。
-        // XVF3800 硬件 AEC 兜底（reference signal 是 USB audio output 总线，
-        // Unity 通过 emscripten WebAudio 输出也走这条总线 → 硬件能扣 echo）。
-        // 如果 Unity 项目的 OnPlayAudio 没真出声（之前测试发现的 case），
-        // 会完全静音 —— 那时需要 Unity 端工程师确认 GameObject "WebCommunication"
-        // 的 OnPlayAudio 接收 base64 wav 并触发 AudioSource.Play()。
-        const dialogueId = `realtime-${Date.now()}`;
-        try { unityBridge.startDialogue(dialogueId); } catch { /* Unity 没准备好 */ }
-        // 仍保留 pcmPlayer 初始化作为 *诊断用* —— 数据不再 push 进去
+        // 数字人渲染层已解耦：Unity 自己通过 ws://127.0.0.1:9876 接 audio_begin/chunk/end
+        // （由 Tauri unity_ws_server 广播；message_router 在每个 audio_* 事件时同步推送一份给那个端口）。
+        // React 这层不再做音频中继 —— 仅保留字幕同步、UI 状态等。
+        // 保留 ensureAecBound 作为浏览器路径诊断兜底（不影响主路径）。
         if (codec === "pcm_s16le" && sampleRate > 0) {
           ensureAecBound(sampleRate);
         }
       },
-      onTtsAudioChunk: (data, _mimeType, codec, sampleRate) => {
+      onTtsAudioChunk: (_data, _mimeType, _codec, _sampleRate) => {
         if (cancelled) return;
-        if (codec === "pcm_s16le" && sampleRate > 0) {
-          // 只喂 Unity（包 WAV header）；浏览器 pcmPlayer 不再 push
-          try {
-            const wavBase64 = wrapPcmAsWavBase64(data, sampleRate, 1);
-            unityBridge.playAudio(wavBase64, "wav", sampleRate, 1);
-          } catch (err) {
-            console.error("[audio] unity playAudio failed:", err);
-          }
-        }
+        // 不再调 unityBridge.playAudio —— Unity 自己从 ws 接 audio_chunk
       },
       onTtsAudioEnd: () => {
-        // Realtime 流式无需关闭（下一段 begin 会重置）；cascade 模式下播放队列自然结束
+        // 不再调 unityBridge —— Unity 自己从 ws 接 audio_end
       },
       onMediaControl: (action, _message) => {
         if (!cancelled) applyMediaControl(action);
@@ -557,6 +546,10 @@ export default function App() {
   useEffect(() => {
     // Delay Unity loading so UI renders first (avoids blocking the main thread)
     const delayTimer = setTimeout(() => {
+    // 注入 Unity ws 协议地址：让 Unity 自己连本地 ws://127.0.0.1:9876 接 audio_*。
+    // 解耦数字人渲染层 — 未来换 Three.js / live2d 也连同一个端口即可。
+    // Tauri host 在 lib.rs 启动时已起好这个 server（见 unity_ws_server.rs）。
+    (window as any).UNITY_WEBSOCKET_DEFAULT_URL = "ws://127.0.0.1:9876";
     const script = document.createElement("script");
     script.src = "/Build/Build.loader.js";
     script.async = true;
@@ -585,6 +578,10 @@ export default function App() {
         }).then((instance: any) => {
           window.unityInstance = instance;
           setIsUnityLoaded(true);
+          // Unity 就绪后启动 ws shim：连本地 9876，把 audio_begin/chunk/end/stop_tts
+          // 翻译成 SendMessage("WebCommunication", "OnAudioBegin/...") 转发给 Unity。
+          // 这是从 Unity demo index.html 移植的协议适配层（详见 unityWsShim.ts）。
+          startUnityWsShim("ws://127.0.0.1:9876");
         }).catch((err: any) => {
           console.error("Unity load failed", err);
         });
@@ -596,6 +593,7 @@ export default function App() {
 
     return () => {
       clearTimeout(delayTimer);
+      stopUnityWsShim();
     };
   }, []);
 

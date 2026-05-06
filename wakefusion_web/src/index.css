@@ -2433,6 +2433,40 @@ button {
   text-align: right;
 }
 
+.avatar-settings-segmented {
+  grid-column: 2 / span 2;
+  display: inline-flex;
+  border: 1px solid var(--ink);
+  border-radius: 999px;
+  padding: 2px;
+  gap: 2px;
+  justify-self: end;
+}
+
+.avatar-settings-segmented-btn {
+  background: transparent;
+  border: none;
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  color: var(--ink);
+  cursor: pointer;
+  padding: 4px 12px;
+  border-radius: 999px;
+  transition: background var(--duration-fast) var(--ease), color var(--duration-fast) var(--ease);
+}
+
+.avatar-settings-segmented-btn.is-active {
+  background: var(--ink);
+  color: var(--paper, #fff);
+}
+
+.avatar-settings-segmented-btn:hover:not(.is-active) {
+  opacity: 0.65;
+}
+
 .avatar-settings-actions {
   display: flex;
   justify-content: flex-end;

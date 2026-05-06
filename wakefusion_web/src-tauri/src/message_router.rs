@@ -165,12 +165,27 @@ pub async fn run_message_router(
             // --- Audio messages: only play if session matches ---
             "audio_begin" => {
                 tracing::info!("audio_begin: traceId={} active_session={}", trace_id, active_session_id);
+                let codec = msg.codec.as_deref().unwrap_or("pcm_s16le");
+                let mime = msg.mime_type.as_deref().unwrap_or("audio/pcm");
+                let sample_rate = msg.sample_rate.unwrap_or(24000);
                 let _ = app.emit("tts_audio_begin", serde_json::json!({
                     "traceId": trace_id,
-                    "mimeType": msg.mime_type.as_deref().unwrap_or("audio/wav"),
-                    "codec": msg.codec.as_deref().unwrap_or(""),
-                    "sampleRate": msg.sample_rate.unwrap_or(22050),
+                    "mimeType": mime,
+                    "codec": codec,
+                    "sampleRate": sample_rate,
                 }));
+                // 广播给 Unity / 3D 数字人渲染层（解耦协议，见 unity_ws_server.rs）
+                // codec 名对齐 Unity 协议文档（pcm_s16le 不在文档枚举里，规一化为 pcm_s16）
+                let unity_codec = if codec == "pcm_s16le" { "pcm_s16" } else { codec };
+                crate::unity_ws_server::broadcast(&serde_json::json!({
+                    "type": "audio_begin",
+                    "traceId": trace_id,
+                    "deviceId": null,
+                    "codec": unity_codec,
+                    "mimeType": mime,
+                    "sampleRate": sample_rate,
+                    "channels": msg.extra.get("channels").and_then(|v| v.as_u64()).unwrap_or(1),
+                }).to_string());
                 // Notify device: TTS is playing（realtime 路径也要通知，让设备侧 mute 上行防回声）
                 crate::device_ws_server::send_to_device(
                     &serde_json::json!({"type": "tts_playing", "traceId": trace_id}).to_string()
@@ -181,18 +196,32 @@ pub async fn run_message_router(
                 if let Some(data_b64) = &msg.data {
                     let sentence_index = msg.extra.get("sentenceIndex")
                         .and_then(|v| v.as_u64());
+                    let codec = msg.codec.as_deref().unwrap_or("pcm_s16le");
+                    let mime = msg.mime_type.as_deref().unwrap_or("audio/pcm");
+                    let sample_rate = msg.sample_rate.unwrap_or(24000);
+                    let seq = msg.seq.unwrap_or(0);
                     let mut payload = serde_json::json!({
                         "traceId": trace_id,
                         "data": data_b64,
-                        "seq": msg.seq.unwrap_or(0),
-                        "mimeType": msg.mime_type.as_deref().unwrap_or("audio/wav"),
-                        "codec": msg.codec.as_deref().unwrap_or(""),
-                        "sampleRate": msg.sample_rate.unwrap_or(0),
+                        "seq": seq,
+                        "mimeType": mime,
+                        "codec": codec,
+                        "sampleRate": sample_rate,
                     });
                     if let Some(si) = sentence_index {
                         payload["sentenceIndex"] = serde_json::json!(si);
                     }
                     let _ = app.emit("tts_audio_chunk", payload);
+                    // 同步广播给 Unity（codec 规一化）
+                    let unity_codec = if codec == "pcm_s16le" { "pcm_s16" } else { codec };
+                    crate::unity_ws_server::broadcast(&serde_json::json!({
+                        "type": "audio_chunk",
+                        "traceId": trace_id,
+                        "deviceId": null,
+                        "seq": seq,
+                        "codec": unity_codec,
+                        "data": data_b64,
+                    }).to_string());
                 }
             }
 
@@ -201,6 +230,12 @@ pub async fn run_message_router(
                 let _ = app.emit("tts_audio_end", serde_json::json!({
                     "traceId": trace_id,
                 }));
+                // 广播 audio_end 给 Unity
+                crate::unity_ws_server::broadcast(&serde_json::json!({
+                    "type": "audio_end",
+                    "traceId": trace_id,
+                    "deviceId": null,
+                }).to_string());
                 // Notify device: TTS ended（realtime 路径）
                 crate::device_ws_server::send_to_device(
                     &serde_json::json!({"type": "tts_idle", "traceId": trace_id}).to_string()
@@ -214,6 +249,13 @@ pub async fn run_message_router(
                 let _ = app.emit("stop_tts", serde_json::json!({
                     "traceId": trace_id,
                 }));
+                // 广播停止给 Unity（让其立即停播 + 清流）
+                let reason = msg.reason.as_deref().unwrap_or("interrupt");
+                crate::unity_ws_server::broadcast(&serde_json::json!({
+                    "type": "stop_tts",
+                    "traceId": trace_id,
+                    "reason": reason,
+                }).to_string());
             }
 
             "media_control" => {
@@ -235,11 +277,21 @@ pub async fn run_message_router(
 
             "error" => {
                 let error_msg = msg.message.clone().unwrap_or_else(|| "unknown error".into());
-                tracing::error!("Backend error: {}", error_msg);
+                let code = msg.code.clone().unwrap_or_default();
+                tracing::error!("Backend error: code={} msg={}", code, error_msg);
                 let _ = app.emit("connection_status", ConnectionStatusEvent {
                     connected: true,
-                    message: error_msg,
+                    message: error_msg.clone(),
                 });
+                // Unity 协议 4.5 节：error.request_cancelled 等价 stop_tts
+                if code == "request_cancelled" {
+                    crate::unity_ws_server::broadcast(&serde_json::json!({
+                        "type": "error",
+                        "traceId": trace_id,
+                        "code": "request_cancelled",
+                        "message": error_msg,
+                    }).to_string());
+                }
             }
 
             "warning" => {
