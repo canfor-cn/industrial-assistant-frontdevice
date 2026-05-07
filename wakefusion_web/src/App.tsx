@@ -2037,14 +2037,16 @@ function rewriteMediaUrl(url: string): string {
 
 function normalizeMediaRef(data: any): MediaRef {
   return {
-    assetId: String(data.assetId ?? data.url),
+    assetId: String(data.assetId ?? data.url ?? ""),
     assetType: String(data.assetType ?? "document"),
-    url: rewriteMediaUrl(String(data.url)),
-    label: String(data.label ?? data.url),
+    url: data.url ? rewriteMediaUrl(String(data.url)) : "",
+    label: String(data.label ?? data.url ?? ""),
     frameUrl: data.frameUrl ? rewriteMediaUrl(String(data.frameUrl)) : undefined,
     startMs: typeof data.startMs === "number" ? data.startMs : undefined,
     endMs: typeof data.endMs === "number" ? data.endMs : undefined,
     traceId: data.traceId ? String(data.traceId) : undefined,
+    // inline 多文档汇总 markdown（adapter 拼接好的）；优先于 url 渲染
+    inlineBody: typeof data.inlineBody === "string" ? data.inlineBody : undefined,
   };
 }
 

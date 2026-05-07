@@ -34,6 +34,7 @@ export function MarkdownTouchViewer({
   const readyFiredRef = useRef(false);
 
   const fetchUrl = stripPlaybackFragment(mediaRef.url);
+  const inlineBody = mediaRef.inlineBody;
 
   useEffect(() => {
     let cancelled = false;
@@ -41,6 +42,17 @@ export function MarkdownTouchViewer({
     setError(null);
     setLoaded(false);
     readyFiredRef.current = false;
+
+    // 优先使用 inline body（后端拼接的"多文档汇总 markdown"）。无 inlineBody 才走 fetch URL。
+    if (inlineBody) {
+      setMarkdown(inlineBody);
+      setLoaded(true);
+      if (!readyFiredRef.current) {
+        readyFiredRef.current = true;
+        onReady();
+      }
+      return () => { cancelled = true; };
+    }
 
     (async () => {
       try {
@@ -72,7 +84,7 @@ export function MarkdownTouchViewer({
     return () => {
       cancelled = true;
     };
-  }, [fetchUrl, onReady]);
+  }, [fetchUrl, inlineBody, onReady]);
 
   const toc = useMemo(() => {
     const lines = markdown.split("\n");

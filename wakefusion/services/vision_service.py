@@ -1062,8 +1062,14 @@ class VisionService:
                 "faces": result.get("faces", []),
                 "hands": result.get("hands", []),
                 "is_talking": is_talking,
+                "distance_m": result.get("distance_m"),
                 "timestamp": time.time()
             }
+            # 预览 JPEG（如有）— 由前端配置面板按需启用推送
+            if "preview_jpeg_b64" in result:
+                data["preview_jpeg_b64"] = result["preview_jpeg_b64"]
+                data["preview_width"] = result.get("preview_width", 0)
+                data["preview_height"] = result.get("preview_height", 0)
             # ── Phase 4: 附加 face embedding（如有），core_server 累积 + 上送后端 ──
             emb = self._drain_face_emb_for_send()
             if emb is not None:
@@ -1323,10 +1329,16 @@ class VisionService:
         last_time = time.time()
         frame_count = 0
 
+        # 预览 JPEG 编码计数器：限速 10fps（每 N 帧编一次，假设主帧率 15fps → 1/2 帧）
+        preview_jpeg_counter = 0
         try:
             for bgr in frame_iter:
                 if bgr is None:
                     continue
+                # ── 热重启检查：用户切换摄像头时，device_main 设了 restart Event → 退出循环 ──
+                if is_restart_requested():
+                    print("[vision] restart requested → exiting main loop", flush=True)
+                    break
                 frame_count += 1
                 if frame_count <= 3 or frame_count % 100 == 0:
                     print(f"[vision] Frame #{frame_count} OK", flush=True)
@@ -1379,6 +1391,26 @@ class VisionService:
 
                 result["distance_m"] = float(global_distance_m) if global_distance_m is not None else None
                 result["hand_distance_m"] = None
+
+                # 预览 JPEG（限速 ~10fps，配置面板用）：encode 到 result，
+                # core_server 检查 _camera_preview_enabled 决定是否上行。
+                preview_jpeg_counter += 1
+                if preview_jpeg_counter % 2 == 0:
+                    try:
+                        h_, w_ = bgr.shape[:2]
+                        if w_ > 640:
+                            scale_ = 640.0 / float(w_)
+                            preview_img = cv2.resize(bgr, (640, int(h_ * scale_)))
+                        else:
+                            preview_img = bgr
+                        ok_, jpeg_buf = cv2.imencode(".jpg", preview_img, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+                        if ok_:
+                            import base64 as _b64
+                            result["preview_jpeg_b64"] = _b64.b64encode(jpeg_buf.tobytes()).decode("ascii")
+                            result["preview_width"] = int(preview_img.shape[1])
+                            result["preview_height"] = int(preview_img.shape[0])
+                    except Exception:
+                        pass
 
                 # 发送结果（通过内存队列）
                 self.send_result(result)
@@ -1436,6 +1468,27 @@ def run_in_thread(output_queue: "queue.Queue", lip_sync_event: threading.Event,
         lip_sync_event=lip_sync_event,
     )
     service.run(camera_index=camera_index)
+
+
+# ── 热重启支持 ──────────────────────────────────────
+# device_main 通过 set 这个 Event 告诉运行中的 vision_service 退出主循环
+# （由 core_server 收到 camera_select 时触发）。退出后 device_main 的 watchdog
+# 会用新 config 重新启动 thread。
+_RESTART_REQUESTED = threading.Event()
+
+
+def request_restart():
+    """外部调用：要求 vision_service 退出当前循环，让 device_main 重启线程切换 backend。"""
+    _RESTART_REQUESTED.set()
+
+
+def clear_restart():
+    """device_main 重启线程前调用，清除标志。"""
+    _RESTART_REQUESTED.clear()
+
+
+def is_restart_requested() -> bool:
+    return _RESTART_REQUESTED.is_set()
 
 
 def main():

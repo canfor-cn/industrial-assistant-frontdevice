@@ -118,21 +118,55 @@ def main():
             hardware_status["camera_ready"] = False
             print("[device_main] ⚠️ vision_service 线程退出，camera_ready=False", flush=True)
 
-    vision_thread = threading.Thread(
-        target=vision_thread_wrapper,
-        args=(vision_queue, lip_sync_event),
-        name="vision_service",
-        daemon=True,
-    )
-    vision_thread.start()
+    # vision_thread 引用放在闭包外（watchdog 可重新指向新线程）
+    vision_thread_ref = {"thread": None}
+
+    def start_vision_thread():
+        t = threading.Thread(
+            target=vision_thread_wrapper,
+            args=(vision_queue, lip_sync_event),
+            name="vision_service",
+            daemon=True,
+        )
+        t.start()
+        vision_thread_ref["thread"] = t
+        return t
+
+    start_vision_thread()
     print("[device_main] vision_service thread started", flush=True)
 
     # Wait for camera init
     time.sleep(3)
 
-    if not vision_thread.is_alive():
+    if not vision_thread_ref["thread"].is_alive():
         hardware_status["camera_ready"] = False
         print("[device_main] ⚠️ vision_service 启动失败（线程已退出），camera_ready=False", flush=True)
+
+    # ── Vision watchdog：监控热重启请求 ──
+    # 当 core_server 收到 camera_select 时调 request_vision_restart()
+    # → 这里检测到旧线程退出 → 用新 config 重新启动 vision_service。
+    def vision_restart_watchdog():
+        try:
+            from wakefusion.services import vision_service as _vs
+        except Exception as e:
+            print(f"[device_main] vision_service import failed in watchdog: {e}", flush=True)
+            return
+        while True:
+            time.sleep(1.0)
+            t = vision_thread_ref["thread"]
+            # 仅在显式 request_restart 触发时重启（避免误把崩溃的线程也重启）
+            if _vs.is_restart_requested() and t is not None and not t.is_alive():
+                print("[device_main] vision restart watchdog: rebuilding thread with new config", flush=True)
+                _vs.clear_restart()
+                hardware_status["camera_ready"] = True
+                try:
+                    start_vision_thread()
+                    print("[device_main] vision_service thread restarted", flush=True)
+                except Exception as e:
+                    print(f"[device_main] vision restart failed: {e}", flush=True)
+                    hardware_status["camera_ready"] = False
+
+    threading.Thread(target=vision_restart_watchdog, name="vision_watchdog", daemon=True).start()
 
     # ── Audio service with auto-retry ──────────────────────────────────
     AUDIO_RETRY_INTERVAL = 5  # 秒：audio 线程退出后多久重试

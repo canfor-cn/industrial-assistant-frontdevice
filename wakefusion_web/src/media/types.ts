@@ -9,6 +9,12 @@ export interface MediaRef {
   startMs?: number;
   endMs?: number;
   traceId?: string;
+  /**
+   * 可选 inline 内容（仅 wiki/document 类型用）。后端把多文档汇总成一篇 markdown
+   * 时，直接放在这里给前端渲染，避免再去 fetch URL。
+   * 优先级：inlineBody > url（fallback）
+   */
+  inlineBody?: string;
 }
 
 export type MediaKind = "video" | "image" | "document" | "audio" | "wiki" | null;

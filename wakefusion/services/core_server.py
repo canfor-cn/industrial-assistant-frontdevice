@@ -670,6 +670,56 @@ class CoreServer:
             # 警告消息
             warn_msg = data.get("message", "未知警告")
             logger.warning(f"⚠️ LLM Agent警告: {warn_msg}")
+
+        # ─── 摄像头管理（前端配置面板用） ───
+        elif msg_type == "camera_list_request":
+            # 列举系统所有摄像头（USB UVC + Orbbec）→ 上行 camera_list
+            try:
+                from wakefusion.services.camera_enumerator import list_all_cameras
+                cameras = list_all_cameras()
+                self._send_websocket_message({
+                    "type": "camera_list",
+                    "cameras": cameras,
+                    "active": {
+                        "backend": getattr(self.config.vision.camera, "backend", "orbbec") if hasattr(self.config.vision, "camera") else "orbbec",
+                        "usb_index": getattr(self.config.vision.camera, "usb_index", None) if hasattr(self.config.vision, "camera") else None,
+                    },
+                })
+                logger.info(f"📷 camera_list reply: {len(cameras)} 个设备")
+            except Exception as e:
+                logger.error(f"❌ camera_list failed: {e}")
+
+        elif msg_type == "camera_select":
+            # 用户选择新摄像头 → 写运行时 config + 触发 vision_service 热重启
+            new_backend = data.get("backend", "usb")
+            new_index = data.get("index", 0)
+            new_name = data.get("name", "")
+            logger.info(f"📷 camera_select: backend={new_backend} index={new_index} name={new_name}")
+            try:
+                if hasattr(self.config.vision, "camera") and self.config.vision.camera is not None:
+                    self.config.vision.camera.backend = new_backend
+                    if new_backend == "usb":
+                        self.config.vision.camera.usb_index = int(new_index)
+                # 触发 vision_service 热重启（device_main 的 watchdog 会用新 config 重启线程）
+                from wakefusion.services import vision_service as _vs
+                _vs.request_restart()
+                # 回执
+                self._send_websocket_message({
+                    "type": "camera_selected",
+                    "backend": new_backend,
+                    "index": new_index,
+                    "name": new_name,
+                })
+            except Exception as e:
+                logger.error(f"❌ camera_select failed: {e}")
+
+        elif msg_type == "camera_preview_start":
+            self._camera_preview_enabled = True
+            logger.info("📷 camera preview ENABLED")
+
+        elif msg_type == "camera_preview_stop":
+            self._camera_preview_enabled = False
+            logger.info("📷 camera preview DISABLED")
     
     async def _handle_websocket_audio_chunk(self, audio_b64: str):
         """处理从 LLM Agent 接收的 base64 音频块"""
@@ -1895,7 +1945,23 @@ class CoreServer:
                 self.is_vision_target_present = True
         
         # 🌟 修复：已删除视觉状态机抢跑代码，让 _user_has_spoken 的修改权完全交还给 _process_audio_data，保证一定能生成 trace_id
-    
+
+        # ─── Camera preview push（前端配置面板用） ───
+        # 仅在前端发送了 camera_preview_start 后才推送，节省带宽。
+        # vision_service 在 vision_data 里附带 preview_jpeg_b64 字段（已 resize 到 640px）。
+        if getattr(self, "_camera_preview_enabled", False):
+            jpeg_b64 = vision_data.get("preview_jpeg_b64")
+            if jpeg_b64:
+                self._send_websocket_message({
+                    "type": "camera_preview",
+                    "jpeg": jpeg_b64,
+                    "width": vision_data.get("preview_width", 0),
+                    "height": vision_data.get("preview_height", 0),
+                    "faces": faces,
+                    "distance_m": distance_m,
+                    "is_talking": is_talking,
+                })
+
     def _process_audio_data(self, metadata: dict, audio_binary: bytes):
         """处理音频数据"""
         current_time = time.time()
