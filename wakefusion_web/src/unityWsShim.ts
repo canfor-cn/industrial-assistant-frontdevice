@@ -37,6 +37,17 @@ let lastUrl: string = "";
 let pcmPlayer: WebAudioPlayer | null = null;
 let pcmPlayerActiveTraceId: string | null = null;
 
+// 外部（如 React 状态机）可订阅 worklet 真实播放状态变化。
+// worklet 在 audio thread 内 process() 每帧检测 ring buffer 状态变化时上报，
+// 比后端 onAudioBegin/End（流到达边界）准确数十秒（前端可能仍在播 buffer 内容）。
+type PlaybackStateListener = (playing: boolean) => void;
+const playbackStateListeners = new Set<PlaybackStateListener>();
+
+export function subscribePcmPlaybackState(listener: PlaybackStateListener): () => void {
+  playbackStateListeners.add(listener);
+  return () => { playbackStateListeners.delete(listener); };
+}
+
 function ensurePcmPlayer(): WebAudioPlayer {
   if (!pcmPlayer) {
     pcmPlayer = createWebAudioPlayer("/pcm-player-worklet.js");
@@ -44,6 +55,12 @@ function ensurePcmPlayer(): WebAudioPlayer {
       // worklet 在 audio thread 内每 33ms 推一次 RMS（实际播放出去的样本能量）
       // → 主线程 SendMessage Unity → SetBlendShapeWeight，对齐延迟 ~25ms
       sendToUnity("WebCommunication", "OnLipEnvelope", JSON.stringify({ value }));
+    });
+    pcmPlayer.onPlaybackState((playing) => {
+      // worklet 真实出声状态（精确）→ 通知所有订阅者（如 useAudioActivityState）
+      for (const cb of playbackStateListeners) {
+        try { cb(playing); } catch (e) { console.error("[Unity WS] playbackState listener error:", e); }
+      }
     });
   }
   return pcmPlayer;

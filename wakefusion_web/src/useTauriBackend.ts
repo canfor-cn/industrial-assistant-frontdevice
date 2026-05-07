@@ -163,6 +163,8 @@ export async function subscribeTauriEvents(handlers: {
   onSentencePack?: (sentenceIndex: number, text: string, audio: string, mimeType: string, sampleRate: number, traceId: string) => void;
   onSentencePackDone?: () => void;
   onMediaControl?: (action: string, message: string) => void;
+  /** 媒体音量降低/恢复（TTS 期间压视频声音）。action: "duck" | "restore"，level: 0..1。 */
+  onMediaDuck?: (action: string, level: number) => void;
   onTtsAudioBegin?: (mimeType: string, codec: string, sampleRate: number) => void;
   onTtsAudioChunk?: (data: string, mimeType: string, codec: string, sampleRate: number, sentenceIndex?: number) => void;
   onTtsAudioEnd?: () => void;
@@ -290,6 +292,15 @@ export async function subscribeTauriEvents(handlers: {
     unlisteners.push(
       await tauriListen<{ action: string; message: string }>("media_control", (p) =>
         h(p.action ?? "", p.message ?? "")
+      )
+    );
+  }
+
+  if (handlers.onMediaDuck) {
+    const h = handlers.onMediaDuck;
+    unlisteners.push(
+      await tauriListen<{ action: string; level: number }>("media_duck", (p) =>
+        h(p.action ?? "", typeof p.level === "number" ? p.level : 0.2)
       )
     );
   }

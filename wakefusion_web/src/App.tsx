@@ -33,7 +33,8 @@ import { isPlayableMedia as isPlayableMediaCheck } from "./media/types";
 import type { MediaRef as MediaRefType } from "./media/types";
 import { useSyncedSubtitle } from "./useSyncedSubtitle";
 import { useUnityBridge } from "./useUnityBridge";
-import { startUnityWsShim, stopUnityWsShim } from "./unityWsShim";
+import { startUnityWsShim, stopUnityWsShim, subscribePcmPlaybackState } from "./unityWsShim";
+import { useAudioActivityState } from "./useAudioActivityState";
 import { PCMStreamPlayer } from "./pcmStreamPlayer";
 import { WebRTCClient } from "./webrtcClient";
 import { startWebrtcLipSync, type LipSyncSession } from "./webrtcLipSync";
@@ -169,6 +170,26 @@ export default function App() {
   const [playbackHistory, setPlaybackHistory] = useState<MediaHistoryEntry[]>([]);
   const [playbackState, setPlaybackState] = useState<"idle" | "playing" | "ended" | "stopped">("idle");
   const [stageMediaVolume, setStageMediaVolume] = useState(1);
+
+  // 音频活动状态机：worklet 真实播放状态 + 用户说话心跳的事实记录器。
+  // App.tsx 是消费者：根据 state 自己 derive 视频音量。
+  // userSilenceMs=5000：用户单次说话通常 < 5s，超过则用户已结束/数字人接管。
+  const audioActivity = useAudioActivityState({ userSilenceMs: 5000 });
+
+  // 订阅 worklet "playing/idle" → 写入状态机（audio thread 精确来源）
+  useEffect(() => {
+    return subscribePcmPlaybackState((playing) => {
+      audioActivity.setTtsPlaying(playing);
+    });
+  }, [audioActivity]);
+
+  // 状态机 → 视频音量（多源取 min，最严格的源决定）
+  useEffect(() => {
+    let v = 1;
+    if (audioActivity.state.tts.playing) v = Math.min(v, 0.2);
+    if (audioActivity.state.user.speaking) v = Math.min(v, 0.1);
+    setStageMediaVolume(v);
+  }, [audioActivity.state]);
 
   // Media state machine + queue (replaces stageMediaRef / stageMode / timer refs)
   const mediaMachine = useMediaStateMachine({
@@ -485,6 +506,13 @@ export default function App() {
       onMediaControl: (action, _message) => {
         if (!cancelled) applyMediaControl(action);
       },
+      onMediaDuck: (action, _level) => {
+        if (cancelled) return;
+        // duck 信号现在仅作为"用户说话心跳"的入口（device speech 上行被后端节流转发）。
+        // 状态机 silence timer 兜底自动恢复，不再依赖 restore 信号。
+        // TTS 通道由 worklet 直接驱动，不走这条。
+        if (action === "duck") audioActivity.touchUserSpeech();
+      },
       onDeviceStatus: (connected, addr) => {
         if (cancelled) return;
         setDeviceConnected(connected);
@@ -507,6 +535,12 @@ export default function App() {
         if (cancelled) return;
         unityBridge.interrupt();
         syncSub.reset();
+        // 同 ws-onmessage 路径：barge-in 时关掉 wiki/document MD viewer，
+        // video/image/audio 保留（用户可能只是想插话不是想关视频）
+        const cur = mediaMachine.currentRefs[0] as { assetType?: string } | undefined;
+        if (cur && (cur.assetType === "wiki" || cur.assetType === "document")) {
+          mediaMachine.dismiss("stopped");
+        }
         setConnectionStatus("播放已打断");
       },
       onSetupProgress: (_phase, message, done, error) => {
@@ -660,11 +694,8 @@ export default function App() {
             return;
           }
           if (data.type === "media_duck") {
-            if (data.action === "duck") {
-              setStageMediaVolume(typeof data.level === "number" ? data.level : 0.1);
-            } else if (data.action === "restore") {
-              setStageMediaVolume(typeof data.level === "number" ? data.level : 1);
-            }
+            // duck 心跳路由到状态机；restore 信号忽略（silence timer 兜底）
+            if (data.action === "duck") audioActivity.touchUserSpeech();
             return;
           }
           if (data.type === "media_control") {
@@ -991,18 +1022,23 @@ export default function App() {
         }
         if (data.type === "media_duck") {
           if (data.action === "duck") {
-            setStageMediaVolume(typeof data.level === "number" ? data.level : 0.1);
+            audioActivity.touchUserSpeech();
             setConnectionStatus("媒体降音");
-          } else if (data.action === "restore") {
-            setStageMediaVolume(typeof data.level === "number" ? data.level : 1);
-            setConnectionStatus("媒体恢复");
           }
+          // restore 信号忽略：silence timer 兜底
           return;
         }
         if (data.type === "stop_tts") {
           unityBridge.interrupt();
           syncSub.reset();
           pcmPlayerRef.current.interrupt();
+          // 用户 barge-in / 停止讲解时，wiki / document 类型的 MD viewer 应该自动关闭
+          // （用户在换话题，长篇资料没必要继续显示）。video / image / audio 保留——
+          // 用户可能只是想跟小慧聊几句，不想关掉正在看的视频。
+          const cur = mediaMachine.currentRefs[0] as { assetType?: string } | undefined;
+          if (cur && (cur.assetType === "wiki" || cur.assetType === "document")) {
+            mediaMachine.dismiss("stopped");
+          }
           setConnectionStatus("播放已打断");
           return;
         }
@@ -1082,8 +1118,7 @@ export default function App() {
           } else if (data.type === "media_control") {
             applyMediaControl(typeof data.action === "string" ? data.action : undefined);
           } else if (data.type === "media_duck") {
-            if (data.action === "duck") setStageMediaVolume(typeof data.level === "number" ? data.level : 0.1);
-            else if (data.action === "restore") setStageMediaVolume(typeof data.level === "number" ? data.level : 1);
+            if (data.action === "duck") audioActivity.touchUserSpeech();
           }
         } catch { /* ignore */ }
       };

@@ -34,6 +34,15 @@ export interface WebAudioPlayer {
   stop(): void;
   /** 注册 envelope 回调；worklet 每 ~33ms 推一次 RMS (0..1)。 */
   onEnvelope(cb: (value: number) => void): void;
+  /**
+   * 注册"真实播放状态"回调；worklet 在 audio thread 内监测 ring buffer 状态变化时推送：
+   * - playing=true：刚开始有 PCM 输出（用户真的听到声音）
+   * - playing=false：buffer 排空 + queue 空（用户真的听完了）
+   *
+   * 比后端 onAudioBegin/End 精确：onAudioEnd 是"Qwen 推完最后一个 chunk"，
+   * 但 worklet ring buffer 还会播几十秒。worklet 自己上报的是真实出声状态。
+   */
+  onPlaybackState(cb: (playing: boolean) => void): void;
   /** 销毁：close AudioContext。一般无需调用（单例复用）。 */
   destroy(): void;
 }
@@ -43,6 +52,7 @@ type PlayerState = {
   node: AudioWorkletNode | null;
   workletReady: Promise<void> | null;
   envelopeCb: ((v: number) => void) | null;
+  playbackStateCb: ((playing: boolean) => void) | null;
   preferredSampleRate: number;
 };
 
@@ -52,6 +62,7 @@ export function createWebAudioPlayer(workletUrl: string): WebAudioPlayer {
     node: null,
     workletReady: null,
     envelopeCb: null,
+    playbackStateCb: null,
     preferredSampleRate: 24000,
   };
 
@@ -80,8 +91,11 @@ export function createWebAudioPlayer(workletUrl: string): WebAudioPlayer {
       });
       node.port.onmessage = (ev) => {
         const m = ev.data;
-        if (m && m.type === "env" && state.envelopeCb) {
+        if (!m) return;
+        if (m.type === "env" && state.envelopeCb) {
           state.envelopeCb(m.value);
+        } else if (m.type === "state" && state.playbackStateCb) {
+          state.playbackStateCb(!!m.playing);
         }
       };
       node.connect(ctx.destination);
@@ -151,6 +165,10 @@ export function createWebAudioPlayer(workletUrl: string): WebAudioPlayer {
       state.envelopeCb = cb;
     },
 
+    onPlaybackState(cb) {
+      state.playbackStateCb = cb;
+    },
+
     destroy() {
       try { state.node?.disconnect(); } catch { /* ignore */ }
       try { state.ctx?.close(); } catch { /* ignore */ }
@@ -158,6 +176,7 @@ export function createWebAudioPlayer(workletUrl: string): WebAudioPlayer {
       state.node = null;
       state.workletReady = null;
       state.envelopeCb = null;
+      state.playbackStateCb = null;
     },
   };
 }

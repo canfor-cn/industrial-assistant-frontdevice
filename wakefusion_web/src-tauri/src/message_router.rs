@@ -268,6 +268,20 @@ pub async fn run_message_router(
                 }));
             }
 
+            "media_duck" => {
+                // 后端 onAudioBegin / onAudioEnd 触发：TTS 播放时把媒体音量压到 20%，
+                // 结束时恢复 100%。前端 React 收到 emit("media_duck") 调 setStageMediaVolume。
+                let action = msg.extra.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                let level = msg.extra.get("level").and_then(|v| v.as_f64()).unwrap_or(0.2);
+                let reason = msg.reason.clone().unwrap_or_default();
+                let _ = app.emit("media_duck", serde_json::json!({
+                    "traceId": trace_id,
+                    "action": action,
+                    "level": level,
+                    "reason": reason,
+                }));
+            }
+
             "stop" => {
                 tracing::warn!("Received stop: {}", msg.reason.as_deref().unwrap_or(""));
                 let _ = app.emit("subtitle_clear", SubtitleClearEvent {});
