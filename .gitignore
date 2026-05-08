@@ -108,3 +108,51 @@ reports/
 
 # ===================== 模型文件目录 =====================
 models/
+
+# ===================== 公开仓必须排除（隐私 / 大文件 / 凭据） =====================
+# 运行时数据（含 visitor_sessions / interaction_logs / face/voice embedding 等隐私）
+runtime/
+!runtime/.gitkeep
+
+# 用户上传 / 生成内容
+uploads/
+exhibit_wiki/
+wiki-work/
+wiki-test/
+
+# 凭据 / 配置（绝不能进公开仓）
+.env
+.env.*
+config.local.yaml
+*.secret
+*.pem
+*.key
+
+# 部署目录（含 EXE / Python / whl-cache）— 体积大，不入仓
+dist/wakefusion-terminal/
+deploy/
+
+# Unity WebGL 构建产物（巨型二进制，npm postinstall 自动下载，见 README）
+wakefusion_web/public/Build/Build.data
+wakefusion_web/public/Build/Build.framework.js
+wakefusion_web/public/Build/Build.loader.js
+wakefusion_web/public/Build/Build.wasm
+wakefusion_web/public/Build.bak/
+wakefusion_web/public/Build.bak2/
+
+# Tauri / cargo target
+wakefusion_web/src-tauri/target/
+wakefusion_web/src-tauri/Cargo.lock.bak
+
+# Vite / npm
+wakefusion_web/dist/
+wakefusion_web/node_modules/
+node_modules/
+package-lock.json.bak
+
+# 本地标准录音 / 测试音频
+标准录音*.txt
+test_recordings/
+
+# 内部文档（非公开）
+README-internal.md

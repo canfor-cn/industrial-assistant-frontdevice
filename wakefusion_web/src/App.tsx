@@ -41,6 +41,7 @@ import { startWebrtcLipSync, type LipSyncSession } from "./webrtcLipSync";
 import { useAvatarLayout } from "./avatar/useAvatarLayout";
 import { DraggableAvatarFrame } from "./avatar/DraggableAvatarFrame";
 import { AvatarSettingsPanel } from "./avatar/AvatarSettingsPanel";
+import { CameraSelectorPanel } from "./camera/CameraSelectorPanel";
 import { RightDock } from "./dock/RightDock";
 import { KeyboardComposer } from "./dock/KeyboardComposer";
 import { MagazineSubtitle } from "./subtitle/MagazineSubtitle";
@@ -242,6 +243,7 @@ export default function App() {
   const [pendingUploads, setPendingUploads] = useState<PendingUploadItem[]>([]);
   const [keyboardOpen, setKeyboardOpen] = useState(false);
   const [avatarPanelOpen, setAvatarPanelOpen] = useState(false);
+  const [cameraPanelOpen, setCameraPanelOpen] = useState(false);
   const avatarController = useAvatarLayout();
 
   // Live subtitle panel: sentence-level audio-text sync
@@ -1550,6 +1552,9 @@ export default function App() {
             <button type="button" className="overlay-btn" onClick={() => setPersonaOpen(true)} aria-label="人设管理">
               <User className="h-4 w-4" />
             </button>
+            <button type="button" className="overlay-btn" onClick={() => setCameraPanelOpen((v) => !v)} aria-label="摄像头配置">
+              <Camera className="h-4 w-4" />
+            </button>
           </header>
         )}
 
@@ -1562,6 +1567,11 @@ export default function App() {
               setAvatarPanelOpen(false);
             }}
           />
+        ) : null}
+
+        {/* Camera selector + live preview + face overlay */}
+        {cameraPanelOpen ? (
+          <CameraSelectorPanel onClose={() => setCameraPanelOpen(false)} />
         ) : null}
 
         {/* Left-bottom: media history (max 3, text cards) */}

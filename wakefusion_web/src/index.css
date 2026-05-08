@@ -2467,6 +2467,108 @@ button {
   opacity: 0.65;
 }
 
+/* ─── Camera selector panel ─── */
+.camera-settings-window {
+  position: absolute;
+  top: 92px;
+  right: 32px;
+  width: 720px;
+  background: var(--paper);
+  border: 1px solid var(--ink);
+  border-radius: 14px;
+  padding: 24px 28px;
+  box-shadow: 0 24px 48px rgba(0, 0, 0, 0.18);
+  z-index: 60;
+  font-family: var(--font-sans);
+  color: var(--ink);
+}
+
+.camera-preview-box {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #0a0a0a;
+  border-radius: 8px;
+  overflow: hidden;
+  margin: 12px 0;
+}
+
+.camera-preview-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.camera-preview-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.camera-preview-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(255, 255, 255, 0.4);
+  font-size: 13px;
+}
+
+.camera-info-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  background: var(--paper-warm);
+  border-radius: 6px;
+}
+
+.camera-info-label {
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-caps);
+  opacity: 0.55;
+  margin-left: 8px;
+}
+
+.camera-info-row .camera-info-label:first-child {
+  margin-left: 0;
+}
+
+.camera-info-value {
+  font-weight: 600;
+}
+
+.camera-device-select {
+  grid-column: 2 / span 2;
+  width: 100%;
+  padding: 6px 10px;
+  background: var(--paper);
+  border: 1px solid var(--ink);
+  border-radius: 6px;
+  font-family: var(--font-sans);
+  font-size: 12px;
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.camera-status-msg {
+  margin: 12px 0;
+  padding: 8px 12px;
+  background: var(--paper-warm);
+  border-left: 3px solid var(--ink);
+  font-size: 12px;
+  border-radius: 0 4px 4px 0;
+}
+
 .avatar-settings-actions {
   display: flex;
   justify-content: flex-end;

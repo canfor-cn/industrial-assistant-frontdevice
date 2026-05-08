@@ -10,7 +10,8 @@
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build",
+    "postinstall": "node scripts/fetch-unity-build.js"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",

@@ -110,3 +110,38 @@ pub async fn host_status(
 pub async fn get_backend_ws_status() -> Result<crate::ws_client::BackendWsStatus, String> {
     Ok(crate::ws_client::current_status())
 }
+
+// ─── 摄像头管理（前端配置面板用） ───
+// 这些 command 把 JSON 通过 device_ws_server::send_to_device 写回 Python core_server。
+// 设备会上行 camera_list / camera_preview / camera_selected，
+// device_ws_server emit 给 React webview。
+
+#[tauri::command]
+pub async fn request_camera_list() -> Result<(), String> {
+    crate::device_ws_server::send_to_device(r#"{"type":"camera_list_request"}"#);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn select_camera(backend: String, index: i64, name: String) -> Result<(), String> {
+    let json = serde_json::json!({
+        "type": "camera_select",
+        "backend": backend,
+        "index": index,
+        "name": name,
+    }).to_string();
+    crate::device_ws_server::send_to_device(&json);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn start_camera_preview() -> Result<(), String> {
+    crate::device_ws_server::send_to_device(r#"{"type":"camera_preview_start"}"#);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn stop_camera_preview() -> Result<(), String> {
+    crate::device_ws_server::send_to_device(r#"{"type":"camera_preview_stop"}"#);
+    Ok(())
+}

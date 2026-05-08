@@ -280,6 +280,11 @@ fn handle_device_message(
             let _ = app.emit("media_duck", msg.extra);
         }
 
+        // ─── 摄像头管理（前端配置面板用） ───
+        "camera_list" | "camera_preview" | "camera_selected" => {
+            let _ = app.emit(&msg.msg_type, msg.extra);
+        }
+
         // Audio segment protocol — device sends audio in chunks, collect and forward
         "audio_segment_begin" => {
             tracing::info!(trace_id = %trace_id, "Device audio_segment_begin");

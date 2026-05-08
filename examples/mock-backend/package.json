@@ -1,0 +1,13 @@
+{
+  "name": "industrial-assistant-mock-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Mock backend for testing device/frontend without the real Qwen Realtime backend",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

@@ -462,6 +462,10 @@ pub fn run() {
             commands::get_cached_audio,
             commands::host_status,
             commands::get_backend_ws_status,
+            commands::request_camera_list,
+            commands::select_camera,
+            commands::start_camera_preview,
+            commands::stop_camera_preview,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
