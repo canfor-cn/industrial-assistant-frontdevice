@@ -42,7 +42,7 @@ console.log(`  source: ${UNITY_BUILD_URL}`);
 console.log(`  target: ${buildDir}/`);
 
 mkdirSync(buildDir, { recursive: true });
-const zipPath = resolve(buildDir, "Build.zip.tmp");
+const zipPath = resolve(buildDir, "Build.zip");
 
 // Use Node's built-in fetch (Node 18+) to download
 async function download() {
