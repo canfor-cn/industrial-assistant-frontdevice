@@ -27,3 +27,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 crossbeam-channel = "0.5"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+
+# Media device runtime — USB UVC 摄像头采集（Windows Media Foundation 后端，自动协商 NV12/MJPG）
+# 选型依据：docs/wakefusion-media-device-architecture.md § 5.1
+nokhwa = { version = "0.10", default-features = false, features = ["input-msmf", "output-threaded"] }

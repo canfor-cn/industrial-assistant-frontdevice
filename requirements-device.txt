@@ -30,3 +30,8 @@ opencv-python>=4.8.0
 # libusb-package 自带 libusb-1.0.dll（pyusb 默认不带，Windows 会报 "No backend available"）
 pyusb>=1.2.0
 libusb-package>=1.0.26
+
+# Camera enumeration: DirectShow 设备真名（如 "ASUS 5M WebCam"）
+# Windows-only；缺失则前端摄像头列表为空（不再走 cv2 探测，避免霸占设备）
+pygrabber>=0.2; sys_platform == "win32"
+comtypes>=1.4.0; sys_platform == "win32"

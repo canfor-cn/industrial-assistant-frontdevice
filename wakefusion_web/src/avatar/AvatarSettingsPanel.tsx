@@ -1,6 +1,7 @@
 import React from "react";
 import type { AvatarCharacter, AvatarLayoutController } from "./useAvatarLayout";
 import { SCALE_MAX, SCALE_MIN } from "./useAvatarLayout";
+import { Drawer } from "../ui/Drawer";
 
 const CHARACTER_OPTIONS: { value: AvatarCharacter; label: string }[] = [
   { value: "A", label: "角色 A" },
@@ -8,8 +9,8 @@ const CHARACTER_OPTIONS: { value: AvatarCharacter; label: string }[] = [
 ];
 
 /**
- * Vogue editorial settings window — small floating panel (not a drawer).
- * Sliders for X / Y / Scale / Opacity, with numeric readout on the right.
+ * Avatar 配置抽屉 — 走统一 Drawer 系统。
+ * Header 永远固定（含 ✕），body 滑块可滚动，footer sticky。
  */
 export function AvatarSettingsPanel({
   controller,
@@ -21,11 +22,32 @@ export function AvatarSettingsPanel({
   const { layout, setX, setY, setScale, setOpacity, reset, character, setCharacter } = controller;
 
   return (
-    <aside className="avatar-settings-window" aria-label="数字人布局调整">
-      <div className="avatar-settings-eyebrow">01 / 01</div>
-      <h3 className="avatar-settings-title">Avatar</h3>
-      <div className="avatar-settings-rule" />
-
+    <Drawer
+      open
+      onClose={onClose}
+      eyebrow="01 / 01"
+      title="Avatar"
+      size="sm"
+      ariaLabel="数字人布局调整"
+      footer={
+        <>
+          <button
+            type="button"
+            className="avatar-settings-btn"
+            onClick={reset}
+          >
+            Reset
+          </button>
+          <button
+            type="button"
+            className="avatar-settings-btn avatar-settings-btn--primary"
+            onClick={onClose}
+          >
+            Done
+          </button>
+        </>
+      }
+    >
       <div className="avatar-settings-row">
         <span className="avatar-settings-row-label">Character</span>
         <div
@@ -84,24 +106,7 @@ export function AvatarSettingsPanel({
         onChange={setOpacity}
         format={(v) => `${Math.round(v * 100)}%`}
       />
-
-      <div className="avatar-settings-actions">
-        <button
-          type="button"
-          className="avatar-settings-btn"
-          onClick={reset}
-        >
-          Reset
-        </button>
-        <button
-          type="button"
-          className="avatar-settings-btn avatar-settings-btn--primary"
-          onClick={onClose}
-        >
-          Done
-        </button>
-      </div>
-    </aside>
+    </Drawer>
   );
 }
 

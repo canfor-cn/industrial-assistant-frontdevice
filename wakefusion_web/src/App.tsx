@@ -184,6 +184,48 @@ export default function App() {
     });
   }, [audioActivity]);
 
+  // Tauri 窗口全屏切换：F11 toggle，ESC 退出。装饰条与 fullscreen 同步：
+  //   全屏 → decorations=false（无标题栏，工业大屏纯净）
+  //   非全屏 → decorations=true（有系统框，方便拖动 / 关闭）
+  useEffect(() => {
+    if (!isTauriEnv()) return;
+    let cancelled = false;
+    const setFullscreenAndDecor = async (full: boolean) => {
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      if (cancelled) return;
+      const win = getCurrentWindow();
+      await win.setFullscreen(full);
+      try { await win.setDecorations(!full); } catch { /* ignore */ }
+    };
+    const onKey = async (e: KeyboardEvent) => {
+      if (e.key !== "F11" && e.key !== "Escape") return;
+      try {
+        const { getCurrentWindow } = await import("@tauri-apps/api/window");
+        if (cancelled) return;
+        const win = getCurrentWindow();
+        if (e.key === "F11") {
+          e.preventDefault();
+          const cur = await win.isFullscreen();
+          await setFullscreenAndDecor(!cur);
+        } else if (e.key === "Escape") {
+          // 抽屉打开时 ESC 让 Drawer 自己处理，不退全屏
+          if (document.querySelector(".drawer-shell")) return;
+          if (await win.isFullscreen()) {
+            e.preventDefault();
+            await setFullscreenAndDecor(false);
+          }
+        }
+      } catch (err) {
+        console.warn("[fullscreen-shortcut]", err);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("keydown", onKey);
+    };
+  }, []);
+
   // 状态机 → 视频音量（多源取 min，最严格的源决定）
   useEffect(() => {
     let v = 1;
@@ -1530,8 +1572,10 @@ export default function App() {
               type="button"
               className={`overlay-btn ${avatarController.editMode ? "is-active" : ""}`}
               onClick={() => {
-                avatarController.toggleEdit();
-                setAvatarPanelOpen((v) => !v);
+                const next = !avatarPanelOpen;
+                avatarController.setEditMode(next);
+                setAvatarPanelOpen(next);
+                if (next) setCameraPanelOpen(false);
               }}
               aria-label="调整数字人位置/大小"
               title="调整数字人"
@@ -1552,7 +1596,19 @@ export default function App() {
             <button type="button" className="overlay-btn" onClick={() => setPersonaOpen(true)} aria-label="人设管理">
               <User className="h-4 w-4" />
             </button>
-            <button type="button" className="overlay-btn" onClick={() => setCameraPanelOpen((v) => !v)} aria-label="摄像头配置">
+            <button
+              type="button"
+              className="overlay-btn"
+              onClick={() => {
+                const next = !cameraPanelOpen;
+                setCameraPanelOpen(next);
+                if (next && avatarPanelOpen) {
+                  avatarController.setEditMode(false);
+                  setAvatarPanelOpen(false);
+                }
+              }}
+              aria-label="摄像头配置"
+            >
               <Camera className="h-4 w-4" />
             </button>
           </header>

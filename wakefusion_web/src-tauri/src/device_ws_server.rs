@@ -281,8 +281,15 @@ fn handle_device_message(
         }
 
         // ─── 摄像头管理（前端配置面板用） ───
-        "camera_list" | "camera_preview" | "camera_selected" => {
+        "camera_list" | "camera_selected" => {
             let _ = app.emit(&msg.msg_type, msg.extra);
+        }
+        // 预览帧不再接收 Python JPEG。USB UVC 主预览由 Rust camera_capture_runtime
+        // 写入 MJPEG server；这里最多转发 legacy metadata，避免旧链路重新成为 preview owner。
+        "camera_preview" => {
+            let mut extra = msg.extra.clone();
+            extra.remove("jpeg");
+            let _ = app.emit("camera_preview", extra);
         }
 
         // Audio segment protocol — device sends audio in chunks, collect and forward

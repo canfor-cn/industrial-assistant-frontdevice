@@ -34,15 +34,21 @@ def run_audio_service(config_path):
         traceback.print_exc()
 
 
-def run_vision_service(vision_queue, lip_sync_event):
-    """Thread: camera + face detection (OpenCV VideoCapture, no pyorbbecsdk)"""
+def run_vision_service(vision_queue, lip_sync_event, config_path=None):
+    """Python vision analysis worker.
+
+    USB UVC preview/capture is owned by Rust/Tauri. In the normal flow this
+    worker samples frames from Rust's MJPEG preview endpoint for analysis only;
+    it must not open the physical USB camera unless explicitly overridden.
+    """
     try:
         from wakefusion.services.vision_service import run_in_thread
         run_in_thread(
             output_queue=vision_queue,
             lip_sync_event=lip_sync_event,
-            target_fps=15,
+            target_fps=int(os.environ.get("WAKEFUSION_VISION_ANALYSIS_FPS", "10")),
             camera_index=0,
+            config_path=config_path,
         )
     except Exception as e:
         print(f"[device_main] vision_service crashed: {e}", flush=True)
@@ -79,6 +85,20 @@ def main():
     if config_path:
         print(f"[device_main] Config: {config_path}", flush=True)
 
+    # ── 先初始化全局 config 单例 ────────────────────────────────────────
+    # 必须在启动 vision_service / audio_service 任何线程之前。
+    # 否则那些线程内部 get_config(None) 会拿到全默认 AppConfig（vision.camera.backend="orbbec"），
+    # 即使我们在 yaml 里写了 backend=usb 也读不到。
+    if config_path and os.path.exists(config_path):
+        try:
+            from wakefusion.config import get_config as _gc
+            _cfg = _gc(config_path)
+            _cam_b = getattr(getattr(_cfg.vision, "camera", None), "backend", "?")
+            _cam_i = getattr(getattr(_cfg.vision, "camera", None), "usb_index", "?")
+            print(f"[device_main] global config loaded · vision.camera={_cam_b}:{_cam_i}", flush=True)
+        except Exception as _e:
+            print(f"[device_main] global config init failed: {_e}", flush=True)
+
     # ── XVF3800 fixed-beam 配置（在 audio_service 抢占设备前先发 control transfer）──
     # 目的：把麦克风波束锁定到正前方 ±约 30° 范围，过滤侧面声源。
     # 失败不致命：自动 fallback 到自适应模式（默认行为，跟改造前等价）。
@@ -110,10 +130,11 @@ def main():
     # 硬件就绪标记：audio/vision 线程崩溃时设为 False，core_server 读取后上报前端
     hardware_status = {"mic_ready": True, "camera_ready": True}
 
-    # Start vision_service as daemon THREAD (no longer subprocess)
+    # USB UVC capture/preview is Rust-owned. Python vision_service may run only
+    # as an analysis sampler over Rust MJPEG, not as a physical camera owner.
     def vision_thread_wrapper(vq, lse):
         try:
-            run_vision_service(vq, lse)
+            run_vision_service(vq, lse, config_path=config_path)
         finally:
             hardware_status["camera_ready"] = False
             print("[device_main] ⚠️ vision_service 线程退出，camera_ready=False", flush=True)
@@ -132,15 +153,28 @@ def main():
         vision_thread_ref["thread"] = t
         return t
 
-    start_vision_thread()
-    print("[device_main] vision_service thread started", flush=True)
-
-    # Wait for camera init
-    time.sleep(3)
-
-    if not vision_thread_ref["thread"].is_alive():
-        hardware_status["camera_ready"] = False
-        print("[device_main] ⚠️ vision_service 启动失败（线程已退出），camera_ready=False", flush=True)
+    python_usb_vision_enabled = os.environ.get("WAKEFUSION_ENABLE_PYTHON_USB_VISION", "0") == "1"
+    if python_usb_vision_enabled:
+        start_vision_thread()
+        print("[device_main] legacy vision_service thread started by explicit env override", flush=True)
+        time.sleep(3)
+        if not vision_thread_ref["thread"].is_alive():
+            hardware_status["camera_ready"] = False
+            print("[device_main] ⚠️ legacy vision_service 启动失败（线程已退出），camera_ready=False", flush=True)
+    else:
+        os.environ.setdefault("WAKEFUSION_VISION_SOURCE", "rust_mjpeg")
+        os.environ.setdefault("WAKEFUSION_VISION_MJPEG_URL", "http://127.0.0.1:7892/preview.mjpg")
+        start_vision_thread()
+        print(
+            "[device_main] Rust owns USB camera preview; Python vision_service samples Rust MJPEG for analysis",
+            flush=True,
+        )
+        time.sleep(3)
+        if not vision_thread_ref["thread"].is_alive():
+            hardware_status["camera_ready"] = False
+            print("[device_main] ⚠️ MJPEG analysis vision_service 启动失败（线程已退出），camera_ready=False", flush=True)
+        else:
+            hardware_status["camera_ready"] = True
 
     # ── Vision watchdog：监控热重启请求 ──
     # 当 core_server 收到 camera_select 时调 request_vision_restart()
@@ -153,6 +187,8 @@ def main():
             return
         while True:
             time.sleep(1.0)
+            if not python_usb_vision_enabled and os.environ.get("WAKEFUSION_VISION_SOURCE") != "rust_mjpeg":
+                continue
             t = vision_thread_ref["thread"]
             # 仅在显式 request_restart 触发时重启（避免误把崩溃的线程也重启）
             if _vs.is_restart_requested() and t is not None and not t.is_alive():
@@ -178,64 +214,114 @@ def main():
             hardware_status["mic_ready"] = False
             print("[device_main] ⚠️ audio_service 线程退出，mic_ready=False", flush=True)
 
-    audio_thread = threading.Thread(
-        target=audio_thread_wrapper,
-        args=(config_path,),
-        name="audio_service",
-        daemon=True,
-    )
-    audio_thread.start()
-    print("[device_main] audio_service thread started", flush=True)
+    # 启动前 probe：检查目标 mic 设备（XVF3800）是否存在。不存在直接跳过 audio_service
+    # 启动 — 避免 audio 反复 crash → reload ONNX 模型 (KWS/VAD/VoiceEmbedder) → 100% CPU
+    # 把 vision 三个线程瞬间打断每隔 5-30s 一次，造成间歇性"卡顿"现象。
+    audio_device_match = "XVF3800"
+    try:
+        import yaml as _yaml_probe
+        if config_path and os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as _f:
+                _cfg = _yaml_probe.safe_load(_f) or {}
+            audio_device_match = (_cfg.get("audio") or {}).get("device_match", "XVF3800")
+    except Exception:
+        pass
 
-    # Wait for audio ZMQ to bind
-    time.sleep(2)
+    mic_available = False
+    try:
+        import sounddevice as _sd
+        _devs = _sd.query_devices()
+        for _d in _devs:
+            if _d.get("max_input_channels", 0) > 0 and audio_device_match.lower() in str(_d.get("name", "")).lower():
+                mic_available = True
+                break
+    except Exception as _e:
+        print(f"[device_main] sounddevice probe failed (continue anyway): {_e}", flush=True)
+        mic_available = True  # probe 失败时仍尝试启动 audio（保守）
 
-    # 检查 audio 是否存活（可能在初始化时崩溃了）
-    if not audio_thread.is_alive():
+    if not mic_available:
+        print(
+            f"[device_main] ⛔ 目标麦克风 '{audio_device_match}' 未找到，"
+            "完全跳过 audio_service 启动 — 不再加载 KWS/VAD/VoiceEmbedder ONNX 模型 "
+            "→ vision 享受全部 CPU。如要恢复请插入 mic 后重启 EXE。",
+            flush=True,
+        )
         hardware_status["mic_ready"] = False
-        print("[device_main] ⚠️ audio_service 启动失败（线程已退出），mic_ready=False", flush=True)
+        # 创建一个伪 audio_thread 引用（已死状态）让后面的 hardware_watchdog 不报错
+        audio_thread = threading.Thread(target=lambda: None, name="audio_disabled", daemon=True)
+        audio_thread.start()
+    else:
+        audio_thread = threading.Thread(
+            target=audio_thread_wrapper,
+            args=(config_path,),
+            name="audio_service",
+            daemon=True,
+        )
+        audio_thread.start()
+        print("[device_main] audio_service thread started", flush=True)
 
-    # 后台监控线程：audio/vision 线程退出后定期重试，实现"热插拔"
+        # Wait for audio ZMQ to bind
+        time.sleep(2)
+
+        # 检查 audio 是否存活（可能在初始化时崩溃了）
+        if not audio_thread.is_alive():
+            hardware_status["mic_ready"] = False
+            print("[device_main] ⚠️ audio_service 启动失败（线程已退出），mic_ready=False", flush=True)
+
+    # 后台监控线程：audio 线程退出后**指数退避**重试。
+    # 关键：连续失败 3 次后永久放弃（直到 EXE 重启），避免没接 mic 的机器陷入
+    # crash-loop 反复加载 ONNX 模型（KWS / VAD / VoiceEmbedder）→ 100% CPU →
+    # vision 三个线程全部饿死从 18fps 雪崩到 1-4fps。
+    # （vision 由上方 vision_restart_watchdog 单独管理，不在这里。）
+    AUDIO_MAX_RESTART = 3      # 失败超过这个数就永久放弃
+    AUDIO_BACKOFF_BASE = 8     # 指数退避基础秒数（8/16/32...）
+
     def hardware_watchdog():
-        nonlocal audio_thread, vision_thread
+        nonlocal audio_thread
+        # mic probe 已确认无设备 → watchdog 直接永久放弃，永不重启
+        if not mic_available:
+            print("[device_main] hardware_watchdog: mic 不可用 → audio 永久禁用", flush=True)
+            return
+        failure_count = 0
+        give_up_logged = False
         while True:
-            time.sleep(AUDIO_RETRY_INTERVAL)
+            # 指数退避：失败越多次等越久（5/8/16/32s，最长 5 分钟）
+            wait = min(AUDIO_BACKOFF_BASE * (2 ** failure_count), 300) if failure_count > 0 else AUDIO_RETRY_INTERVAL
+            time.sleep(wait)
+
+            # 永久放弃后只看是否还在死循环空转
+            if failure_count >= AUDIO_MAX_RESTART:
+                if not give_up_logged:
+                    print(
+                        f"[device_main] ⛔ audio_service 已连续失败 {failure_count} 次，"
+                        "永久放弃（直到 EXE 重启）。mic 不可用，vision/UI 仍正常工作。",
+                        flush=True,
+                    )
+                    give_up_logged = True
+                hardware_status["mic_ready"] = False
+                time.sleep(300)  # 长睡，不再尝试
+                continue
 
             # ── Audio watchdog ──
-            if not audio_thread.is_alive():
-                print(f"[device_main] 🔄 audio_service 已退出，尝试重启...", flush=True)
-                hardware_status["mic_ready"] = False
-                audio_thread = threading.Thread(
-                    target=audio_thread_wrapper,
-                    args=(config_path,),
-                    name="audio_service",
-                    daemon=True,
-                )
-                audio_thread.start()
-                time.sleep(3)
-                if audio_thread.is_alive():
-                    hardware_status["mic_ready"] = True
-                    print("[device_main] ✅ audio_service 热重载成功，mic_ready=True", flush=True)
-                else:
-                    print("[device_main] ❌ audio_service 重启失败，下次继续尝试...", flush=True)
+            if audio_thread.is_alive():
+                # 健康跑着 — 不动（不重置 failure_count，避免被加载模型期间的"假活"骗）
+                continue
 
-            # ── Vision watchdog ──
-            if not vision_thread.is_alive():
-                print(f"[device_main] 🔄 vision_service 已退出，尝试重启...", flush=True)
-                hardware_status["camera_ready"] = False
-                vision_thread = threading.Thread(
-                    target=vision_thread_wrapper,
-                    args=(vision_queue, lip_sync_event),
-                    name="vision_service",
-                    daemon=True,
-                )
-                vision_thread.start()
-                time.sleep(3)
-                if vision_thread.is_alive():
-                    hardware_status["camera_ready"] = True
-                    print("[device_main] ✅ vision_service 热重载成功，camera_ready=True", flush=True)
-                else:
-                    print("[device_main] ❌ vision_service 重启失败，下次继续尝试...", flush=True)
+            # 死了 → failure_count 立刻 +1（不再因短暂"活"复位）
+            failure_count += 1
+            print(
+                f"[device_main] 🔄 audio_service 已退出，尝试重启 "
+                f"(第 {failure_count}/{AUDIO_MAX_RESTART} 次)...",
+                flush=True,
+            )
+            hardware_status["mic_ready"] = False
+            audio_thread = threading.Thread(
+                target=audio_thread_wrapper,
+                args=(config_path,),
+                name="audio_service",
+                daemon=True,
+            )
+            audio_thread.start()
 
     watchdog_thread = threading.Thread(target=hardware_watchdog, name="hardware_watchdog", daemon=True)
     watchdog_thread.start()

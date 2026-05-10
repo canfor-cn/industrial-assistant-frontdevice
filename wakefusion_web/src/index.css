@@ -2335,20 +2335,8 @@ button {
   pointer-events: none;
 }
 
-/* ─── Avatar Settings Window (Vogue 弹出小窗) ─── */
-.avatar-settings-window {
-  position: absolute;
-  top: 92px;
-  right: 32px;
-  width: 320px;
-  background: var(--paper);
-  border: 1px solid var(--ink);
-  padding: 32px 28px 24px;
-  z-index: 55;
-  box-shadow: var(--shadow-lg);
-  animation: drawer-in var(--duration-normal) var(--ease);
-}
-
+/* ─── Avatar Settings (内部行 / 滑块 / 分段按钮 / 操作按钮) ───
+   wrapper 已迁到通用 .drawer-shell，保留下方细节样式给 Avatar 内容用。 */
 .avatar-settings-eyebrow {
   font-family: var(--font-mono);
   font-size: 10px;
@@ -2467,22 +2455,8 @@ button {
   opacity: 0.65;
 }
 
-/* ─── Camera selector panel ─── */
-.camera-settings-window {
-  position: absolute;
-  top: 92px;
-  right: 32px;
-  width: 720px;
-  background: var(--paper);
-  border: 1px solid var(--ink);
-  border-radius: 14px;
-  padding: 24px 28px;
-  box-shadow: 0 24px 48px rgba(0, 0, 0, 0.18);
-  z-index: 60;
-  font-family: var(--font-sans);
-  color: var(--ink);
-}
-
+/* ─── Camera selector panel (内部细节) ───
+   wrapper 已迁到通用 .drawer-shell。 */
 .camera-preview-box {
   position: relative;
   width: 100%;
@@ -2517,6 +2491,50 @@ button {
   justify-content: center;
   color: rgba(255, 255, 255, 0.4);
   font-size: 13px;
+}
+
+/* FPS badge — 视频右上角浮窗 */
+.camera-fps-badge {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  padding: 4px 9px;
+  background: rgba(10, 10, 10, 0.62);
+  color: #fff;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  pointer-events: none;
+  user-select: none;
+  z-index: 2;
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+}
+
+.camera-fps-unit {
+  margin-left: 2px;
+  opacity: 0.65;
+  font-weight: 400;
+  letter-spacing: var(--tracking-caps);
+}
+
+.camera-stream-retry {
+  margin-top: 12px;
+  padding: 4px 14px;
+  background: transparent;
+  border: 1px solid #fff;
+  color: #fff;
+  font-family: var(--font-sans);
+  font-size: 11px;
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: all var(--duration-fast) var(--ease);
+}
+.camera-stream-retry:hover {
+  background: #fff;
+  color: #000;
 }
 
 .camera-info-row {
@@ -3000,4 +3018,409 @@ button {
   letter-spacing: 0;
   /* 让"耀"字微微浮起，做篆刻镌刻感 */
   filter: drop-shadow(0 0.5px 0 rgba(139, 18, 18, 0.3));
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Drawer — 统一抽屉系统（Vogue editorial）
+   所有配置面板（Avatar / Camera / 后续新增）都用这套规范
+   ═══════════════════════════════════════════════════════════════ */
+
+.drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(10, 10, 10, 0.18);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+  z-index: 70;
+  pointer-events: none; /* 仅 ✕ 关，不响应遮罩点击 */
+  animation: drawer-backdrop-in 200ms var(--ease);
+}
+
+@keyframes drawer-backdrop-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.drawer-shell {
+  position: fixed;
+  top: 0;
+  right: 0;
+  height: 100vh;
+  z-index: 71;
+  display: flex;
+  flex-direction: column;
+  background: var(--paper);
+  border-left: 1px solid var(--rule);
+  box-shadow: -24px 0 60px rgba(10, 10, 10, 0.12);
+  outline: none;
+  font-family: var(--font-sans);
+  color: var(--ink);
+  animation: drawer-shell-in 320ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.drawer-shell--sm { width: min(380px, 92vw); }
+.drawer-shell--md { width: min(480px, 92vw); }
+.drawer-shell--lg { width: min(640px, 94vw); }
+
+@keyframes drawer-shell-in {
+  0%   { clip-path: inset(0 0 0 100%); transform: translateX(8px); opacity: 0; }
+  100% { clip-path: inset(0 0 0 0);    transform: translateX(0);   opacity: 1; }
+}
+
+/* Header — 永远固定在顶部，不随 body 滚动 */
+.drawer-header {
+  flex-shrink: 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  padding: 32px 32px 20px;
+  background: var(--paper);
+  position: relative;
+  z-index: 1;
+  animation: drawer-stagger-in 320ms 80ms var(--ease) both;
+}
+
+.drawer-header-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+
+.drawer-eyebrow {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.drawer-title {
+  margin: 6px 0 0;
+  font-family: var(--font-display);
+  font-size: clamp(24px, 3vw, 32px);
+  font-weight: 500;
+  letter-spacing: var(--tracking-display);
+  text-transform: uppercase;
+  line-height: 1.05;
+  color: var(--ink);
+}
+
+.drawer-rule {
+  width: 56px;
+  height: 1px;
+  background: var(--ink);
+  margin: 14px 0 0;
+}
+
+.drawer-close {
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid var(--rule-soft);
+  color: var(--ink);
+  cursor: pointer;
+  transition: all var(--duration-fast) var(--ease);
+}
+
+.drawer-close:hover {
+  background: var(--ink);
+  color: var(--paper);
+  border-color: var(--ink);
+}
+
+/* Body — 自适应高度，超出滚动 */
+.drawer-body {
+  flex: 1 1 auto;
+  min-height: 0;        /* flex item 才能正确 overflow */
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 8px 32px 32px;
+  animation: drawer-stagger-in 320ms 140ms var(--ease) both;
+  scrollbar-gutter: stable;
+}
+
+.drawer-body::-webkit-scrollbar {
+  width: 6px;
+}
+.drawer-body::-webkit-scrollbar-track {
+  background: transparent;
+}
+.drawer-body::-webkit-scrollbar-thumb {
+  background: var(--rule-soft);
+  border-radius: 3px;
+}
+.drawer-body::-webkit-scrollbar-thumb:hover {
+  background: var(--ink-soft);
+}
+
+/* Footer — sticky 在底，永远可见 */
+.drawer-footer {
+  flex-shrink: 0;
+  display: flex;
+  justify-content: flex-end;
+  gap: 14px;
+  padding: 18px 32px 24px;
+  background: var(--paper);
+  border-top: 1px solid var(--ink);
+  animation: drawer-stagger-in 320ms 200ms var(--ease) both;
+}
+
+@keyframes drawer-stagger-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Drawer 内通用 section（标题 + 内容块） */
+.drawer-section {
+  margin-bottom: 22px;
+}
+.drawer-section:last-child {
+  margin-bottom: 0;
+}
+.drawer-section-title {
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  color: var(--ink-soft);
+  margin: 0 0 10px;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Camera 设备列表（替代原 select 下拉）
+   ═══════════════════════════════════════════════════════════════ */
+
+.camera-device-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.camera-device-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 10px 12px;
+  background: var(--paper);
+  border: 1px solid var(--rule-soft);
+  cursor: pointer;
+  text-align: left;
+  font-family: var(--font-sans);
+  color: var(--ink);
+  transition: all var(--duration-fast) var(--ease);
+}
+
+.camera-device-item:hover {
+  border-color: var(--ink);
+  background: var(--paper-warm);
+}
+
+.camera-device-item.is-selected {
+  border-color: var(--ink);
+  background: var(--paper-warm);
+}
+
+.camera-device-item.is-active {
+  border-color: var(--ink);
+}
+
+.camera-device-dot {
+  flex-shrink: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--rule-soft);
+  transition: background var(--duration-fast) var(--ease);
+}
+.camera-device-item.is-selected .camera-device-dot {
+  background: var(--ink);
+}
+.camera-device-item.is-active .camera-device-dot {
+  background: #22c55e;
+  box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.18);
+}
+
+.camera-device-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.camera-device-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.camera-device-sub {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.camera-device-badge {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border: 1px solid var(--rule-soft);
+  color: var(--ink-soft);
+}
+.camera-device-item.is-active .camera-device-badge {
+  border-color: #22c55e;
+  color: #16a34a;
+}
+
+.camera-device-empty {
+  padding: 16px 12px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--muted);
+  border: 1px dashed var(--rule-soft);
+}
+
+/* ─── Camera 自定义下拉（永远显示当前选择，即使设备未接入） ─── */
+.camera-select-wrap {
+  position: relative;
+}
+
+.camera-select-trigger {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 12px;
+  background: var(--paper);
+  border: 1px solid var(--rule-soft);
+  cursor: pointer;
+  font-family: var(--font-sans);
+  color: var(--ink);
+  text-align: left;
+  transition: border-color var(--duration-fast) var(--ease), background var(--duration-fast) var(--ease);
+}
+
+.camera-select-trigger:hover,
+.camera-select-trigger.is-open {
+  border-color: var(--ink);
+  background: var(--paper-warm);
+}
+
+.camera-select-trigger.is-warn {
+  border-color: #d97706;       /* amber-600 */
+  background: rgba(245, 158, 11, 0.06);
+}
+
+.camera-select-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.camera-select-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.camera-select-sub {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.camera-select-trigger.is-warn .camera-select-sub {
+  color: #b45309;              /* amber-700 */
+}
+
+.camera-select-warn-icon {
+  flex-shrink: 0;
+  color: #d97706;
+}
+
+.camera-select-chevron {
+  flex-shrink: 0;
+  color: var(--ink-soft);
+  transition: transform var(--duration-fast) var(--ease);
+}
+.camera-select-chevron.is-open {
+  transform: rotate(180deg);
+}
+
+.camera-select-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  background: var(--paper);
+  border: 1px solid var(--ink);
+  box-shadow: 0 12px 28px rgba(10, 10, 10, 0.12);
+  z-index: 5;
+  max-height: 240px;
+  overflow-y: auto;
+  animation: drawer-stagger-in 180ms var(--ease);
+}
+
+.camera-select-menu::-webkit-scrollbar {
+  width: 6px;
+}
+.camera-select-menu::-webkit-scrollbar-thumb {
+  background: var(--rule-soft);
+  border-radius: 3px;
+}
+
+.camera-select-option {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px;
+  cursor: pointer;
+  transition: background var(--duration-fast) var(--ease);
+}
+
+.camera-select-option:hover {
+  background: var(--paper-warm);
+}
+
+.camera-select-option.is-selected {
+  background: var(--paper-warm);
+}
+
+.camera-select-empty {
+  padding: 12px 10px;
+  font-size: 12px;
+  text-align: center;
+  color: var(--muted);
+}
+
+/* Drawer 内 Avatar Row 和按钮统一外观（相对 drawer 收紧 padding）*/
+.drawer-shell .avatar-settings-row {
+  padding: 12px 0;
+}
+.drawer-shell .avatar-settings-row:first-of-type {
+  padding-top: 4px;
 }

@@ -54,6 +54,7 @@ class CoreServer:
         """
         # 加载配置
         self.config = get_config(config_path)
+        self._config_path = config_path  # 持久化摄像头选择时用
         self.zmq_config = self.config.zmq
         self.vision_wake_config = self.config.vision_wake
         self.audio_threshold_config = self.config.audio_threshold
@@ -544,6 +545,10 @@ class CoreServer:
     async def _handle_websocket_message(self, data: dict):
         """处理从LLM Agent接收的WebSocket消息"""
         msg_type = data.get("type")
+        # DEBUG：临时打印所有摄像头相关消息，定位 preview ENABLED 信号丢失问题
+        if msg_type in ("camera_list_request", "camera_select",
+                        "camera_preview_start", "camera_preview_stop"):
+            logger.info(f"📨 [camera-msg-trace] received msg_type={msg_type}")
         
         if msg_type == "route":
             if self.is_interactive_mode and not self.is_playing_tts:
@@ -673,54 +678,38 @@ class CoreServer:
 
         # ─── 摄像头管理（前端配置面板用） ───
         elif msg_type == "camera_list_request":
-            # 列举系统所有摄像头（USB UVC + Orbbec）→ 上行 camera_list
-            try:
-                from wakefusion.services.camera_enumerator import list_all_cameras
-                cameras = list_all_cameras()
-                self._send_websocket_message({
-                    "type": "camera_list",
-                    "cameras": cameras,
-                    "active": {
-                        "backend": getattr(self.config.vision.camera, "backend", "orbbec") if hasattr(self.config.vision, "camera") else "orbbec",
-                        "usb_index": getattr(self.config.vision.camera, "usb_index", None) if hasattr(self.config.vision, "camera") else None,
-                    },
-                })
-                logger.info(f"📷 camera_list reply: {len(cameras)} 个设备")
-            except Exception as e:
-                logger.error(f"❌ camera_list failed: {e}")
+            logger.info("📷 camera_list_request ignored: Rust/Tauri owns USB camera enumeration")
 
         elif msg_type == "camera_select":
-            # 用户选择新摄像头 → 写运行时 config + 触发 vision_service 热重启
-            new_backend = data.get("backend", "usb")
-            new_index = data.get("index", 0)
-            new_name = data.get("name", "")
-            logger.info(f"📷 camera_select: backend={new_backend} index={new_index} name={new_name}")
-            try:
-                if hasattr(self.config.vision, "camera") and self.config.vision.camera is not None:
-                    self.config.vision.camera.backend = new_backend
-                    if new_backend == "usb":
-                        self.config.vision.camera.usb_index = int(new_index)
-                # 触发 vision_service 热重启（device_main 的 watchdog 会用新 config 重启线程）
-                from wakefusion.services import vision_service as _vs
-                _vs.request_restart()
-                # 回执
-                self._send_websocket_message({
-                    "type": "camera_selected",
-                    "backend": new_backend,
-                    "index": new_index,
-                    "name": new_name,
-                })
-            except Exception as e:
-                logger.error(f"❌ camera_select failed: {e}")
+            logger.info("📷 camera_select ignored: Rust/Tauri owns USB camera selection")
 
         elif msg_type == "camera_preview_start":
-            self._camera_preview_enabled = True
-            logger.info("📷 camera preview ENABLED")
+            logger.info("📷 camera_preview_start ignored: Rust/Tauri owns USB preview")
 
         elif msg_type == "camera_preview_stop":
-            self._camera_preview_enabled = False
-            logger.info("📷 camera preview DISABLED")
-    
+            logger.info("📷 camera_preview_stop ignored: Rust/Tauri owns USB preview")
+
+    def _persist_camera_selection(self, backend: str, index: int, name: str) -> None:
+        """把 camera 选择写回 config.yaml（保留其它字段格式）。
+
+        读 → 改 vision.camera 子树 → 写。比 dump 整个 pydantic model 更安全 ——
+        避免改写注释 / 重排键序 / 变默认值。
+        """
+        if not self._config_path:
+            return
+        import yaml as _yaml
+        with open(self._config_path, "r", encoding="utf-8") as f:
+            data = _yaml.safe_load(f) or {}
+        vision = data.setdefault("vision", {})
+        camera = vision.setdefault("camera", {})
+        camera["backend"] = backend
+        if backend == "usb":
+            camera["usb_index"] = int(index)
+        camera["last_selected_name"] = name  # UI 显示"上次选择"用，即使设备未接入
+        with open(self._config_path, "w", encoding="utf-8") as f:
+            _yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+        logger.info(f"💾 camera selection persisted: backend={backend} index={index}")
+
     async def _handle_websocket_audio_chunk(self, audio_b64: str):
         """处理从 LLM Agent 接收的 base64 音频块"""
         import numpy as np
@@ -1947,20 +1936,22 @@ class CoreServer:
         # 🌟 修复：已删除视觉状态机抢跑代码，让 _user_has_spoken 的修改权完全交还给 _process_audio_data，保证一定能生成 trace_id
 
         # ─── Camera preview push（前端配置面板用） ───
-        # 仅在前端发送了 camera_preview_start 后才推送，节省带宽。
-        # vision_service 在 vision_data 里附带 preview_jpeg_b64 字段（已 resize 到 640px）。
-        if getattr(self, "_camera_preview_enabled", False):
+        # 默认 ENABLED — vision_service 主循环 jpeg 体积小（30KB×15fps=450KB/s），
+        # 本地 ws 完全顶得住；如此即使前端 camera_preview_start 信号丢失也能正常预览。
+        # 前端 stop_camera_preview 仍可显式关闭以省 CPU 编码（见 camera_preview_stop handler）。
+        if getattr(self, "_camera_preview_enabled", True):
+            msg = {
+                "type": "camera_preview",
+                "width": vision_data.get("preview_width", 0),
+                "height": vision_data.get("preview_height", 0),
+                "faces": faces,
+                "distance_m": distance_m,
+                "is_talking": is_talking,
+            }
             jpeg_b64 = vision_data.get("preview_jpeg_b64")
             if jpeg_b64:
-                self._send_websocket_message({
-                    "type": "camera_preview",
-                    "jpeg": jpeg_b64,
-                    "width": vision_data.get("preview_width", 0),
-                    "height": vision_data.get("preview_height", 0),
-                    "faces": faces,
-                    "distance_m": distance_m,
-                    "is_talking": is_talking,
-                })
+                msg["jpeg"] = jpeg_b64
+            self._send_websocket_message(msg)
 
     def _process_audio_data(self, metadata: dict, audio_binary: bytes):
         """处理音频数据"""

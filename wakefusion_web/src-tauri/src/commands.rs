@@ -1,6 +1,7 @@
 use crate::audio_handler;
 use crate::ws_protocol::{self, UpstreamMessage};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use tauri::Emitter;
 use tauri::State;
 
 pub type WsSender = crossbeam_channel::Sender<UpstreamMessage>;
@@ -112,36 +113,89 @@ pub async fn get_backend_ws_status() -> Result<crate::ws_client::BackendWsStatus
 }
 
 // ─── 摄像头管理（前端配置面板用） ───
-// 这些 command 把 JSON 通过 device_ws_server::send_to_device 写回 Python core_server。
-// 设备会上行 camera_list / camera_preview / camera_selected，
-// device_ws_server emit 给 React webview。
+// USB UVC 摄像头由 Rust/Tauri 直接枚举、选择和预览。Python 不再作为 USB
+// 预览 owner，也不再参与高频取帧。
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CameraInfoForUi {
+    index: u32,
+    name: String,
+    backend: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CameraListForUi {
+    cameras: Vec<CameraInfoForUi>,
+    active: CameraActiveForUi,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CameraActiveForUi {
+    backend: String,
+    usb_index: Option<u32>,
+    last_selected_name: Option<String>,
+}
 
 #[tauri::command]
-pub async fn request_camera_list() -> Result<(), String> {
-    crate::device_ws_server::send_to_device(r#"{"type":"camera_list_request"}"#);
+pub async fn request_camera_list(app: tauri::AppHandle) -> Result<(), String> {
+    let cameras = crate::media::camera_capture_runtime::list_cameras()
+        .into_iter()
+        .filter_map(|cam| {
+            let index = cam.id.strip_prefix("uvc-mf:")?.parse::<u32>().ok()?;
+            Some(CameraInfoForUi {
+                index,
+                name: cam.display_name,
+                backend: "uvc".to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let status = crate::media::camera_capture_runtime::status();
+    let payload = CameraListForUi {
+        cameras,
+        active: CameraActiveForUi {
+            backend: "uvc".to_string(),
+            usb_index: status.camera_index,
+            last_selected_name: status.camera_name,
+        },
+    };
+    let _ = app.emit("camera_list", payload);
     Ok(())
 }
 
 #[tauri::command]
-pub async fn select_camera(backend: String, index: i64, name: String) -> Result<(), String> {
-    let json = serde_json::json!({
-        "type": "camera_select",
-        "backend": backend,
-        "index": index,
-        "name": name,
-    }).to_string();
-    crate::device_ws_server::send_to_device(&json);
+pub async fn select_camera(
+    app: tauri::AppHandle,
+    backend: String,
+    index: i64,
+    name: String,
+) -> Result<(), String> {
+    if backend != "uvc" && backend != "usb" && backend != "uvc-mediafoundation" {
+        return Err(format!("unsupported camera backend for Rust preview: {backend}"));
+    }
+    let idx = u32::try_from(index).map_err(|_| format!("invalid camera index: {index}"))?;
+    let status = crate::media::camera_capture_runtime::start_preview_with_app(idx, Some(app.clone()))?;
+    let _ = app.emit("camera_selected", serde_json::json!({
+        "backend": "uvc",
+        "index": status.camera_index.unwrap_or(idx),
+        "name": status.camera_name.unwrap_or(name),
+    }));
+    let _ = request_camera_list(app).await;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn start_camera_preview() -> Result<(), String> {
-    crate::device_ws_server::send_to_device(r#"{"type":"camera_preview_start"}"#);
+pub async fn start_camera_preview(app: tauri::AppHandle) -> Result<(), String> {
+    let status = crate::media::camera_capture_runtime::status();
+    if !status.running {
+        let _ = crate::media::camera_capture_runtime::start_default_preview_with_app(Some(app.clone()))?;
+    }
+    let _ = app.emit("camera_preview_status", crate::media::camera_capture_runtime::status());
     Ok(())
 }
 
 #[tauri::command]
-pub async fn stop_camera_preview() -> Result<(), String> {
-    crate::device_ws_server::send_to_device(r#"{"type":"camera_preview_stop"}"#);
+pub async fn stop_camera_preview(app: tauri::AppHandle) -> Result<(), String> {
+    crate::media::camera_capture_runtime::stop_preview();
+    let _ = app.emit("camera_preview_status", crate::media::camera_capture_runtime::status());
     Ok(())
 }

@@ -1,8 +1,10 @@
 """
 唇动检测独立模块 (Lip-Sync VAD)
 基于 MediaPipe Face Mesh，通过计算嘴唇内部纵横比(MAR)的动态方差，判断用户是否在说话。
+
+注意：mediapipe 改为 **lazy import**（在 __init__ 内部 try）— 避免 module-level
+import mediapipe 触发 native 加载 hang 整个 vision_service 启动。
 """
-import mediapipe as mp
 import numpy as np
 from collections import deque
 import logging
@@ -23,14 +25,17 @@ class LipSyncDetector:
         self.variance_threshold = variance_threshold
         self.mar_closed_threshold = mar_closed_threshold
         self.mar_history = deque(maxlen=history_len)
-        
+
         # 状态稳定性：要求连续多帧都是 talking 才输出 True（减少抖动误报）
         self._talking_confirm_count = 0
         self._talking_confirm_threshold = 2  # 🌟 2帧防抖
-        
-        # 初始化 MediaPipe Face Mesh
+
+        # 初始化 MediaPipe Face Mesh — lazy import，加载失败不致命
         self._disabled = False
+        self.mp_face_mesh = None
+        self.face_mesh = None
         try:
+            import mediapipe as mp  # lazy
             self.mp_face_mesh = mp.solutions.face_mesh
             self.face_mesh = self.mp_face_mesh.FaceMesh(
                 max_num_faces=1,
@@ -39,11 +44,12 @@ class LipSyncDetector:
                 min_tracking_confidence=0.5
             )
             logger.info(f"✅ 唇动检测模块已初始化 (history={history_len}, variance_threshold={variance_threshold}, mar_closed_threshold={mar_closed_threshold})")
-        except (AttributeError, ImportError):
+        except (AttributeError, ImportError, ModuleNotFoundError):
             self._disabled = True
-            self.mp_face_mesh = None
-            self.face_mesh = None
             logger.warning("⚠️ 唇动检测不可用 (mediapipe.solutions 缺失)，已降级为空操作")
+        except Exception as e:
+            self._disabled = True
+            logger.warning(f"⚠️ 唇动检测初始化失败（已降级为空操作）: {e}")
 
     def start_sync(self):
         """启动口型同步检测（已废弃，保留接口兼容性）"""

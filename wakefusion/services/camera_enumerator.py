@@ -33,37 +33,47 @@ def list_usb_cameras() -> List[Dict[str, Any]]:
 
 
 def _list_usb_cameras_windows() -> List[Dict[str, Any]]:
-    """Windows DirectShow 列举（设备管理器同款名字）。"""
+    """Windows DirectShow 列举（设备管理器同款名字）。
+    pygrabber 没装就返回空 — 不再用 cv2 fallback，避免每次刷新都开 8 路 VideoCapture
+    霸占真实摄像头、和 vision_service 抢资源。
+
+    注意：DirectShow 是 COM 组件，调用线程必须先 CoInitialize。core_server 的 ws
+    handler 线程里 Python 不会自动 init，所以这里显式调一次（已 init 过会返回 S_FALSE，
+    无害）。multithreading 模式（COINIT_MULTITHREADED）适合后台线程。
+    """
     try:
         from pygrabber.dshow_graph import FilterGraph
+    except ImportError:
+        print("[camera_enumerator] pygrabber 未安装，无法列举 DirectShow 设备名。"
+              "请 `pip install pygrabber comtypes`。", flush=True)
+        return []
+
+    # 显式 CoInitialize，避免 "尚未调用 CoInitialize" (HRESULT 0x800401F0)
+    try:
+        from comtypes import CoInitializeEx, COINIT_MULTITHREADED
+        try:
+            CoInitializeEx(COINIT_MULTITHREADED)
+        except OSError:
+            # RPC_E_CHANGED_MODE: 同一线程之前已用其他模式 init 过 → 不致命
+            pass
+    except Exception:
+        # 最后兜底：试 pythoncom（pywin32 自带）
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()
+        except Exception:
+            pass
+
+    try:
         graph = FilterGraph()
         devices = graph.get_input_devices()  # ["Integrated Camera", "EMEET ..."]
         return [
             {"index": i, "name": name, "backend": "usb"}
             for i, name in enumerate(devices)
         ]
-    except ImportError:
-        # pygrabber 没装：fallback 用 cv2 探测前 8 个 index 是否能打开
-        return _list_usb_cameras_cv2_probe()
     except Exception as e:
         print(f"[camera_enumerator] DirectShow enumerate failed: {e}", flush=True)
-        return _list_usb_cameras_cv2_probe()
-
-
-def _list_usb_cameras_cv2_probe() -> List[Dict[str, Any]]:
-    """Fallback：尝试打开 0~7 看哪些能打开。拿不到名字，用 'USB Camera N' 占位。"""
-    try:
-        import cv2
-    except ImportError:
         return []
-
-    found: List[Dict[str, Any]] = []
-    for idx in range(8):
-        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW if platform.system() == "Windows" else cv2.CAP_ANY)
-        if cap.isOpened():
-            found.append({"index": idx, "name": f"USB Camera {idx}", "backend": "usb"})
-            cap.release()
-    return found
 
 
 def _list_usb_cameras_linux() -> List[Dict[str, Any]]:

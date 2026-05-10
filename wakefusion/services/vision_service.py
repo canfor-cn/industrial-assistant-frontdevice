@@ -12,11 +12,11 @@ if hasattr(_sys.stdout, 'reconfigure'):
 在独立进程中运行 MediaPipe，计算结果通过 UDP 发出
 """
 
-# MediaPipe face detection — try legacy solutions API, fall back to shim
-try:
-    import mediapipe.python.solutions.face_detection as mp_face
-except (ImportError, ModuleNotFoundError):
-    # mediapipe >= 0.10.30 removed solutions; provide a thin shim using OpenCV YuNet
+# MediaPipe face detection — 不再 try `mediapipe.python.solutions.face_detection`，
+# 那个路径在新版（0.10.30+）虽然报 ImportError，但触发 mediapipe native lib 初始化
+# (load extensions from ...) 偶发卡住整个进程启动 → vision_thread 永远进不到 __init__。
+# 直接用 OpenCV YuNet shim 等效替代。
+if True:
     import os as _os
 
     class _FakeKeypoint:
@@ -46,7 +46,16 @@ except (ImportError, ModuleNotFoundError):
             self.detections = detections
 
     class _YuNetFaceDetection:
-        """Drop-in shim matching mp_face.FaceDetection interface using OpenCV YuNet."""
+        """Drop-in shim matching mp_face.FaceDetection interface using OpenCV YuNet.
+
+        关键性能优化：YuNet 推理用**固定 320×320 输入**（不是原始帧分辨率）。
+        1280×720 直接推理 ≈ 500-700ms（CPU），320×320 推理 ≈ 30-50ms（16x 加速）。
+        bbox/keypoints 用归一化坐标返回（与 mediapipe.solutions 接口一致），
+        无需考虑缩放还原。
+        """
+        # YuNet 网络默认 320×320 输入；可调到 640×640 提升远处小脸检出率（代价 ~4x）
+        _INFER_SIZE = (320, 320)
+
         def __init__(self, model_selection=1, min_detection_confidence=0.5):
             import cv2
             # Search multiple locations for the model
@@ -63,29 +72,37 @@ except (ImportError, ModuleNotFoundError):
                     break
             if not model_path:
                 raise FileNotFoundError(f"YuNet model not found in: {candidates}")
-            self._detector = cv2.FaceDetectorYN.create(model_path, "", (320, 320), min_detection_confidence)
+            self._detector = cv2.FaceDetectorYN.create(
+                model_path, "", self._INFER_SIZE, min_detection_confidence
+            )
+            self._detector.setInputSize(self._INFER_SIZE)
             self._conf = min_detection_confidence
 
         def process(self, rgb_image):
             import cv2
-            h, w = rgb_image.shape[:2]
-            self._detector.setInputSize((w, h))
-            _, faces = self._detector.detect(rgb_image)
+            h_orig, w_orig = rgb_image.shape[:2]
+            iw, ih = self._INFER_SIZE
+            # Resize 到固定 320×320（CPU 上 cv2.resize 几 ms）
+            small = cv2.resize(rgb_image, (iw, ih), interpolation=cv2.INTER_LINEAR)
+            _, faces = self._detector.detect(small)
             if faces is None or len(faces) == 0:
                 return _FakeResult(None)
             detections = []
+            # YuNet 输出在 320×320 尺度上，bbox/kp 全部除以推理尺寸 → 归一化 [0,1]
             for face in faces:
-                x, y, fw, fh = float(face[0]/w), float(face[1]/h), float(face[2]/w), float(face[3]/h)
+                x = float(face[0]) / iw
+                y = float(face[1]) / ih
+                fw = float(face[2]) / iw
+                fh = float(face[3]) / ih
                 conf = float(face[-1])
                 if conf < self._conf:
                     continue
-                # YuNet keypoints: right_eye, left_eye, nose, right_mouth, left_mouth
                 kps = [
-                    _FakeKeypoint(float(face[4]/w), float(face[5]/h)),   # right eye
-                    _FakeKeypoint(float(face[6]/w), float(face[7]/h)),   # left eye
-                    _FakeKeypoint(float(face[8]/w), float(face[9]/h)),   # nose
-                    _FakeKeypoint(float(face[10]/w), float(face[11]/h)), # right mouth
-                    _FakeKeypoint(float(face[12]/w), float(face[13]/h)), # left mouth
+                    _FakeKeypoint(float(face[4])/iw, float(face[5])/ih),   # right eye
+                    _FakeKeypoint(float(face[6])/iw, float(face[7])/ih),   # left eye
+                    _FakeKeypoint(float(face[8])/iw, float(face[9])/ih),   # nose
+                    _FakeKeypoint(float(face[10])/iw, float(face[11])/ih), # right mouth
+                    _FakeKeypoint(float(face[12])/iw, float(face[13])/ih), # left mouth
                 ]
                 detections.append(_FakeDetection(conf, _FakeLocationData(_FakeBBox(x, y, fw, fh), kps)))
             return _FakeResult(detections if detections else None)
@@ -95,10 +112,10 @@ except (ImportError, ModuleNotFoundError):
 
     mp_face = _mp_face_module()
 
-# MediaPipe Tasks（Gesture Recognizer）
-import mediapipe as mp
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
+# MediaPipe Tasks（Gesture Recognizer）— 改为 lazy import（在 GestureRecognizer
+# 创建时再 import），避免 module-level mediapipe.tasks.python.vision import
+# 触发 native 加载 hang 导致 vision_service module 永远 import 不完。
+# 注：mp / python / vision 三个名字下面 GestureRecognizer 用到，会在 __init__ 里 lazy import 后局部使用。
 
 import cv2
 import numpy as np
@@ -109,6 +126,7 @@ import threading
 import queue
 import logging
 import os
+import platform
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from collections import deque
@@ -166,6 +184,7 @@ class VisionService:
             output_queue: 输出队列（替代 ZMQ PUB，传视觉数据给 core_server）
             lip_sync_event: 唇动检测控制事件（替代 ZMQ SUB，core_server set/clear）
         """
+        print("[vision-init] step 0: __init__ entered", flush=True)
         # 加载配置
         self.config = get_config(config_path)
         self.vision_wake_config = self.config.vision_wake
@@ -228,28 +247,40 @@ class VisionService:
 
         # 采用"内存缓冲区"方案彻底修复 GestureRecognizer 初始化失败的问题
         # 直接在 Python 层读取文件，避开 MediaPipe 的路径 Bug
+        print("[vision-init] step 1: loading GestureRecognizer", flush=True)
         self.recognizer = None
+        # 局部保存 mediapipe.tasks.python.vision，run() 主循环里 mp.Image / mp.ImageFormat 也要用
+        self._mp = None
+        self._mp_vision = None
         try:
             with open("gesture_recognizer.task", "rb") as f:
                 model_buffer = f.read()
-            
-            base_options = python.BaseOptions(model_asset_buffer=model_buffer)
+
+            # Lazy import — 仅在真正创建 GestureRecognizer 时加载 mediapipe.tasks，
+            # 避免 module-level import 触发 mediapipe native 加载 hang 进程启动。
+            import mediapipe as _mp
+            from mediapipe.tasks import python as _mp_python
+            from mediapipe.tasks.python import vision as _mp_vision
+            self._mp = _mp
+            self._mp_vision = _mp_vision
+
+            base_options = _mp_python.BaseOptions(model_asset_buffer=model_buffer)
             # 不同 MediaPipe 版本的 Options 参数可能略有差异，这里做一次兼容性兜底
             try:
-                options = vision.GestureRecognizerOptions(
+                options = _mp_vision.GestureRecognizerOptions(
                     base_options=base_options,
-                    running_mode=vision.RunningMode.LIVE_STREAM,
+                    running_mode=_mp_vision.RunningMode.LIVE_STREAM,
                     num_hands=4,
                     result_callback=self._on_gesture_result,
                 )
             except TypeError:
-                options = vision.GestureRecognizerOptions(
+                options = _mp_vision.GestureRecognizerOptions(
                     base_options=base_options,
-                    running_mode=vision.RunningMode.LIVE_STREAM,
+                    running_mode=_mp_vision.RunningMode.LIVE_STREAM,
                     result_callback=self._on_gesture_result,
                 )
-            
-            self.recognizer = vision.GestureRecognizer.create_from_options(options)
+
+            self.recognizer = _mp_vision.GestureRecognizer.create_from_options(options)
             vision_logger.info("[GestureRecognizer] 使用 Buffer 模式初始化成功")
         except FileNotFoundError:
             vision_logger.error("请确保 gesture_recognizer.task 文件位于项目根目录下")
@@ -283,6 +314,7 @@ class VisionService:
         # 🌟 任务3：EMA滤波存储 - 存储每个face的上一帧frontal_percent（key: face_id）
         self._face_frontal_history: Dict[int, float] = {}
 
+        print("[vision-init] step 2: loading FaceEmbedder", flush=True)
         # ── Phase 4: face embedding (visitor recognition) ──
         # Lazily loaded; if the ONNX file is missing or onnxruntime fails to
         # init, FaceEmbedder.is_available() stays False and no extra work runs.
@@ -315,9 +347,11 @@ class VisionService:
         self._latest_face_emb = None
         self._latest_face_emb_at: float = 0.0
 
+        print("[vision-init] step 3: loading LipSyncDetector", flush=True)
         # 初始化唇动检测器
         self.lip_detector = LipSyncDetector()
-        
+
+        print("[vision-init] step 4: __init__ done", flush=True)
         vision_logger.info(
             f"VisionService initialized: queue={'yes' if output_queue else 'no'}, "
             f"IMG UDP 127.0.0.1:{self.udp_image_port}, DEPTH UDP 127.0.0.1:{self.udp_depth_port}, "
@@ -936,7 +970,12 @@ class VisionService:
 
         # 1) 推送当前帧到 recognizer（异步回调更新 self._latest_gesture_data）
         try:
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
+            if self._mp is None:
+                # mediapipe lazy 加载失败 → 跳过 gesture 推送，本帧仅返回 face 数据
+                result = self._build_result_from_tracks(faces)
+                result["is_talking"] = is_talking
+                return result
+            mp_image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb_image)
             # 使用 time.time_ns() 生成毫秒级时间戳，保证单调递增且精度更高
             ts_ms = int(time.time_ns() // 1_000_000)
             self.recognizer.recognize_async(mp_image, ts_ms)
@@ -1065,9 +1104,9 @@ class VisionService:
                 "distance_m": result.get("distance_m"),
                 "timestamp": time.time()
             }
-            # 预览 JPEG（如有）— 由前端配置面板按需启用推送
-            if "preview_jpeg_b64" in result:
-                data["preview_jpeg_b64"] = result["preview_jpeg_b64"]
+            # 预览 JPEG 不再走 ws — 由 preview_http_server 直接吐给浏览器；
+            # 这里只随帧带 width/height 给前端做 face overlay 缩放
+            if "preview_width" in result:
                 data["preview_width"] = result.get("preview_width", 0)
                 data["preview_height"] = result.get("preview_height", 0)
             # ── Phase 4: 附加 face embedding（如有），core_server 累积 + 上送后端 ──
@@ -1229,24 +1268,81 @@ class VisionService:
             yield bgr  # may be None if decode failed; main loop handles it
 
     def _open_videocapture(self, source, width: int, height: int, fps: int, label: str):
-        """Open a cv2.VideoCapture with desired resolution/fps. Source can be int (USB index) or str (RTSP url)."""
-        cap = cv2.VideoCapture(source)
-        if not cap.isOpened():
+        """Open a cv2.VideoCapture with desired resolution/fps. Source can be int (USB index) or str (RTSP url).
+
+        摄像头采集 backend 选择 — 跟"顶级软件" Windows 相机 App / Teams / Chrome 一致：
+          • Windows: 默认 CAP_MSMF (Media Foundation) — 跟 Windows 相机 App 同 stack，
+            自动协商 NV12/MJPG/YUY2 优先级；先尝试 MSMF，失败 fallback DSHOW + MJPG。
+          • Linux: CAP_V4L2
+
+        历史教训：CAP_DSHOW 是老 API（Win98 时代），对新摄像头协商能力差，常被锁
+        在 YUY2 raw → USB 2.0 带宽限制 → 720p@15fps 实际只跑 3-5fps。
+        CAP_MSMF 自动协商 NV12（GPU 友好）或 MJPG，720p@30fps 都能稳跑。
+        """
+        # 加速 MSMF 启动（默认会卡 5+ 秒做硬件能力探测）
+        os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "1")
+
+        cap = None
+        backend_used = "?"
+        if isinstance(source, int):
+            if platform.system() == "Windows":
+                # 1) 优先 MSMF（Windows 相机 App 同款）
+                try:
+                    cap = cv2.VideoCapture(source, cv2.CAP_MSMF)
+                    if cap.isOpened():
+                        backend_used = "MSMF"
+                    else:
+                        cap.release()
+                        cap = None
+                except Exception:
+                    cap = None
+                # 2) MSMF 失败 fallback 到 DSHOW + 显式 MJPG fourcc
+                if cap is None:
+                    cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
+                    backend_used = "DSHOW"
+                    if cap.isOpened():
+                        try:
+                            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                        except Exception:
+                            pass
+            else:
+                cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
+                backend_used = "V4L2"
+        else:
+            cap = cv2.VideoCapture(source)
+            backend_used = "default"
+
+        if cap is None or not cap.isOpened():
             print(f"[ERROR] {label} VideoCapture failed to open: {source!r}", flush=True)
             return None, 0
+
         # Best-effort resolution / FPS hints; some cameras ignore them.
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         if fps > 0:
             cap.set(cv2.CAP_PROP_FPS, fps)
+        # MSMF buffer 大小调小（默认 4 帧），降低延迟
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
         # Drain a couple of frames so the capture buffer is ready.
         for _ in range(3):
             cap.read()
         actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or width)
         actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or height)
         actual_fps = cap.get(cv2.CAP_PROP_FPS) or fps
+        # 解析当前 fourcc — 看 backend 协商成什么 SubType
+        try:
+            fcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+            fourcc_str = "".join(chr((fcc >> (8 * i)) & 0xFF) for i in range(4)).strip()
+            if not fourcc_str or all(c == "\x00" for c in fourcc_str):
+                fourcc_str = "auto"  # MSMF 不暴露 fourcc，默认协商 NV12
+        except Exception:
+            fourcc_str = "?"
         print(
-            f"[INFO] {label} opened: {actual_w}x{actual_h} @ {actual_fps:.1f}fps (source={source!r})",
+            f"[INFO] {label} opened: {actual_w}x{actual_h} @ {actual_fps:.1f}fps "
+            f"fourcc={fourcc_str} backend={backend_used} (source={source!r})",
             flush=True,
         )
         return cap, actual_w
@@ -1275,8 +1371,18 @@ class VisionService:
         camera_index 仅用于 USB 兼容；优先使用 config.vision.camera.usb_index。
         """
         cam = getattr(self.config.vision, "camera", None)
-        backend = cam.backend if cam is not None else "orbbec"
+        source_override = os.environ.get("WAKEFUSION_VISION_SOURCE", "").strip().lower()
+        backend = source_override or (cam.backend if cam is not None else "orbbec")
+        analysis_only = backend == "rust_mjpeg"
         print(f"启动视觉服务（backend={backend}）...", flush=True)
+
+        # 启动进程内 MJPEG HTTP server（浏览器 <img> 直连）
+        if not analysis_only:
+            try:
+                from wakefusion.services.preview_http_server import start_server as _start_preview
+                _start_preview(7893)
+            except Exception as _e:
+                print(f"[vision] preview_http_server start failed (non-fatal): {_e}", flush=True)
 
         cap_handle = None  # 保存到 finally 用于 cleanup
         pipeline = None
@@ -1320,8 +1426,19 @@ class VisionService:
             cap_handle = cap
             self._init_distance_calibration(color_width or req_w)
             frame_iter = self._iterate_videocapture(cap)
+        elif backend == "rust_mjpeg":
+            url = os.environ.get("WAKEFUSION_VISION_MJPEG_URL", "http://127.0.0.1:7892/preview.mjpg")
+            req_w = (cam.color_width if cam else 1280)
+            req_h = (cam.color_height if cam else 720)
+            req_fps = int(os.environ.get("WAKEFUSION_VISION_ANALYSIS_FPS", str(cam.target_fps if cam else self.target_fps)))
+            cap, color_width = self._open_videocapture(url, req_w, req_h, req_fps, "Rust MJPEG analysis")
+            if cap is None:
+                return
+            cap_handle = cap
+            self._init_distance_calibration(color_width or req_w)
+            frame_iter = self._iterate_videocapture(cap)
         else:
-            print(f"[ERROR] unknown camera backend: {backend!r} (expected orbbec/usb/rtsp)", flush=True)
+            print(f"[ERROR] unknown camera backend: {backend!r} (expected orbbec/usb/rtsp/rust_mjpeg)", flush=True)
             return
 
         print(f"VisionService started (backend={backend})", flush=True)
@@ -1329,49 +1446,150 @@ class VisionService:
         last_time = time.time()
         frame_count = 0
 
-        # 预览 JPEG 编码计数器：限速 10fps（每 N 帧编一次，假设主帧率 15fps → 1/2 帧）
-        preview_jpeg_counter = 0
+        # Perf 计数器（每 30 帧打一次平均耗时，定位主循环瓶颈）
+        _perf_acc = {"read": 0.0, "process": 0.0, "dist": 0.0, "jpeg": 0.0, "send": 0.0, "udp": 0.0, "total": 0.0}
+        _perf_n = 0
+        _t_iter_end = time.perf_counter()  # 初值，用于测下一帧 read 用时
+
+        # ─── 推理与视频流并行解耦（Tesla AutoPilot / Apple Vision Pro 标准做法）───
+        # 主循环：cv2.read → jpeg encode → put_jpeg → send_result（用 cached 推理结果）
+        # 推理线程：从 latest_frame slot 拉最新帧 → process_frame → 写 cached_result
+        # 效果：视频流 = 摄像头 + JPEG 速度上限（~30fps），推理按自己速度跑（~5-10fps），
+        # face box 滞后 100-200ms，人眼基本无感。
+        _infer_input_lock = threading.Lock()
+        _infer_input_holder: list = [None]   # mutable holder：最新一帧 BGR
+        _infer_output_lock = threading.Lock()
+        _infer_output_holder: list = [None]  # latest 推理 result
+        _infer_stop = threading.Event()
+
+        def _inference_worker():
+            local_count = 0
+            local_acc = 0.0
+            while not _infer_stop.is_set():
+                with _infer_input_lock:
+                    frame = _infer_input_holder[0]
+                    _infer_input_holder[0] = None
+                if frame is None:
+                    time.sleep(0.003)  # 主循环还没塞新帧 → 短暂等待
+                    continue
+                try:
+                    t0 = time.perf_counter()
+                    result = self.process_frame(frame)
+                    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                    with _infer_output_lock:
+                        _infer_output_holder[0] = result
+                    local_count += 1
+                    local_acc += elapsed_ms
+                    if local_count % 20 == 0:
+                        avg = local_acc / 20.0
+                        print(f"[infer-worker] avg={avg:.0f}ms over 20f → infer fps≈{1000.0/max(avg,1):.1f}",
+                              flush=True)
+                        local_acc = 0.0
+                except Exception as e:
+                    print(f"[infer-worker] error: {e}", flush=True)
+                    time.sleep(0.05)
+
+        _infer_thread = threading.Thread(target=_inference_worker, name="vision-inference", daemon=True)
+        _infer_thread.start()
+
+        # ─── JPEG 编码线程（再次解耦：主循环只 read + 推帧，编码不抢 CPU） ───
+        _jpeg_input_lock = threading.Lock()
+        _jpeg_input_holder: list = [None]
+
+        def _jpeg_worker():
+            local_count = 0
+            local_acc = 0.0
+            from wakefusion.services.preview_http_server import put_jpeg as _pp_inner
+            while not _infer_stop.is_set():
+                with _jpeg_input_lock:
+                    frame = _jpeg_input_holder[0]
+                    _jpeg_input_holder[0] = None
+                if frame is None:
+                    time.sleep(0.005)
+                    continue
+                try:
+                    t0 = time.perf_counter()
+                    h_, w_ = frame.shape[:2]
+                    if w_ > 640:
+                        scale_ = 640.0 / float(w_)
+                        preview_img = cv2.resize(frame, (640, int(h_ * scale_)),
+                                                 interpolation=cv2.INTER_LINEAR)
+                    else:
+                        preview_img = frame
+                    ok_, jpeg_buf = cv2.imencode(
+                        ".jpg", preview_img, [int(cv2.IMWRITE_JPEG_QUALITY), 60]
+                    )
+                    if ok_:
+                        _pp_inner(jpeg_buf.tobytes())
+                    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                    local_count += 1
+                    local_acc += elapsed_ms
+                    if local_count % 30 == 0:
+                        avg = local_acc / 30.0
+                        print(f"[jpeg-worker] avg={avg:.0f}ms over 30f → encode fps≈{1000.0/max(avg,1):.1f}",
+                              flush=True)
+                        local_acc = 0.0
+                except Exception as e:
+                    print(f"[jpeg-worker] error: {e}", flush=True)
+                    time.sleep(0.05)
+
+        _jpeg_thread = None
+        if not analysis_only:
+            _jpeg_thread = threading.Thread(target=_jpeg_worker, name="vision-jpeg", daemon=True)
+            _jpeg_thread.start()
+
         try:
             for bgr in frame_iter:
+                _t_after_read = time.perf_counter()
+                _read_ms = (_t_after_read - _t_iter_end) * 1000.0  # frame_iter yield 用时 ≈ cv2.read
+
                 if bgr is None:
+                    _t_iter_end = time.perf_counter()
                     continue
                 # ── 热重启检查：用户切换摄像头时，device_main 设了 restart Event → 退出循环 ──
                 if is_restart_requested():
                     print("[vision] restart requested → exiting main loop", flush=True)
                     break
+                if analysis_only:
+                    now = time.time()
+                    if now - last_time < self.frame_time:
+                        continue
+                    last_time = now
                 frame_count += 1
                 if frame_count <= 3 or frame_count % 100 == 0:
                     print(f"[vision] Frame #{frame_count} OK", flush=True)
 
-                # 控制帧率
-                current_time = time.time()
-                elapsed = current_time - last_time
-                if elapsed < self.frame_time:
-                    time.sleep(self.frame_time - elapsed)
-                last_time = time.time()
+                # 不再人为 throttle — cv2.read() 受摄像头硬件帧率自然限速。
+                # 之前 target_fps=30 强制 sleep 凑 33ms/帧，加上 GIL 争抢导致主循环
+                # 实测只跑 18fps（远低于 30fps 上限）。让主循环跑摄像头硬件速度，
+                # 三个线程独立调度，整体吞吐反而更高。
+                if not analysis_only:
+                    last_time = time.time()
+                _t_after_throttle = time.perf_counter()
 
-                # 检查唇动控制事件
+                # 检查唇动控制事件（轻量，只读 Event）
                 self._check_lip_sync_event()
 
-                # 性能优化：MediaPipe 处理半速
-                self._process_frame_counter += 1
-                if self._process_frame_counter % 2 == 0 or not hasattr(self, "_last_result"):
-                    result = self.process_frame(bgr)
-                    self._last_result = result
+                # 把最新一帧推给推理线程（替换式 — 推理慢就只跟最新帧）
+                with _infer_input_lock:
+                    _infer_input_holder[0] = bgr  # zero-copy 引用
+
+                # 用最近一次推理结果做 face data（可能滞后 100-200ms，人眼无感）
+                with _infer_output_lock:
+                    cached = _infer_output_holder[0]
+                if cached is not None:
+                    # 浅拷贝：下面 distance 计算会改 result["faces"][i]，避免污染 cached
+                    result = dict(cached)
+                    # faces 列表也拷一份（每个 face dict 不拷，distance_m 直接写覆盖）
+                    if "faces" in result and isinstance(result["faces"], list):
+                        result["faces"] = [dict(f) for f in result["faces"]]
                 else:
-                    if hasattr(self, "_last_result") and self._last_result:
-                        faces = self._last_result.get("faces", [])
-                        result = self._build_result_from_tracks(faces)
-                        result["faces"] = faces
-                        result["hand_distance_m"] = self._last_result.get("hand_distance_m")
-                        result["distance_m"] = self._last_result.get("distance_m")
-                        result["presence"] = self._last_result.get("presence", False)
-                        result["confidence"] = self._last_result.get("confidence", 0.0)
-                        result["is_talking"] = self._last_result.get("is_talking", False)
-                        self._last_result = result
-                    else:
-                        result = self.process_frame(bgr)
-                        self._last_result = result
+                    # 推理还没出第一帧 → 空结果，仍能正常推视频流
+                    result = {"faces": [], "hands": [], "is_talking": False,
+                              "distance_m": None, "hand_distance_m": None,
+                              "presence": False, "confidence": 0.0}
+
+                _t_after_process = time.perf_counter()
 
                 # 距离估算：用人脸宽度像素推算距离
                 faces = result.get("faces", []) if isinstance(result.get("faces", []), list) else []
@@ -1392,31 +1610,61 @@ class VisionService:
                 result["distance_m"] = float(global_distance_m) if global_distance_m is not None else None
                 result["hand_distance_m"] = None
 
-                # 预览 JPEG（限速 ~10fps，配置面板用）：encode 到 result，
-                # core_server 检查 _camera_preview_enabled 决定是否上行。
-                preview_jpeg_counter += 1
-                if preview_jpeg_counter % 2 == 0:
-                    try:
-                        h_, w_ = bgr.shape[:2]
-                        if w_ > 640:
-                            scale_ = 640.0 / float(w_)
-                            preview_img = cv2.resize(bgr, (640, int(h_ * scale_)))
-                        else:
-                            preview_img = bgr
-                        ok_, jpeg_buf = cv2.imencode(".jpg", preview_img, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
-                        if ok_:
-                            import base64 as _b64
-                            result["preview_jpeg_b64"] = _b64.b64encode(jpeg_buf.tobytes()).decode("ascii")
-                            result["preview_width"] = int(preview_img.shape[1])
-                            result["preview_height"] = int(preview_img.shape[0])
-                    except Exception:
-                        pass
+                _t_after_dist = time.perf_counter()
+
+                # 预览 JPEG：Rust MJPEG 分析模式下不再二次编码/推送预览，避免干扰主视频流。
+                if not analysis_only:
+                    with _jpeg_input_lock:
+                        _jpeg_input_holder[0] = bgr  # zero-copy 引用
+                # preview 尺寸固定 640×N，下游 face overlay 用这个值
+                _h, _w = bgr.shape[:2]
+                if _w > 640:
+                    result["preview_width"] = 640
+                    result["preview_height"] = int(_h * 640.0 / float(_w))
+                else:
+                    result["preview_width"] = int(_w)
+                    result["preview_height"] = int(_h)
+
+                _t_after_jpeg = time.perf_counter()
 
                 # 发送结果（通过内存队列）
                 self.send_result(result)
 
+                _t_after_send = time.perf_counter()
+
                 # 发送 RGB 图像（JPEG，异步）
-                self.send_frame_image_async(bgr)
+                if not analysis_only:
+                    self.send_frame_image_async(bgr)
+
+                _t_after_udp = time.perf_counter()
+                _t_iter_end = _t_after_udp  # 下一帧的 read 起点
+
+                # 累积每段耗时
+                _perf_acc["read"] += _read_ms
+                _perf_acc["process"] += (_t_after_process - _t_after_throttle) * 1000
+                _perf_acc["dist"] += (_t_after_dist - _t_after_process) * 1000
+                _perf_acc["jpeg"] += (_t_after_jpeg - _t_after_dist) * 1000
+                _perf_acc["send"] += (_t_after_send - _t_after_jpeg) * 1000
+                _perf_acc["udp"] += (_t_after_udp - _t_after_send) * 1000
+                _perf_acc["total"] += (_t_after_udp - _t_after_read) * 1000
+                _perf_n += 1
+                if _perf_n >= 30:
+                    n = float(_perf_n)
+                    print(
+                        f"[vision-perf] avg/frame over {_perf_n}f: "
+                        f"read={_perf_acc['read']/n:.0f}ms "
+                        f"process={_perf_acc['process']/n:.0f}ms "
+                        f"dist={_perf_acc['dist']/n:.0f}ms "
+                        f"jpeg={_perf_acc['jpeg']/n:.0f}ms "
+                        f"send={_perf_acc['send']/n:.0f}ms "
+                        f"udp={_perf_acc['udp']/n:.0f}ms "
+                        f"total={_perf_acc['total']/n:.0f}ms "
+                        f"→ effective fps≈{1000.0 * n / max(_perf_acc['total'], 1):.1f}",
+                        flush=True,
+                    )
+                    for k in _perf_acc:
+                        _perf_acc[k] = 0.0
+                    _perf_n = 0
 
         except KeyboardInterrupt:
             print("\nVisionService stopped by user")
@@ -1425,6 +1673,11 @@ class VisionService:
             import traceback
             traceback.print_exc()
         finally:
+            # 通知推理线程退出（daemon=True 进程退出时也会被回收，但这里更干净）
+            try:
+                _infer_stop.set()
+            except Exception:
+                pass
             if pipeline is not None:
                 try:
                     pipeline.stop()
@@ -1460,9 +1713,15 @@ class VisionService:
 
 
 def run_in_thread(output_queue: "queue.Queue", lip_sync_event: threading.Event,
-                  target_fps: int = 15, camera_index: int = 0):
-    """线程入口：由 device_main 调用"""
+                  target_fps: int = 15, camera_index: int = 0,
+                  config_path: Optional[str] = None):
+    """线程入口：由 device_main 调用。
+
+    config_path 必须传：vision 重启时强制 reload yaml，避免拿到 core_server 之外
+    其它路径（audio/llm）reload 时创建的、未含最新 camera_select 的旧实例。
+    """
     service = VisionService(
+        config_path=config_path,
         target_fps=target_fps,
         output_queue=output_queue,
         lip_sync_event=lip_sync_event,

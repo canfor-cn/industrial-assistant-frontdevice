@@ -4,7 +4,9 @@ mod commands;
 mod config;
 mod device_ws_server;
 mod events;
+mod media;
 mod message_router;
+mod mjpeg_server;
 mod unity_ws_server;
 mod ws_client;
 mod ws_protocol;
@@ -182,6 +184,33 @@ pub fn run() {
             let device_ws_tx = upstream_tx.clone();
             let device_id_clone = device_id.clone();
             device_ws_server::spawn_device_ws_server(device_app, 8765, device_ws_tx, device_id_clone);
+
+            // MJPEG HTTP server — React 端 <img src="http://127.0.0.1:7892/preview.mjpg">
+            // 帧源必须来自 Rust USB capture runtime，不再从 Python camera_preview 转发。
+            mjpeg_server::spawn_mjpeg_server(7892);
+
+            // Rust-owned USB UVC preview. This must be the only preview owner.
+            let media_app = app.handle().clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(2)); // 让 webview 先起来
+                let cams = media::camera_device_manager::list_uvc_cameras();
+                tracing::info!("[media] discovered {} UVC camera(s)", cams.len());
+                for cam in &cams {
+                    tracing::info!(
+                        "[media] camera id={} name={:?} backend={} profiles={}",
+                        cam.id, cam.display_name, cam.backend, cam.profiles.len()
+                    );
+                    for p in cam.profiles.iter().take(8) {
+                        tracing::info!(
+                            "[media]   profile {}x{}@{}fps fmt={:?} preview={}",
+                            p.width, p.height, p.fps, p.pixel_format, p.preferred_for_preview
+                        );
+                    }
+                }
+                if let Err(e) = media::camera_capture_runtime::start_default_preview_with_app(Some(media_app)) {
+                    tracing::warn!("[media] Rust USB preview did not start: {}", e);
+                }
+            });
 
             // Unity (3D digital human) downstream broadcast WS — Unity / Three.js / live2d
             // 自己连 ws://127.0.0.1:9876 接 audio_begin/chunk/end/stop_tts 协议（解耦渲染层）
